@@ -305,17 +305,32 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 进程 CPU 增量为 0，但**既没有 `onError` 也没有 `onCompletion`**。
      * 界面层能自救的两个信号都没来，于是永远冻着。
      *
-     * ## 判据为什么是「输出帧率」而不是位置或 isPlaying
+     * ## ⚠️ 目前**没有启用** —— 因为还没找到可信的存活判据
      *
-     *  - `isPlaying()` 在原生侧只查 `mp_state` 状态变量，**线程全死了它照样返回 true**
-     *  - `positionMs()` 实测在 SMB 通路上恒为 0（见 `PlayerLivenessTest`），没法用
-     *  - `outputFps()` 来自视频时钟，解码链一断就掉到 0 —— 这是唯一反映真实存活的信号
+     * 一开始打算用「输出帧率」：`isPlaying()` 在原生侧只查 `mp_state`
+     * 状态变量（线程全死照样返回 true），`positionMs()` 被实测排除，
+     * 于是 `outputFps()` 看着最合适。
      *
-     * 要求连续 [LIVENESS_STRIKES] 次都读到 0 才动手，避免把正常的缓冲抖动
-     * （换台、HLS 换分片）误判成死机。
+     * 但实测把它也否掉了：**在 SMB + `IMediaDataSource` 通路上 `outputFps()`
+     * 恒为 0**，而同一条通路上的画面是正常在放的
+     * （`PlayerLivenessTest.whichSignalReflectsLiveness` 拿真实片源量过；
+     * 本地文件 `test.mp4` 上它正常，能读到 14.8fps）。
+     *
+     * 拿一个恒为 0 的信号做判据，会在 15 秒后把**正常播放**误判成死机并不断
+     * 重启画面 —— 那比原来的问题更糟。所以这里加了 [LIVENESS_ENABLED] 开关，
+     * 默认关闭，等找到可信判据再打开。**不要只是把开关改成 true。**
+     *
+     * 可行的方向（都还没验证）：
+     *  - 让 `IMediaDataSource` 通路上的统计生效（可能要设某个 ijk 选项）
+     *  - 用「读取字节数的增量」等别的计数器（`PlaybackEngine.Liveness` 已经把
+     *    cached/traffic/position/fps 四个一起取回来了，但需要先在真实片源上
+     *    量出哪个在动）
+     *  - 在 `MainActivity` 里记录最近一次 `onInfo`/`onPrepared` 等回调的时间，
+     *    用「多久没收到任何播放器事件」当判据
      */
     private val livenessWatchdog = object : Runnable {
         override fun run() {
+            if (!LIVENESS_ENABLED) return
             if (!gotFirstFrame || !engine.isPlaying()) {
                 strikes = 0
                 main.postDelayed(this, LIVENESS_INTERVAL_MS)
@@ -386,6 +401,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     private fun armLivenessWatchdog() {
+        if (!LIVENESS_ENABLED) return
         main.removeCallbacks(livenessWatchdog)
         strikes = 0
         main.postDelayed(livenessWatchdog, LIVENESS_INTERVAL_MS)
@@ -1285,6 +1301,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 播放中存活检查的间隔。 */
         private const val LIVENESS_INTERVAL_MS = 5_000L
+
+        /**
+         * 播放中存活看门狗的总开关。**默认关闭**，原因见 `livenessWatchdog` 的注释：
+         * 唯一看上去可用的判据（`outputFps`）在 SMB 通路上实测恒为 0，
+         * 用它会在 15 秒后把正常播放误判成死机。
+         * 找到可信判据之前不要改成 true。
+         */
+        private const val LIVENESS_ENABLED = false
 
         /** 3 次 × 5 秒 = 15 秒。留这个缓冲是为了不把正常的缓冲抖动
          *  （换台、HLS 换分片、SMB 偶发卡顿）误判成死机 —— 误判会让画面无故重启，
