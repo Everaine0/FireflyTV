@@ -50,18 +50,25 @@
 ## 测试与联调
 
 ```powershell
-# 生成测试素材（插桩测试的示例视频 + 本地 SMB 联调用的媒体库目录树）
+# 生成测试素材（插桩测试的示例视频）
 .\scripts\make-test-media.ps1
 
-# 一键拉起「用模拟器试流程」：宿主机 SMB 服务 + Android TV 模拟器 + 配置页端口转发
+# 一键拉起模拟器：装包 + 启动 + 把内置配置页转发出来
 .\scripts\dev-env.ps1
 ```
 
-`dev-env.ps1` 跑完会把配置页地址打出来，照着填就能在模拟器里走完整个流程。
-模拟器里宿主机的地址是 **`10.0.2.2`**（不是 `127.0.0.1`）。
+想用**自己的真实 NAS** 跑插桩联调，把连接信息填进 `local.properties`
+（模板见 `local.properties.example`，该文件已 gitignore，不会入库）。
+没填就自动跳过相关测试，不会失败。
 
-联调用的 SMB 账号固定为 `firefly` / `firefly`，共享名 `media`，
-服务端是纯 Python 的 impacket（`scripts/dev-smb-server.py`），**不需要管理员权限**。
+排查 NAS 上的片源结构（尤其是 mp4 的 `moov` 在头还是尾）：
+
+```powershell
+$env:PYTHONPATH = '<impacket 安装目录>'
+$env:FF_SMB_HOST='192.0.2.3'; $env:FF_SMB_SHARE='media'
+$env:FF_SMB_USER='...'; $env:FF_SMB_PASS='...'
+python .\scripts\smb-diag.py --limit 10 --probe 8
+```
 
 ## 文档
 

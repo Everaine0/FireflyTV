@@ -8,7 +8,6 @@ app/src/androidTest/assets/*.mp4
 *.iml
 .gradle/
 build/
-local.properties
 .idea/
 .DS_Store
 captures/
@@ -18,3 +17,6 @@ captures/
 *.aab
 *.keystore
 *.jks
+
+# 私密：真 NAS 测试账号等本机配置（模板见 local.properties.example）
+local.properties

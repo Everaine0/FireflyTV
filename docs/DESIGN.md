@@ -164,20 +164,49 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | 5 | 和风天气 TLS 握手在 Android 5.1 失败 | 留降级开关；真机验证 |
 | 6 | 遥控器键值差异 | `logcat` 查实际 keyCode；同时处理 `DPAD_*` 与 `ENTER` |
 | 7 | 4K 面板 + 老系统缩放假象 | 1080p 逻辑基准 + dp + 5% 安全边距 |
-| 8 | **非 faststart 的 mp4 播不了**（moov 在文件尾） | **已实测确认**，见下节。短期靠片源规整；中期自研 IO 或换 Media3 |
+| 8 | **非 faststart 的 mp4 播不了**（moov 在文件尾） | ✅ **已修**：`MoovRelocatingSource` 在 Java 侧把 moov 搬到虚拟文件头。见下节 |
 
-### 风险 8 的实测证据（重要）
+### 风险 8：从「实测限制」到已修复
 
-ijkplayer 0.8.8 在 `IMediaDataSource` 通道下**不会回尾读 moov**：
+**现象**：ijkplayer 0.8.8 在 `IMediaDataSource` 通道下**只顺序读、从不回尾读 moov**，
+读满第一个 32KB 块后直接报 `moov atom not found`。
+读取轨迹（logcat）：`readAt` 只被顺序调用 4 次（0/32768/65536/98304），全程没有跳读。
+试过格式选项 `seekable=1`，**无效**。
 
-- 读取轨迹（logcat）：`readAt` 只被顺序调用 4 次（0 / 32768 / 65536 / 98304，共 128119 字节），
-  全程没有发起任何回尾跳读，随后报 `moov atom not found` → `Invalid data found when processing input`
-- 对照实验：同一份内容加 `-movflags +faststart`（moov 挪到文件头）后**正常起播并出首帧**
-- 试过 `seekable=1` 格式选项，**无效**
+**影响面（在真实 NAS 上量的，不是推测）**：
 
-影响面：相机录的、下载来的 mp4 大多是非 faststart，属于常见片源形态，不是边角情况。
-现状用 `@Ignore` 固化在 `IjkPlaybackBridgeTest.moov在末尾的mp4无法播放_已知限制`，
-将来换 Media3 或自研 IO 时去掉注解即可立刻验证是否修好。
+| 剧 | 集数 | moov 位置 |
+| :--- | :--- | :--- |
+| 大宅门（4K H265） | 40 | 全部在**尾部** |
+| 猫和老鼠 50 周年 | 157 | 全部在**尾部** |
+| 娘道 | 76 | 文件头不是 `ftyp`，见下面的开放问题 |
+
+即：**197 集全部无法直接播放**。这不是边角情况，是全部内容。
+
+**修法**：[MoovRelocatingSource] 在 Java 侧解析顶层 box，把字节流重新排布成
+`ftyp + moov + 其余按原顺序`，只改动 view 层，不改一个字节的源文件、不做转码、不落临时文件。
+`readAt` 里按段映射虚拟偏移到物理偏移，段数只有个位数，代价可忽略。
+本来 moov 就在头部的文件原样透传。
+
+**验证**：`IjkPlaybackBridgeTest.moov在末尾的mp4也能播放` +
+`SmbEndToEndTest.能通过SMB播放并出首帧`（对真实 NAS 的 4K H265 片源）。
+
+### 开放问题：`娘道` 的文件头不是 mp4
+
+`电视剧/[娘道][2018][全集][国产剧]/01.mp4` 的头 64 字节是：
+
+```
+hex  : 474000100000b00d002ac300001a23f09a53d68707ffffffff...
+ascii: G@.......*....#..S..........................
+```
+
+没有 `ftyp`，`.mp4` 后缀名不成立。同步字节 `0x47` 开头，但不符合 MPEG-TS 的
+188 字节包结构（第二个包的位置对不上）。**这是什么格式需要确认**：
+
+- 如果是某种 TS 变体，FFmpeg 按内容探测仍可能播出来（`.mp4` 后缀不影响探测）
+- 如果是加密/私有容器，就得单独处理或换片源
+
+在确认真实格式之前，这一类片源能不能播是**未知**，不要当成已支持。
 
 ### 关键实现参数
 
@@ -225,8 +254,17 @@ ijkplayer 0.8.8 在 `IMediaDataSource` 通道下**不会回尾读 moov**：
 | 中文 TTS（风险 2） | ⏳ 待真机 | 运行时探测、失败退化为纯文字，逻辑已写；模拟器没有中文 TTS 引擎，**必须在目标电视上验证** |
 | 天气接口（风险 5） | ⏳ 待真机 | 接口形态已按和风 v7 确认（`X-QW-Api-Key` + `lang=zh`），但 Android 5.1 的 TLS 握手只能真机验证 |
 | `CATEGORY_HOME`（风险 1） | ⏳ 待真机 | 开机自启已写；抢主屏需在长虹系统上试 |
-| 直播重连 | ⏳ 未联调 | 退避重连逻辑已写，但 m3u 里的地址是占位；需要真实直播源验证 |
-| SMB 端到端 | ✅ 已联调 | 用 `scripts/dev-smb-server.py` 在宿主机起 SMB 服务，模拟器经 `10.0.2.2` 跑通：列库 → 跳过空文件夹 → 识别直播库 → 自然排序 → m3u 解析 → 随机读 → 播放出首帧 |
+| 直播重连 | ⏳ 未联调 | 退避重连逻辑已写，真实直播源还没试过 |
+| `娘道` 的容器格式 | ❓ 未知 | 文件头不是 `ftyp`，`.mp4` 后缀不成立；真实格式待确认（见风险 8 末节） |
+| 声音 | ❓ 待确认 | 之前模拟器是用 `-no-audio` 启动的；现在已改为带音频启动，需再确认一次 |
+
+### 已修复（本轮真实 NAS 联调暴露的两个硬伤）
+
+| 项 | 说明 |
+| :--- | :--- |
+| **崩溃闪退** | ijkplayer 的 `onPrepared/onError/onCompletion/onInfo` 在它自己的 `IjkMediaPlayer$EventHandler` 线程回调。之前直接透传给界面层，界面在非 UI 线程碰 View，抛 `CalledFromWrongThreadException` 当场崩；Activity 重建后又立刻报同样的错，于是「闪退之后再也打不开」。现在 `IjkPlaybackEngine` 用 `onMain{}` 统一把回调切回主线程 |
+| **moov 在尾部** | 真实 NAS 上 197 集全部是 non-faststart，原来一集都播不了。`MoovRelocatingSource` 把 moov 搬到虚拟文件头后正常起播（风险 8） |
+| SMB 端到端 | 对真实 NAS（SMB 3.1.1）跑通：列库 → 跳过空目录 → 识别直播库 → 列剧列集 → 逐集探 moov → m3u 解析 → 随机读 → 播放出首帧 |
 
 ## 11. 构建与部署要点
 

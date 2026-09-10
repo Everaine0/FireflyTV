@@ -10,10 +10,15 @@ import tv.danmaku.ijk.media.player.misc.IMediaDataSource
  * [readAt] 必须是**随机读**，否则拖进度与续播会失灵。ijkplayer 的读线程基本是顺序读，
  * 所以按块缓存最近若干块，命中即返回；真正跳读才回源。
  *
+ * 构造时就套上 [MoovRelocatingSource]：非 faststart 的 mp4 需要把 moov 搬到头部才能播
+ * （DESIGN 风险 8）。本来就在头部的文件会原样透传，没有额外开销。
+ *
  * 不做断线自愈重试：会话失效时直接抛错，由播放器触发 onError，
  * 界面层统一走「无法连接 NAS」故障页并每 10 秒重试（DESIGN §8）。
  */
-class SmbMediaDataSource(private val source: RandomAccessSource) : IMediaDataSource {
+class SmbMediaDataSource(underlying: RandomAccessSource) : IMediaDataSource {
+
+    private val source: RandomAccessSource = MoovRelocatingSource.wrap(underlying)
 
     constructor(cfg: Config.Smb, relativePath: String) : this(SmbRandomAccessSource(cfg, relativePath))
 

@@ -94,6 +94,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     override fun playSource(source: RandomAccessSource, startMs: Long) {
+        // 非 faststart 的 mp4 由 SmbMediaDataSource 内部负责把 moov 搬到头部（DESIGN 风险 8）
         val src = SmbMediaDataSource(source)
         releaseInternal()
         dataSource = src
@@ -130,7 +131,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
                     pendingSeekMs = 0
                 }
                 mp.start()
-                listener?.onPrepared(mp.duration)
+                val duration = mp.duration
+                onMain { listener?.onPrepared(duration) }
             }
         })
         p.setOnCompletionListener {
@@ -138,7 +140,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
                 // 直播"完成"通常是断流
                 scheduleLiveRetry()
             } else {
-                listener?.onCompletion()
+                onMain { listener?.onCompletion() }
             }
         }
         p.setOnErrorListener { _, what, extra ->
@@ -147,11 +149,11 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         }
         p.setOnInfoListener { _, what, _ ->
             if (what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
-                listener?.onFirstFrame()
+                onMain { listener?.onFirstFrame() }
             }
             false
         }
-        p.setOnVideoSizeChangedListener { _, _, _, _, _ -> listener?.onFirstFrame() }
+        p.setOnVideoSizeChangedListener { _, _, _, _, _ -> onMain { listener?.onFirstFrame() } }
 
         // 老人用：宁可轻微丢帧也不要黑屏卡住
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1L)
@@ -165,6 +167,18 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         return p
     }
 
+    /**
+     * 所有对外回调都必须回到主线程。
+     *
+     * ijkplayer 的 onPrepared / onError / onCompletion / onInfo 是在它自己的
+     * `IjkMediaPlayer$EventHandler` 线程上触发的。直接透传给界面层的话，
+     * 界面会在非 UI 线程上碰 View —— 抛 `CalledFromWrongThreadException` 当场崩，
+     * 而且 Activity 重建后立刻再报同样的错，表现就是「闪退之后再也打不开」。
+     */
+    private fun onMain(block: () -> Unit) {
+        if (Looper.myLooper() === Looper.getMainLooper()) block() else main.post(block)
+    }
+
     private fun handleError(what: Int, extra: Int) {
         if (liveReconnect && liveUrlProvider?.invoke() != null) {
             scheduleLiveRetry()
@@ -173,7 +187,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         val fatal = what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_UNSUPPORTED ||
             what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_MALFORMED ||
             extra == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_IO
-        listener?.onError("这个视频无法播放", fatal)
+        onMain { listener?.onError("这个视频无法播放", fatal) }
     }
 
     /** 断流自动重连：2 秒起退避，最多退到 10 秒，永不放弃（DESIGN §8）。 */

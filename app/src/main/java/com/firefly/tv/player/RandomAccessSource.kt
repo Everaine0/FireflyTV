@@ -54,18 +54,3 @@ class FileRandomAccessSource(path: String) : RandomAccessSource {
         runCatching { file.close() }
     }
 }
-
-/** 整块在内存里的字节源。插桩测试用来隔离「块缓存逻辑」和「底层读」两类问题。 */
-class ByteArrayRandomAccessSource(private val data: ByteArray) : RandomAccessSource {
-
-    override val size: Long get() = data.size.toLong()
-
-    override fun read(offset: Long, buf: ByteArray, bufOffset: Int, len: Int): Int {
-        if (offset < 0 || offset >= data.size) return -1
-        val n = minOf(len.toLong(), data.size - offset).toInt()
-        System.arraycopy(data, offset.toInt(), buf, bufOffset, n)
-        return n
-    }
-
-    override fun close() = Unit
-}

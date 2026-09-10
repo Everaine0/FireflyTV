@@ -1,0 +1,14 @@
+# 复制成 local.properties 再填自己的值。local.properties 不入库。
+#
+# 这里的账号只用于**插桩测试**连真实的 NAS / SMB 服务；
+# 应用本身不读取这些值，它的配置来自电视上的二维码配置页。
+#
+# 留空则相关测试自动跳过（assumeTrue），不会失败。
+
+ff.smb.host=
+ff.smb.share=
+ff.smb.user=
+ff.smb.pass=
+# 可选：域，以及共享内的根目录（例如共享下还有一层 tv 就填 tv）
+ff.smb.domain=
+ff.smb.root=

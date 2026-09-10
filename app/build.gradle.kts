@@ -3,6 +3,24 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+/**
+ * 本机私密配置：真 NAS 的 SMB 测试账号。
+ * 存在根目录的 local.properties（已 gitignore，模板见 local.properties.example）。
+ * 只用于插桩测试；应用本身不读这些值 —— 它的配置来自电视上的二维码配置页。
+ */
+val localSecrets: Map<String, String> = rootProject.file("local.properties")
+    .takeIf { it.exists() }
+    ?.readLines()
+    ?.mapNotNull { line ->
+        val t = line.trim()
+        if (t.isEmpty() || t.startsWith("#") || !t.contains('=')) return@mapNotNull null
+        val k = t.substringBefore('=').trim()
+        val v = t.substringAfter('=').trim()
+        if (v.isEmpty()) null else k to v
+    }
+    ?.toMap()
+    ?: emptyMap()
+
 android {
     namespace = "com.firefly.tv"
     compileSdk = 34
@@ -15,6 +33,14 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // 通过 instrumentation 参数把私密配置传进测试，避免写死在源码里
+        listOf(
+            "ff.smb.host", "ff.smb.share", "ff.smb.user",
+            "ff.smb.pass", "ff.smb.domain", "ff.smb.root",
+        ).forEach { key ->
+            localSecrets[key]?.let { testInstrumentationRunnerArguments[key] = it }
+        }
 
         ndk {
             // 电视 armeabi-v7a / arm64-v8a；模拟器 x86（缺了会直接崩）
@@ -59,6 +85,13 @@ android {
 
     lint {
         abortOnError = false
+    }
+
+    testOptions {
+        unitTests {
+            // 被测类里有 android.util.Log 调用；单测跑在 JVM 上，需要让它返回默认值而不是抛异常
+            isReturnDefaultValues = true
+        }
     }
 }
 

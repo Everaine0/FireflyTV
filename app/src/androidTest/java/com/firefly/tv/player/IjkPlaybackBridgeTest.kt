@@ -111,21 +111,31 @@ class IjkPlaybackBridgeTest {
      * 用 @Ignore 标注并在 DESIGN 风险清单里登记，而不是假装它能播。
      */
     /**
-     * moov 在文件末尾的 mp4（非 faststart）**播不了** —— 这是已经实测确认的限制。
+     * moov 在文件末尾的 mp4（非 faststart）也要能播 —— 靠 [MoovRelocatingSource] 把 moov 搬到头部。
      *
-     * 证据（插桩测试 + logcat 读取轨迹）：mov 解复用器只顺序读了 4 次 32KB
-     * （0/32768/65536/98304 共 128119 字节），全程没有发起任何回尾跳读，
-     * 然后报 "moov atom not found"。试过 `seekable=1`，无效。
-     * 对照实验：同一份内容加 `-movflags +faststart`（moov 在头）就能正常起播并出首帧。
-     *
-     * 相机录的、下载来的 mp4 大多是非 faststart，所以这条限制必须记在案。
-     * 用 @Ignore 保留用例：将来换 Media3 或自研 IO 时，去掉注解就能立刻验证是否修好。
+     * 背景：ijkplayer 0.8.8 在 IMediaDataSource 通道下只顺序读、不回尾读 moov，
+     * 直接播会报 "moov atom not found"（DESIGN 风险 8）。相机录的、下载来的 mp4 大多是这种布局，
+     * 所以这条必须过，否则等于一半片源打不开。
      */
     @Test
-    @org.junit.Ignore("已知限制：ijkplayer 0.8.8 的 IMediaDataSource 不回尾读 moov，见方法注释")
-    fun moov在末尾的mp4无法播放_已知限制() {
+    fun moov在末尾的mp4也能播放() {
         val video = TailMoovVideo.ensure(context)
+        // 先确认这个素材确实是非 faststart，否则这条测试就是假绿
+        val moovAt = findMoovOffset(video.readBytes())
+        assertTrue("测试素材的 moov 应在文件尾部，实际偏移 $moovAt", moovAt > video.length() / 2)
+
         playAndAssert(FileRandomAccessSource(video.absolutePath), "moov 在末尾")
+    }
+
+    private fun findMoovOffset(data: ByteArray): Int {
+        for (i in 0 until data.size - 4) {
+            if (data[i] == 'm'.code.toByte() && data[i + 1] == 'o'.code.toByte() &&
+                data[i + 2] == 'o'.code.toByte() && data[i + 3] == 'v'.code.toByte()
+            ) {
+                return i
+            }
+        }
+        return -1
     }
 
     /** 跳读必须真的生效，否则续播和拖进度都会失灵（DESIGN §6）。 */
