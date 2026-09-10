@@ -388,7 +388,7 @@ function show(text, ok) {
   msg.textContent = text;
   msg.className = 'msg ' + (ok ? 'ok' : 'err');
 }
-async function call(path, btn) {
+async function call(path, btn, okText) {
   btn.disabled = true;
   const old = btn.textContent;
   btn.textContent = '正在检查…';
@@ -399,7 +399,7 @@ async function call(path, btn) {
       body: body()
     });
     const j = await r.json();
-    if (j.ok) { show('检查通过，正在开始播放…', true); }
+    if (j.ok) { show(okText, true); }
     else { show('NAS：' + j.smb + '\n天气：' + j.weather, false); }
     return j.ok;
   } catch (e) {
@@ -410,10 +410,16 @@ async function call(path, btn) {
     btn.textContent = old;
   }
 }
-document.getElementById('btnTest').onclick = e => call('/api/test', e.target);
+// 「先测试一下」只检查，不会保存、也不会开始播放 —— 文案必须说清楚，
+// 否则用户以为已经生效，看着电视还停在二维码页会一头雾水。
+document.getElementById('btnTest').onclick = e =>
+  call('/api/test', e.target, '检查通过。确认没问题后，请点下面的「保存并开始使用」。');
 document.getElementById('btnSave').onclick = async e => {
-  const ok = await call('/api/save', e.target);
-  if (ok) { document.getElementById('btnSave').disabled = true; }
+  const ok = await call('/api/save', e.target, '已保存，电视马上开始播放…');
+  if (ok) {
+    document.getElementById('btnSave').disabled = true;
+    document.getElementById('btnTest').disabled = true;
+  }
 };
 </script>
 </body>
