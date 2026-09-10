@@ -86,26 +86,56 @@ class ConfigServerTest {
         try {
             val url = "http://127.0.0.1:${server.port}/api/test?t=${server.token}"
 
-            // 全部留空：两项都要给出各自的原因
+            // 全部留空：SMB 是必填，必须给出原因；天气可选，留空算通过
             val empty = request("POST", url, mapOf("t" to server.token))
             assertEquals(200, empty.code)
             assertTrue("应报告失败", empty.body.contains("\"ok\":false"))
             assertTrue("缺 SMB 提示：${empty.body}", empty.body.contains("请填写 NAS 地址"))
-            assertTrue("缺天气提示：${empty.body}", empty.body.contains("请填写天气 Key"))
+            // 天气留空必须是「跳过」而不是「未填」，否则没和风 Key 的人永远过不了配置页
+            assertTrue(
+                "天气留空应算通过：${empty.body}",
+                empty.body.contains("\"weather\":\"连接成功\""),
+            )
 
-            // 只填 SMB：SMB 仍需给出可读原因，天气仍报未填
+            // 天气只填一半：必须报「要么都填要么都留空」，不能静默通过
+            val halfWeather = request(
+                "POST", url,
+                mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare", "wkey" to "only-key"),
+            )
+            assertEquals(200, halfWeather.code)
+            assertFalse("不该成功：${halfWeather.body}", halfWeather.body.contains("\"ok\":true"))
+            assertTrue("天气填一半应提示：${halfWeather.body}", halfWeather.body.contains("要么都填"))
+
+            // SMB 填了但连不上：必须给出一句中文原因，而不是空白
             val partial = request(
                 "POST", url,
                 mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare"),
             )
             assertEquals(200, partial.code)
             assertFalse("不该成功", partial.body.contains("\"ok\":true"))
-            assertTrue("天气项应仍提示未填：${partial.body}", partial.body.contains("请填写天气 Key"))
-            // SMB 项不能是空的，必须有一句中文原因
             assertTrue("SMB 项没有给出原因：${partial.body}", Regex("\"smb\":\"[^\"]{2,}\"").containsMatchIn(partial.body))
 
             // 未知路径
             assertEquals(404, request("GET", "http://127.0.0.1:${server.port}/nope?t=${server.token}").code)
+        } finally {
+            server.stop()
+        }
+    }
+
+    @Test
+    fun 天气留空不算失败() {
+        val server = ConfigServer(context) {}
+        assertTrue(server.start())
+        try {
+            val url = "http://127.0.0.1:${server.port}/api/test?t=${server.token}"
+            // 天气三项全空 + SMB 填了但连不上：整体仍失败（SMB 是必填），
+            // 但天气那一项必须是「连接成功」（= 跳过），否则没 Key 的人过不了配置页
+            val res = request(
+                "POST", url,
+                mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare"),
+            )
+            assertEquals(200, res.code)
+            assertTrue("天气留空应算通过：${res.body}", res.body.contains("\"weather\":\"连接成功\""))
         } finally {
             server.stop()
         }

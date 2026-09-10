@@ -144,14 +144,13 @@ class ConfigServer(
     }
 
     /**
-     * 逐项实测。SMB 与天气分别试，谁失败就说谁的具体原因（DESIGN §2）。
+     * 逐项实测。SMB 是必填项，天气是可选项（DESIGN §2）。
+     *
+     * 天气做成可选的原因：老人看电视不依赖天气，而和风要单独申请 Key。
+     * 为了填天气而卡住「连 NAS 看电视」是反的。留空就跳过，填了就必须测通。
      * 返回 JSON：{"ok":bool,"smb":"...","weather":"..."}，成功项文案为「连接成功」。
      */
-    private fun testAll(p: Map<String, String>): String {
-        val smbMsg = testSmb(p)
-        val wMsg = testWeather(p)
-        return result(smbMsg, wMsg)
-    }
+    private fun testAll(p: Map<String, String>): String = result(testSmb(p), testWeather(p))
 
     private fun save(p: Map<String, String>): String {
         val smbMsg = testSmb(p)
@@ -184,7 +183,7 @@ class ConfigServer(
         return """{"ok":$ok,"smb":${json(smbMsg ?: "连接成功")},"weather":${json(wMsg ?: "连接成功")}}"""
     }
 
-    /** 返回 null = 成功，否则是给老人看的中文原因。 */
+    /** 返回 null = 通过（含"没填，跳过"），否则是给老人看的中文原因。 */
     private fun testSmb(p: Map<String, String>): String? {
         val cfg = Config.Smb(
             p["host"].orEmpty(), p["share"].orEmpty(), p["root"].orEmpty(),
@@ -199,11 +198,13 @@ class ConfigServer(
         }
     }
 
+    /** 天气是可选项：三项全空 = 跳过（通过）；填了任意一项就必须测通。 */
     private fun testWeather(p: Map<String, String>): String? {
-        val key = p["wkey"].orEmpty()
-        val host = p["whost"].orEmpty()
-        val loc = p["wloc"].orEmpty()
-        if (key.isBlank() || host.isBlank() || loc.isBlank()) return "请填写天气 Key、Host 和城市"
+        val key = p["wkey"].orEmpty().trim()
+        val host = p["whost"].orEmpty().trim()
+        val loc = p["wloc"].orEmpty().trim()
+        if (key.isBlank() && host.isBlank() && loc.isBlank()) return null // 可选，留空即跳过
+        if (key.isBlank() || host.isBlank() || loc.isBlank()) return "天气三项要么都填，要么都留空"
         return WeatherClient.test(Config.Weather(key, host, loc))
     }
 
@@ -354,7 +355,9 @@ class ConfigServer(
 </section>
 
 <section>
-  <h2>二、天气预报</h2>
+  <h2>二、天气预报（可以不填）</h2>
+  <p class="hint" style="margin:0 0 12px">不填也能正常看电视，只是按 OK 时看不到天气、也不会播报天气。
+     要填就三项都填，填了会一起检查。</p>
   <label>和风天气 Key</label>
   <input id="wkey" autocomplete="off" autocapitalize="off">
   <label>和风天气 API Host</label>
@@ -396,7 +399,7 @@ async function call(path, btn) {
       body: body()
     });
     const j = await r.json();
-    if (j.ok) { show('两项都通过了，正在开始播放…', true); }
+    if (j.ok) { show('检查通过，正在开始播放…', true); }
     else { show('NAS：' + j.smb + '\n天气：' + j.weather, false); }
     return j.ok;
   } catch (e) {

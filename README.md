@@ -53,9 +53,15 @@
 # 生成测试素材（插桩测试的示例视频 + 本地 SMB 联调用的媒体库目录树）
 .\scripts\make-test-media.ps1
 
-# 启动与目标电视同版本的 TV 模拟器（自带遥控器面板）
-<Android SDK>\emulator\emulator.exe -avd firefly_tv -no-snapshot -no-boot-anim -gpu swiftshader_indirect
+# 一键拉起「用模拟器试流程」：宿主机 SMB 服务 + Android TV 模拟器 + 配置页端口转发
+.\scripts\dev-env.ps1
 ```
+
+`dev-env.ps1` 跑完会把配置页地址打出来，照着填就能在模拟器里走完整个流程。
+模拟器里宿主机的地址是 **`10.0.2.2`**（不是 `127.0.0.1`）。
+
+联调用的 SMB 账号固定为 `firefly` / `firefly`，共享名 `media`，
+服务端是纯 Python 的 impacket（`scripts/dev-smb-server.py`），**不需要管理员权限**。
 
 ## 文档
 
