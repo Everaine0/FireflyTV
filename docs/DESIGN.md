@@ -494,6 +494,8 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 | 网络诊断 | `…class=com.firefly.tv.diag.NetworkDiagTest`，结果看 `adb logcat -s FireflyDiag`（模拟器里 `ping` 不通是正常的，NAT 不回 ICMP，**只有 TCP 能说明问题**） |
 | 测试素材 | `.\scripts\make-test-media.ps1`（moov 位置对照）+ `.\scripts\make-audio-fixtures.ps1`（音频编码对照）。生成的媒体**都不入库**，见 `app/src/androidTest/assets/README.md`；`app/src/test/resources/real-ac3.ts` 是入库的 TS 语料，用来验证轨道探测 |
 | 诊断脚本 | `scripts/ts-psi.py`（正确的 PAT/PMT 解析，文件头写了三个踩过的假象）、`scripts/push-config.py`（本机联调直接写配置，账号从 `local.properties` 读）、`scripts/check-ac3-decode.ps1` |
+| moov 重排取证 | `scripts/verify-relocation-full.py`（把重排后的**完整**字节物化出来，用 ffmpeg 验；截断样本会给出假结论）、`scripts/dump-stco.py` / `inspect-mp4-moov.py`（读 moov 结构与 chunk 偏移表） |
+| WSL 侧配置核查 | `scripts/wsl-check-ffmpeg-config.sh`（逐 ABI 查 FFmpeg 编进去的解码器/解析器/解复用器）、`wsl-check-parsers.sh`（**解码器和解析器是两回事**，只看 `nm \| grep decoder` 会漏）、`wsl-fix-apt.sh`（清 apt 锁 + 禁用挡住 `apt-get update` 的 NVIDIA 源） |
 | 装到电视 | U 盘拷 APK → 电视文件管理安装；或手机电视助手局域网推送 |
 | 电视设置 | 开「允许未知来源应用」；设置开机自启；尝试设为默认桌面 |
 
