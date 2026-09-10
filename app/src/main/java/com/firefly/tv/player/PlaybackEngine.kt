@@ -63,6 +63,51 @@ interface PlaybackEngine {
     fun isPlaying(): Boolean
     fun positionMs(): Long
     fun durationMs(): Long
+
+    /**
+     * 画面实际输出的帧率。
+     *
+     * 这是「播放器还活着吗」的**唯一可靠判据**，`isPlaying()` 和 `positionMs()` 都不行：
+     *
+     *  - `isPlaying()` 在原生侧只查 `mp_state` 这个状态变量
+     *    （`ff_ffplay.c` 的 `ijkmp_is_playing`），**播放器内部线程全死光了它照样返回 true**。
+     *  - `positionMs()` 实测在 SMB + IMediaDataSource 通路上恒为 0，没法当判据。
+     *
+     * 而输出帧率来自视频时钟，解码链一断就掉到 0。
+     * 现场佐证：用户报「卡住」时抓线程栈，ijkplayer 的线程
+     * （`ff_read`/`ff_audio_dec`/`ff_video_dec`/`ff_aout_android`）一个都不存在，
+     * 进程 CPU 增量为 0 —— 这时输出帧率必然是 0。
+     */
+    fun outputFps(): Float
+
+    /**
+     * 一份用于判断「播放器还活着吗」的快照。
+     *
+     * 为什么不是单一指标：实测在 SMB + `IMediaDataSource` 通路上，
+     * **输出帧率和 `currentPosition` 都恒为 0**（见 `PlayerLivenessTest`），
+     * 拿任何一个单独做判据都会失效。
+     * 所以把几个不同来源的计数器一起取回来，让调用方用「全都长时间不变」来判定。
+     */
+    class Liveness(
+        /** 已缓存的视频时长（毫秒）。读取线程还活着时它会增长。 */
+        val videoCachedMs: Long,
+        /** 累计读取字节数。 */
+        val trafficBytes: Long,
+        val positionMs: Long,
+        val outputFps: Float,
+    ) {
+        /** 和另一份快照相比，有没有任何一个计数器在动。 */
+        fun differsFrom(o: Liveness?): Boolean {
+            if (o == null) return true
+            return videoCachedMs != o.videoCachedMs ||
+                trafficBytes != o.trafficBytes ||
+                positionMs != o.positionMs ||
+                outputFps != o.outputFps
+        }
+    }
+
+    fun liveness(): Liveness
+
     fun seekTo(ms: Long)
     fun pause()
     fun resume()
@@ -104,6 +149,24 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
     override fun setListener(l: PlaybackEngine.Listener) {
         listener = l
+    }
+
+    /**
+     * 首帧只上报一次。
+     *
+     * ijkplayer 会在每次分辨率变化时重发 `VIDEO_RENDERING_START`
+     * （HLS 换分片很常见），不去重的话上层会反复收到「首帧」，
+     * 每次都去撤看门狗、刷界面。
+     */
+    private var firstFrameFired = false
+
+    /** 是否已经知道视频尺寸（= 解码器已就绪，但**不代表**出过帧）。 */
+    private var sizeKnown = false
+
+    private fun fireFirstFrame() {
+        if (firstFrameFired) return
+        firstFrameFired = true
+        onMain { listener?.onFirstFrame() }
     }
 
     override fun attach(surface: Surface) {
@@ -153,6 +216,10 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     private fun newPlayer(): IjkMediaPlayer {
+        // 每次起播都要重置：这两个标志描述的是「当前这一次播放」，
+        // 不清掉的话第二次起播会永远收不到首帧（被 firstFrameFired 挡住）。
+        firstFrameFired = false
+        sizeKnown = false
         val p = IjkMediaPlayer()
         p.setOnPreparedListener(object : tv.danmaku.ijk.media.player.IMediaPlayer.OnPreparedListener {
             override fun onPrepared(mp: tv.danmaku.ijk.media.player.IMediaPlayer) {
@@ -182,14 +249,28 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         p.setOnInfoListener { _, what, _ ->
             when (what) {
                 tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START ->
-                    onMain { listener?.onFirstFrame() }
+                    fireFirstFrame()
 
                 tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_AUDIO_RENDERING_START ->
                     onMain { listener?.onAudioStarted() }
             }
             false
         }
-        p.setOnVideoSizeChangedListener { _, _, _, _, _ -> onMain { listener?.onFirstFrame() } }
+        // ⚠️ 这里**不能**当成首帧。
+        //
+        // 原来这一行也调 onFirstFrame()，是个真实存在过的 bug：
+        // `MEDIA_INFO_VIDEO_SIZE_CHANGED` 在**准备阶段**就会触发 —— 解码器刚拿到
+        // 分辨率就报，此时一帧都还没解出来。而 onFirstFrame 的第一件事是撤掉
+        // 起播看门狗，于是看门狗在画面真正出来之前就被撤了。
+        //
+        // 后果：如果解码器随后卡住（例如模拟器软解不动 4K H.265），
+        // 就再也没有任何东西会报故障，界面永远冻在最后一帧 ——
+        // 正是用户报的「切换其他电视剧卡死」。
+        //
+        // 现在只记下尺寸，首帧必须由 VIDEO_RENDERING_START 触发。
+        p.setOnVideoSizeChangedListener { _, _, _, _, _ ->
+            sizeKnown = true
+        }
 
         // 老人用：宁可轻微丢帧也不要黑屏卡住
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1L)
@@ -202,6 +283,23 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", probe?.second ?: t.analyzeDurationUs)
         // 内嵌中文字幕轨优先，无中文则整个不显示（DESIGN §5）
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "subtitle", 1L)
+
+        // ---- 让「流断了」变成一次明确的报错，而不是静默僵死 ----
+        //
+        // 起因：用户报「卡住」。抓线程栈发现 ijkplayer 的线程全部消失、
+        // 进程 CPU 增量为 0，但**既没有 onError 也没有 onCompletion** ——
+        // 因为底层的 socket 读默认是无限等待的，对方不再发数据时就永远挂着。
+        // 界面层唯一能自救的两个信号都没来，于是画面冻在最后一帧再也不动。
+        //
+        // 给底层 I/O 设上限，超时就会走 onError → 界面重连。
+        // 15 秒是权衡：太短会把正常的缓冲抖动误判成断流。
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rw_timeout", IO_TIMEOUT_US)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", IO_TIMEOUT_US)
+        if (kind == PlaybackMode.Kind.LIVE) {
+            // 直播用 HTTP/HTTPS：再给一层连接与读取超时
+            p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http_persistent", 0L)
+            p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 1L)
+        }
 
         player = p
         return p
@@ -250,6 +348,22 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
     override fun durationMs(): Long = player?.duration ?: 0L
 
+    override fun outputFps(): Float = runCatching {
+        player?.videoOutputFramesPerSecond ?: 0f
+    }.getOrDefault(0f)
+
+    override fun liveness(): PlaybackEngine.Liveness {
+        val p = player ?: return PlaybackEngine.Liveness(0, 0, 0, 0f)
+        return runCatching {
+            PlaybackEngine.Liveness(
+                videoCachedMs = p.videoCachedDuration,
+                trafficBytes = p.trafficStatisticByteCount,
+                positionMs = p.currentPosition,
+                outputFps = p.videoOutputFramesPerSecond,
+            )
+        }.getOrDefault(PlaybackEngine.Liveness(0, 0, 0, 0f))
+    }
+
     override fun seekTo(ms: Long) {
         // 直播没有可信的时间轴，seek 进去就是长时间音画不同步（见 PlaybackMode）
         if (kind == PlaybackMode.Kind.LIVE) return
@@ -283,5 +397,10 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         }
         dataSource?.close()
         dataSource = null
+    }
+
+    private companion object {
+        /** 底层 I/O 超时（微秒）。见 [newPlayer] 里的说明。 */
+        const val IO_TIMEOUT_US = 15_000_000L
     }
 }

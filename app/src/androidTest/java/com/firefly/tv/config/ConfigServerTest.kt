@@ -91,10 +91,13 @@ class ConfigServerTest {
             assertEquals(200, empty.code)
             assertTrue("应报告失败", empty.body.contains("\"ok\":false"))
             assertTrue("缺 SMB 提示：${empty.body}", empty.body.contains("请填写 NAS 地址"))
-            // 天气留空必须是「跳过」而不是「未填」，否则没和风 Key 的人永远过不了配置页
+            // 天气留空必须是「跳过」而不是「失败」，否则没和风 Key 的人永远过不了配置页。
+            // 但措辞**不能说成「连接成功」** —— 那样用户会以为天气配好了，
+            // 等发现电视上不显示天气又要重新排查一遍。
+            // （同类假反馈之前出现过：配置页说「检查通过，正在开始播放」但其实没保存。）
             assertTrue(
-                "天气留空应算通过：${empty.body}",
-                empty.body.contains("\"weather\":\"连接成功\""),
+                "天气留空应说清是「跳过」：${empty.body}",
+                empty.body.contains("\"weather\":\"没填，已跳过"),
             )
 
             // 天气只填一半：必须报「要么都填要么都留空」，不能静默通过
@@ -129,13 +132,17 @@ class ConfigServerTest {
         try {
             val url = "http://127.0.0.1:${server.port}/api/test?t=${server.token}"
             // 天气三项全空 + SMB 填了但连不上：整体仍失败（SMB 是必填），
-            // 但天气那一项必须是「连接成功」（= 跳过），否则没 Key 的人过不了配置页
+            // 但天气那一项不能算失败，否则没 Key 的人过不了配置页。
+            // 措辞必须是「跳过」而不是「连接成功」—— 跳过不等于通过。
             val res = request(
                 "POST", url,
                 mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare"),
             )
             assertEquals(200, res.code)
-            assertTrue("天气留空应算通过：${res.body}", res.body.contains("\"weather\":\"连接成功\""))
+            assertTrue(
+                "天气留空应说清是「跳过」：${res.body}",
+                res.body.contains("\"weather\":\"没填，已跳过"),
+            )
         } finally {
             server.stop()
         }

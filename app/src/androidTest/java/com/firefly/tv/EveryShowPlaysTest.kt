@@ -139,8 +139,11 @@ class EveryShowPlaysTest {
         worker.start()
 
         frame.await(START_TIMEOUT_S, TimeUnit.SECONDS)
-        // 首帧之后给音频一点时间（大文件要先把缓冲填起来）
-        audio.await(8, TimeUnit.SECONDS)
+        // 首帧之后给音频一点时间。4K H.265 在模拟器上纯软解极慢，
+        // 视频线程会把 CPU 吃光，音频可能排不上队 —— 所以这里的等待只是
+        // 「尽量观察到」，不作为断言依据（真正的音频断言在 Ac3AudioTest 里，
+        // 那份是能实时播放的片源）。
+        audio.await(25, TimeUnit.SECONDS)
         val secs = (System.currentTimeMillis() - t0) / 1000.0
         val r = R(frame.count == 0L, audio.count == 0L, secs, err)
         runCatching { engine.release() }
@@ -152,14 +155,4 @@ class EveryShowPlaysTest {
         /** 起播看门狗是 25 秒（MainActivity），这里给到 35 秒留余量。 */
         const val START_TIMEOUT_S = 35L
     }
-}
-
-/**
- * `SmbClient` 没有实现 `Closeable`（只有 `close()`），所以用不了 Kotlin 的 `use`。
- * 这里补一个等价的小工具，免得每个测试都写一遍 try/finally。
- */
-private inline fun <T> SmbClient.use0(block: (SmbClient) -> T): T = try {
-    block(this)
-} finally {
-    runCatching { close() }
 }

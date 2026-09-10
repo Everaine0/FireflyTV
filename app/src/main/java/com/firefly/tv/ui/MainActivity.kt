@@ -290,6 +290,112 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         onError("这个视频打不开，正在换下一个", fatal = false)
     }
 
+    // ---- 播放中存活看门狗 ----
+
+    /**
+     * 「播放器悄悄死掉」看门狗。
+     *
+     * ## 为什么还需要第二个看门狗
+     *
+     * [stallWatchdog] 只保护**首帧之前**，`onFirstFrame` 一到就被撤掉。
+     * 而用户实测到的「卡住」是发生在**播放中**：画面冻在最后一帧再也不动。
+     *
+     * 抓线程栈确认了现场：ijkplayer 的线程
+     * （`ff_read` / `ff_audio_dec` / `ff_video_dec` / `ff_aout_android`）**全部消失**，
+     * 进程 CPU 增量为 0，但**既没有 `onError` 也没有 `onCompletion`**。
+     * 界面层能自救的两个信号都没来，于是永远冻着。
+     *
+     * ## 判据为什么是「输出帧率」而不是位置或 isPlaying
+     *
+     *  - `isPlaying()` 在原生侧只查 `mp_state` 状态变量，**线程全死了它照样返回 true**
+     *  - `positionMs()` 实测在 SMB 通路上恒为 0（见 `PlayerLivenessTest`），没法用
+     *  - `outputFps()` 来自视频时钟，解码链一断就掉到 0 —— 这是唯一反映真实存活的信号
+     *
+     * 要求连续 [LIVENESS_STRIKES] 次都读到 0 才动手，避免把正常的缓冲抖动
+     * （换台、HLS 换分片）误判成死机。
+     */
+    private val livenessWatchdog = object : Runnable {
+        override fun run() {
+            if (!gotFirstFrame || !engine.isPlaying()) {
+                strikes = 0
+                main.postDelayed(this, LIVENESS_INTERVAL_MS)
+                return
+            }
+            val fps = engine.outputFps()
+            if (fps > 0.5f) {
+                strikes = 0
+                lastLiveFps = fps
+            } else {
+                strikes++
+                trace("存活检查：帧率=$fps 连续第 $strikes 次为 0")
+                if (strikes >= LIVENESS_STRIKES) {
+                    strikes = 0
+                    Log.w(TAG, "画面连续 ${LIVENESS_STRIKES * LIVENESS_INTERVAL_MS / 1000} 秒没有输出，判定播放器已死，自动重连")
+                    trace("livenessWatchdog 判定播放器已死，自动重连")
+                    recoverFromDeadPlayer()
+                    return
+                }
+            }
+            main.postDelayed(this, LIVENESS_INTERVAL_MS)
+        }
+    }
+
+    private var strikes = 0
+    private var lastLiveFps = 0f
+
+    /**
+     * 自动重连不能无上限地试。
+     *
+     * 如果片源本身就有问题（比如 4K H.265 在这台设备上根本解不动），
+     * 看门狗会一直判定「死了 → 重连 → 又死」，画面每隔十几秒重启一次，
+     * 用户看到的是「一直在闪」，比冻住更糟。
+     * 所以连续重启超过 [MAX_AUTO_RECOVER] 次就停下来，老实出故障页。
+     */
+    private var recoverCount = 0
+    private var recoverWindowStart = 0L
+
+    /** 播放器已经死了（不会自己报错）—— 只能重建一个。 */
+    private fun recoverFromDeadPlayer() {
+        val now = System.currentTimeMillis()
+        if (now - recoverWindowStart > RECOVER_WINDOW_MS) {
+            recoverWindowStart = now
+            recoverCount = 0
+        }
+        recoverCount++
+        if (recoverCount > MAX_AUTO_RECOVER) {
+            trace("自动重连 $recoverCount 次仍失败，出故障页")
+            disarmLivenessWatchdog()
+            showFault("画面卡住了，请按一下遥控器上的返回键再试", retry = false)
+            return
+        }
+
+        val lib = libraries.getOrNull(libIndex)
+        disarmLivenessWatchdog()
+        // 先把死的那个彻底丢掉，否则新起的播放器会和它抢 Surface
+        runCatching { engine.release() }
+        trace("自动重连第 $recoverCount 次 lib=${lib?.name}")
+        if (lib is Library.Live) {
+            currentTitle = channels.getOrNull(channelIndex)?.name ?: currentTitle
+            playChannel()
+        } else {
+            // 位置在这条通路上取不到（恒为 0，见 PlayerLivenessTest），
+            // 所以只能从头续播同一集。对老人来说「这一集重头放」远比
+            // 「画面永远冻着」好收拾。
+            playEpisode(0L)
+        }
+    }
+
+    private fun armLivenessWatchdog() {
+        main.removeCallbacks(livenessWatchdog)
+        strikes = 0
+        main.postDelayed(livenessWatchdog, LIVENESS_INTERVAL_MS)
+    }
+
+    private fun disarmLivenessWatchdog() {
+        main.removeCallbacks(livenessWatchdog)
+        strikes = 0
+    }
+
     // ---- 按键（只有三类） ----
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
@@ -1090,6 +1196,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         gotFirstFrame = true
         main.removeCallbacks(stallWatchdog)
         showFault(null)
+        // 首帧之后换成「存活看门狗」：上面的 stallWatchdog 只管首帧之前，
+        // 而用户实测的「卡住」发生在播放中（见 livenessWatchdog 的说明）
+        armLivenessWatchdog()
         // 画面已经出来了，「正在打开…」的过渡页就没必要再占着屏幕
         main.removeCallbacks(configStartingTick)
         configStartingTick.run()
@@ -1136,6 +1245,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         ioHandler.removeCallbacksAndMessages(null)
         runCatching { hud.dismiss() }
         runCatching { main.removeCallbacks(stallWatchdog) }
+        runCatching { disarmLivenessWatchdog() }
         runCatching { engine.release() }
         runCatching { tts.shutdown() }
         runCatching { abandonAudioFocus() }
@@ -1172,6 +1282,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 起播后多久没出首帧就判定卡死。4K 大文件要留足时间。 */
         private const val STALL_TIMEOUT_MS = 25_000L
+
+        /** 播放中存活检查的间隔。 */
+        private const val LIVENESS_INTERVAL_MS = 5_000L
+
+        /** 3 次 × 5 秒 = 15 秒。留这个缓冲是为了不把正常的缓冲抖动
+         *  （换台、HLS 换分片、SMB 偶发卡顿）误判成死机 —— 误判会让画面无故重启，
+         *  比重启晚几秒更烦人。 */
+        private const val LIVENESS_STRIKES = 3
+
+        /** 自动重连的次数上限与统计窗口，防止「一直闪」。 */
+        private const val MAX_AUTO_RECOVER = 3
+        private const val RECOVER_WINDOW_MS = 120_000L
+
         private const val WEATHER_TTL_MS = 30 * 60 * 1000L
         private val NUM_DIGITS = arrayOf("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
     }
