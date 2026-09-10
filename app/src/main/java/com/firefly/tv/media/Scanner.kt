@@ -54,6 +54,9 @@ object Scanner {
 
     const val MAX_ENTRIES = 2000
 
+    /** 按内容探测时最多看几个文件，避免整柜非视频文件把列目录拖慢。 */
+    private const val CONTENT_PROBE_LIMIT = 32
+
     /**
      * 列根目录下的媒体库。
      * 容错：无视频文件的文件夹、无有效内容的库一律跳过（DESIGN §4）。
@@ -94,7 +97,23 @@ object Scanner {
         if (entries.any { !it.isDir && MediaExt.isVideo(it.name) }) return Kind.Video
         // 电视剧目录：本级只有子文件夹，真正的视频在剧名目录里
         if (entries.any { it.isDir }) return Kind.Video
+        // 后缀全都不认识：可能整批片源后缀是错的（实测有整季 .mp4 实际是 MPEG-TS），
+        // 这时才按内容确认一下，避免整部剧被当成空目录跳过
+        if (hasVideoByContent(cfg, dir, entries.map { it.name })) return Kind.Video
         return Kind.Empty
+    }
+
+    /** 按内容逐个确认（只在后缀判断全军覆没时才调用，代价有界）。 */
+    private fun hasVideoByContent(cfg: Config.Smb, dir: String, names: List<String>): Boolean {
+        for (name in names.asSequence().take(CONTENT_PROBE_LIMIT)) {
+            val head = try {
+                SmbStore.with(cfg) { it.head("$dir/$name", MediaSniff.HEAD_BYTES) }
+            } catch (_: Throwable) {
+                continue
+            }
+            if (MediaSniff.looksLikeVideoByContent(head)) return true
+        }
+        return false
     }
 
     /** 视频库顶层 = 剧列表（每个子文件夹一部剧）。 */
@@ -124,15 +143,33 @@ object Scanner {
         val season = entries.filter { it.isDir }
             .map { it.name }
             .sortedWith(NaturalOrder)
-            .firstOrNull { it.isNotBlank() } ?: return emptyList()
+            .firstOrNull { it.isNotBlank() }
+        if (season != null) {
+            val inSeason = SmbStore.with(cfg) { it.list("$base/$season") }
+            val vids = inSeason.asSequence()
+                .filter { !it.isDir && MediaExt.isVideo(it.name) }
+                .map { it.name }
+                .sortedWith(NaturalOrder)
+                .take(MAX_ENTRIES)
+                .toList()
+            if (vids.isNotEmpty()) return vids
+        }
 
-        return SmbStore.with(cfg) { it.list("$base/$season") }
-            .asSequence()
-            .filter { !it.isDir && MediaExt.isVideo(it.name) }
+        // 后缀一个都不认识：按内容挑出实际是媒体的那些文件
+        return entries.asSequence()
+            .filter { !it.isDir && !MediaExt.isM3u(it.name) }
             .map { it.name }
+            .filter { name -> isVideoByContent(cfg, "$base/$name") }
             .sortedWith(NaturalOrder)
             .take(MAX_ENTRIES)
             .toList()
+    }
+
+    private fun isVideoByContent(cfg: Config.Smb, relativePath: String): Boolean = try {
+        val head = SmbStore.with(cfg) { it.head(relativePath, MediaSniff.HEAD_BYTES) }
+        MediaSniff.looksLikeVideoByContent(head)
+    } catch (_: Throwable) {
+        false
     }
 
     /** 剧集文件的完整相对路径（相对库根）。 */

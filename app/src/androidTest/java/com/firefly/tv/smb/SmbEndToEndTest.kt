@@ -7,6 +7,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.firefly.tv.core.Config
 import com.firefly.tv.media.Library
 import com.firefly.tv.media.LiveSource
+import com.firefly.tv.media.MediaSniff
 import com.firefly.tv.media.Scanner
 import com.firefly.tv.player.IjkPlaybackEngine
 import com.firefly.tv.player.PlaybackEngine
@@ -59,12 +60,32 @@ class SmbEndToEndTest {
         requireServer()
 
         val libraries = SmbStore.with(cfg) { Scanner.libraries(cfg) }
-        println("发现媒体库：${libraries.map { it.name + "(" + it::class.simpleName + ")" }}")
+        println("[自检] 发现媒体库：${libraries.map { it.name + "(" + it::class.simpleName + ")" }}")
 
-        assertTrue("一个媒体库都没识别出来", libraries.isNotEmpty())
-        // 没有视频也没有 m3u 的目录必须被跳过（DESIGN §4）
-        libraries.filterIsInstance<Library.Live>().forEach {
-            println("直播库 ${it.name} -> ${it.m3u}")
+        // 自检：账号配好了、服务也连着，那就必须真列出东西来。
+        // 如果这里是空的，说明是解析/兼容问题，不能让后面几条测试悄悄 skip 掉当没看见。
+        assertTrue("媒体库一个都没列出来，但 SMB 是通的 —— 分类逻辑有问题", libraries.isNotEmpty())
+
+        val videos = libraries.filterIsInstance<Library.Video>()
+        val lives = libraries.filterIsInstance<Library.Live>()
+        println("[自检] 视频库=${videos.map { it.name }}  直播库=${lives.map { it.name }}")
+        assertTrue("一个视频库都没有", videos.isNotEmpty())
+
+        videos.forEach { lib ->
+            val shows = SmbStore.with(cfg) { Scanner.shows(cfg, lib) }
+            println("[自检] ${lib.name} -> ${shows.size} 部剧 ${shows.take(4)}")
+            assertTrue("库 ${lib.name} 一部剧都没列出来", shows.isNotEmpty())
+            shows.take(3).forEach { show ->
+                val eps = SmbStore.with(cfg) { Scanner.episodes(cfg, lib, show) }
+                println("[自检]   《$show》 ${eps.size} 集  ${eps.take(3)}")
+                assertTrue("《$show》一集都没列出来", eps.isNotEmpty())
+            }
+        }
+
+        lives.forEach { lib ->
+            val channels = SmbStore.with(cfg) { LiveSource.channels(cfg, lib) }
+            println("[自检] 直播库 ${lib.name}(${lib.m3u}) -> ${channels.size} 个频道")
+            channels.take(4).forEach { println("[自检]    ${it.name} -> ${it.url}") }
         }
     }
 
@@ -145,6 +166,62 @@ class SmbEndToEndTest {
         }
     }
 
+    /**
+     * 后缀写成 `.mp4` 但实际是 MPEG-TS 的片源也要能播。
+     *
+     * 实测背景：某季《娘道》76 集全叫 `.mp4`，头 4 字节是 `47 40 00 10`，没有 `ftyp`，
+     * ffprobe 判定为 mpegts / h264 / ac3。这类文件不需要 moov，但**必须**能被
+     * 「按内容判断」的扫描逻辑列出来，否则整部剧会被当成空目录跳过。
+     *
+     * 注意别用「后缀不是已知视频后缀」去找这类文件 —— `.mp4` 本身就是已知后缀，
+     * 那样写永远找不着（第一版就踩了这个坑，测试静默跳过）。要按**内容**找。
+     */
+    @Test
+    fun 后缀与实际格式不符的片源也能列出并起播() {
+        requireServer()
+
+        val videos = SmbStore.with(cfg) { Scanner.libraries(cfg) }.filterIsInstance<Library.Video>()
+        assumeTrue("没有视频库", videos.isNotEmpty())
+
+        // 按内容找出「名不副实」的片源：后缀说是 mp4，内容却不是 ISO BMFF
+        var hit: Triple<Library.Video, String, String>? = null
+        var mismatched = 0
+        outer@ for (lib in videos) {
+            for (show in SmbStore.with(cfg) { Scanner.shows(cfg, lib) }) {
+                val eps = SmbStore.with(cfg) { Scanner.episodes(cfg, lib, show) }
+                for (ep in eps) {
+                    val path = Scanner.episodePath(lib, show, ep)
+                    val head = SmbStore.with(cfg) { it.head(path, MediaSniff.HEAD_BYTES) }
+                    if (head.size < 16) continue
+                    val byName = MediaSniff.looksLikeVideoByName(ep)
+                    val byContent = MediaSniff.looksLikeVideoByContent(head)
+                    if (byName && byContent && !isIsoBmff(head) && ep.lowercase().endsWith(".mp4")) {
+                        mismatched++
+                        if (hit == null) hit = Triple(lib, show, ep)
+                    }
+                    if (mismatched >= 3) break@outer
+                }
+            }
+        }
+        assumeTrue("这台 NAS 上没有「后缀与实际格式不符」的片源", hit != null)
+
+        val (lib, show, ep) = hit!!
+        val path = Scanner.episodePath(lib, show, ep)
+        println("名不副实的片源：$path")
+        val head = SmbStore.with(cfg) { it.head(path, MediaSniff.HEAD_BYTES) }
+        println("头部 hex: " + head.take(16).joinToString("") { "%02x".format(it) })
+        assertTrue(
+            "内容探测没认出这是视频（整部剧会消失）",
+            MediaSniff.looksLikeVideoByContent(head),
+        )
+        assertTrue("应被 TS 规则命中", head[0] == 0x47.toByte())
+
+        playAndAssert(cfg, path, "后缀不符($ep)")
+    }
+
+    private fun isIsoBmff(b: ByteArray): Boolean =
+        b.size >= 8 && String(b, 4, 4, Charsets.US_ASCII) == "ftyp"
+
     /** 真机播放：抽一部剧的第一集，验证能起播并出首帧。 */
     @Test
     fun 能通过SMB播放并出首帧() {
@@ -164,11 +241,15 @@ class SmbEndToEndTest {
 
         val path = Scanner.episodePath(videoLib, firstShow, eps.first())
         println("准备播放：$path")
+        playAndAssert(cfg, path, firstShow)
+    }
 
-        // 先验证随机读语义在真实网络上成立
-        val ds = SmbMediaDataSource(cfg, path)
+    /** 走完整播放通路：先验随机读，再验起播与首帧。 */
+    private fun playAndAssert(smb: Config.Smb, path: String, label: String) {
+        // 1) 随机读语义在真实网络上必须成立
+        val ds = SmbMediaDataSource(smb, path)
         val size = ds.getSize()
-        println("文件大小 = $size 字节 (${"%.1f".format(size / 1024.0 / 1024.0)}MB)")
+        println("[$label] 文件大小 = $size 字节 (${"%.1f".format(size / 1024.0 / 1024.0)}MB)")
         assertTrue("大小不合理：$size", size > 10_000)
         val buf = ByteArray(16)
         assertEquals(16, ds.readAt(0, buf, 0, 16))
@@ -176,7 +257,7 @@ class SmbEndToEndTest {
         assertEquals(-1, ds.readAt(size, buf, 0, 16))
         ds.close()
 
-        // 走完整播放通路
+        // 2) 完整播放
         val prepared = CountDownLatch(1)
         val firstFrame = CountDownLatch(1)
         val failure = AtomicReference<String?>(null)
@@ -185,7 +266,7 @@ class SmbEndToEndTest {
         main.post {
             engine.setListener(object : PlaybackEngine.Listener {
                 override fun onPrepared(durationMs: Long) {
-                    println("已起播，时长 ${durationMs}ms")
+                    println("[$label] 已起播，时长 ${durationMs}ms")
                     prepared.countDown()
                 }
 
@@ -200,13 +281,13 @@ class SmbEndToEndTest {
                     firstFrame.countDown()
                 }
             })
-            engine.playSmb(cfg, path, 0L)
+            engine.playSmb(smb, path, 0L)
         }
 
-        assertTrue("起播失败/超时：${failure.get()}", prepared.await(45, TimeUnit.SECONDS))
-        assertTrue("播放报错：${failure.get()}", failure.get() == null)
-        assertTrue("等不到首帧", firstFrame.await(45, TimeUnit.SECONDS))
-        println("SMB 播放出首帧 ✅")
+        assertTrue("[$label] 起播失败/超时：${failure.get()}", prepared.await(60, TimeUnit.SECONDS))
+        assertTrue("[$label] 播放报错：${failure.get()}", failure.get() == null)
+        assertTrue("[$label] 等不到首帧", firstFrame.await(60, TimeUnit.SECONDS))
+        println("[$label] 播放出首帧 ✅")
 
         main.post { engine.release() }
     }

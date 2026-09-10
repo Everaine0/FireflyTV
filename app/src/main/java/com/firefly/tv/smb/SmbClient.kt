@@ -115,6 +115,30 @@ class SmbClient(private val cfg: Config.Smb) {
         return Handle(file, size)
     }
 
+    /**
+     * 只读开头若干字节，用来按内容判断文件类型。
+     * 给「后缀名不可信」的片源用（例如实际是 MPEG-TS 却叫 .mp4）。
+     * 读不到就返回空数组，调用方按「不认识」处理。
+     */
+    fun head(relative: String, count: Int): ByteArray {
+        return try {
+            open(relative).use { h ->
+                val n = minOf(count.toLong(), h.size).toInt()
+                if (n <= 0) return ByteArray(0)
+                val buf = ByteArray(n)
+                var got = 0
+                while (got < n) {
+                    val r = h.read(got.toLong(), buf, got, n - got)
+                    if (r <= 0) break
+                    got += r
+                }
+                if (got == n) buf else buf.copyOf(got)
+            }
+        } catch (_: Throwable) {
+            ByteArray(0)
+        }
+    }
+
     /** 配置页「逐项实测」用：连得上 + 共享存在 + 根目录能列。 */
     fun probe(): String = try {
         val dirs = list("").count { it.isDir }
