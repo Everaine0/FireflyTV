@@ -6,7 +6,7 @@ Answers the questions that matter for the "moov atom not found" failure:
   - for each video: where is the `moov` box (front = faststart, tail = needs relocation)
 
 Credentials are read from environment variables or a local file that is gitignored:
-    set FF_SMB_HOST=192.0.2.3
+    set FF_SMB_HOST=192.168.1.100
     set FF_SMB_SHARE=media
     set FF_SMB_USER=...
     set FF_SMB_PASS=...

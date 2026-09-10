@@ -19,12 +19,15 @@ import androidx.appcompat.app.AppCompatActivity
 import com.firefly.tv.config.ConfigServer
 import com.firefly.tv.core.Config
 import com.firefly.tv.core.Lunar
+import com.firefly.tv.media.AudioSupport
 import com.firefly.tv.media.Library
+import com.firefly.tv.media.LibraryCache
 import com.firefly.tv.media.LiveSource
 import com.firefly.tv.media.Scanner
 import com.firefly.tv.net.WeatherClient
 import com.firefly.tv.player.IjkPlaybackEngine
 import com.firefly.tv.player.PlaybackEngine
+import com.firefly.tv.player.PlaybackMode
 import com.firefly.tv.smb.SmbClient
 import com.firefly.tv.smb.SmbStore
 import com.firefly.tv.tts.TtsSpeaker
@@ -49,6 +52,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private lateinit var configScreen: ConfigScreen
     private lateinit var faultScreen: FaultScreen
     private lateinit var overlay: OverlayScreen
+    private lateinit var hudView: HudView
 
     private lateinit var engine: PlaybackEngine
     private lateinit var tts: TtsSpeaker
@@ -63,16 +67,26 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private val focusListener by lazy {
         object : android.media.AudioManager.OnAudioFocusChangeListener {
             override fun onAudioFocusChange(focusChange: Int) {
-                when (focusChange) {
-                    android.media.AudioManager.AUDIOFOCUS_LOSS,
-                    android.media.AudioManager.AUDIOFOCUS_LOSS_TRANSIENT,
-                    -> engine.stop()
-
-                    // 拿回焦点后按库类型原样重播，别把直播当剧集重放
-                    android.media.AudioManager.AUDIOFOCUS_GAIN -> replayCurrent()
+                // 决策交给 AudioFocusPolicy（有单元测试钉住），这里只负责执行。
+                // 关键点：直播永远不 seek，所以重播时进度必须是 0。
+                val pos = engine.positionMs()
+                when (val a = AudioFocusPolicy.decide(contentKind(), focusChange, pos)) {
+                    is AudioFocusPolicy.Action.Continue -> Unit
+                    is AudioFocusPolicy.Action.PauseTransient -> engine.pause()
+                    is AudioFocusPolicy.Action.StopAndAbandon -> engine.stop()
+                    // 点播接着刚才的位置；直播 a.resumeMs 恒为 0，从当前时刻重新起播
+                    is AudioFocusPolicy.Action.Replay ->
+                        replayCurrent(if (a.content == AudioFocusPolicy.Content.OnDemand) pos else 0L)
                 }
             }
         }
+    }
+
+    /** 当前在播什么。按**库类型**判断，不看名字 —— 否则直播和剧集的状态会串味。 */
+    private fun contentKind(): AudioFocusPolicy.Content = when (libraries.getOrNull(libIndex)) {
+        is Library.Video -> if (episodes.isEmpty()) AudioFocusPolicy.Content.None else AudioFocusPolicy.Content.OnDemand
+        is Library.Live -> if (channels.isEmpty()) AudioFocusPolicy.Content.None else AudioFocusPolicy.Content.Live
+        null -> AudioFocusPolicy.Content.None
     }
 
     // ---- 当前播放位置 ----
@@ -101,11 +115,25 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      */
     private var librarySeq = 0
 
+    /** NAS 目录结构的落盘缓存；冷启动直接出画面，不用等 SMB 扫完。 */
+    private var cache: LibraryCache.Snapshot? = null
+
+    /** 按键反馈条。没有它，切库那几秒屏幕上什么都没有，看起来就是卡死。 */
+    private val hud = SwitchHud()
+
     private var currentTitle: String = ""
+
+    /** 这条流的音频这台电视解不了时，给用户的一句话（见 AudioSupport）。 */
+    private var audioWarning: String? = null
 
     // ---- 定时任务 ----
     private val overlayHide = Runnable { hideOverlay() }
     private val retryTick = Runnable { startPlayback() }
+    private val hudTick = object : Runnable {
+        override fun run() {
+            if (renderHud()) main.postDelayed(this, HUD_TICK_MS)
+        }
+    }
     private val positionTick = object : Runnable {
         override fun run() {
             savePositionDebounced()
@@ -130,11 +158,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         engine = IjkPlaybackEngine(this).apply { setListener(this@MainActivity) }
         tts = TtsSpeaker(this).apply { init() }
 
+        // 缓存读盘放在 IO 线程，别在主线程碰 SharedPreferences
+        ioHandler.post { cache = readCache() }
+
         if (!Config.configured(this)) {
             openConfigServer()
         } else {
             startPlayback()
             main.postDelayed(positionTick, POSITION_INTERVAL_MS)
+            main.postDelayed(hudTick, HUD_TICK_MS)
         }
     }
 
@@ -150,13 +182,16 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         configScreen = ConfigScreen(this)
         faultScreen = FaultScreen(this)
         overlay = OverlayScreen(this)
+        hudView = HudView(this)
 
         configScreen.visibility = View.GONE
         faultScreen.visibility = View.GONE
         overlay.visibility = View.GONE
+        hudView.visibility = View.GONE
         root.addView(configScreen, matchParent())
         root.addView(faultScreen, matchParent())
         root.addView(overlay, matchParent())
+        root.addView(hudView, matchParent())
 
         setContentView(root)
     }
@@ -262,20 +297,41 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         showFault(null) // 清掉故障页
         ioHandler.post {
+            // 先把落盘缓存读出来：冷启动靠它直接出画面，不必等 NAS 扫完（DESIGN §7）
+            if (cache == null) cache = readCache()
+            val cached = cache?.takeIf { !it.isEmpty }
+
+            if (cached != null) {
+                main.post {
+                    libraries = cached.libraries
+                    restoreSpot(cached.libraries)
+                }
+            }
+
             try {
                 val libs = Scanner.libraries(cfg)
+                val snap = LibraryCache.withLibraries(cache, libs)
+                commitCache(snap)
                 main.post {
                     if (libs.isEmpty()) {
                         showFault("NAS 上还没有可以播放的内容")
                     } else {
                         libraries = libs
-                        restoreSpot(libs)
+                        // 有缓存时界面已经在放了，不能再切一次 —— 否则画面会被打断重来
+                        if (cached == null) restoreSpot(libs)
                     }
                 }
             } catch (t: Throwable) {
                 val msg = SmbClient.describe(t)
                 SmbStore.drop()
-                main.post { showFault(msg, retry = true) }
+                main.post {
+                    // 缓存里有内容就先照常看，NAS 的毛病等它自己好；没有才报故障
+                    if (cache?.isEmpty != false) {
+                        showFault(msg, retry = true)
+                    } else {
+                        Log.w(TAG, "后台刷新失败（先用缓存继续播）：$msg")
+                    }
+                }
             }
         }
     }
@@ -286,8 +342,59 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         var li = libs.indexOfFirst { it.name == spot.lib }
         if (li < 0) li = 0
         // 只有「上次看的就是这个库」时才谈得上续播；否则从第 1 集开始
-        val sameLibrary = libs[li].name == spot.lib
-        selectLibrary(li, resumeShow = if (sameLibrary) spot.show else "", resumeIndex = spot.index, resumePos = if (sameLibrary) spot.posMs else 0L)
+        val start = Navigator.startPoint(spot.lib, libs[li].name, spot.show, spot.index, spot.posMs)
+        selectLibrary(li, resumeShow = start.show, resumeIndex = start.episode, resumePos = start.positionMs)
+    }
+
+    // ---- NAS 结构缓存 ----
+    //
+    // 用户实测的原话是「你不会每次都现查吧」。之前的答案很难看：确实每次都现查，
+    // 开机要几十次 SMB 往返。现在冷启动直接用上次的结构出画面，同时后台静默刷新。
+
+    private fun readCache(): LibraryCache.Snapshot? {
+        val text = Config.loadCache(this) ?: return null
+        val snap = runCatching { LibraryCache.parse(text) }.getOrNull() ?: return null
+        return snap.takeIf { !it.isEmpty }
+    }
+
+    /** 缓存只在 IO 线程上碰，所以这里不做同步。 */
+    private fun commitCache(snap: LibraryCache.Snapshot) {
+        cache = snap
+        Config.saveCache(this, LibraryCache.serialize(snap))
+    }
+
+    /** 一次按键的即时反馈。返回是否还需要继续跑定时器。 */
+    private fun renderHud(): Boolean {
+        val state = hud.peek(System.currentTimeMillis()) ?: run {
+            hudView.visibility = View.GONE
+            return false
+        }
+        hudView.render(state)
+        hudView.visibility = View.VISIBLE
+        return true
+    }
+
+    /** 内容真的开始播了：把「正在打开…」换成名字，1.6 秒后自动收起。 */
+    private fun onContentPicked(title: String) {
+        if (!Config.configured(this)) return
+        hud.onPlaying(title, System.currentTimeMillis())
+        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
+    }
+
+    /** 换剧/换台：先出一条名字，别让屏幕一动不动。 */
+    private fun announce(title: String) {
+        hud.onContentSwitch(title, System.currentTimeMillis())
+        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
+    }
+
+    private fun announceLibrary(name: String) {
+        // 换库就把上一条「没声音」的提示清掉：那是上一个片源的毛病，
+        // 留着会让人以为新片源也没声音
+        audioWarning = null
+        // 库名同时写进 OK 浮层：按左右键时用户本来就习惯按 OK 确认，现在按下就看到库名变了
+        currentTitle = SwitchHud.libraryTitle(name)
+        hud.onLibrarySwitch(name)
+        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
     }
 
     /**
@@ -324,33 +431,69 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         val lib = libraries[libIndex]
         val cfg = Config.smb(this)
 
+        // 立刻告诉用户「键收到了，正在打开哪个库」。切库要等 SMB 列目录，
+        // 原来这段时间屏幕上什么都没变，看起来就是卡住（用户实测反馈）。
+        announceLibrary(lib.name)
+
         when (lib) {
             is Library.Video -> {
-                ioHandler.post {
-                    val list = try {
-                        Scanner.shows(cfg, lib)
-                    } catch (t: Throwable) {
-                        postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
-                        return@post
-                    }
-                    postIf(seq) {
-                        if (list.isEmpty()) {
-                            // 这个库一部剧都没有：换下一个库
-                            selectLibrary(libIndex + dir, "", 0, 0L, dir)
-                        } else {
-                            cachedShowsLib = lib.name
-                            shows = list
-                            val found = list.indexOf(resumeShow)
-                            val si = if (found >= 0) found else 0
-                            val ep = if (found >= 0) resumeIndex else 0
-                            val pos = if (found >= 0) resumePos else 0L
-                            playShow(lib, si, ep, pos, seq)
-                        }
-                    }
+                // 缓存里有这个库的剧列表就先用着，画面马上出来，不必等 NAS
+                val cachedShows = cache?.showsOf(lib.name).orEmpty()
+                if (cachedShows.isNotEmpty()) {
+                    cachedShowsLib = lib.name
+                    shows = cachedShows
+                    val found = cachedShows.indexOf(resumeShow)
+                    playShow(
+                        lib,
+                        if (found >= 0) found else 0,
+                        if (found >= 0) resumeIndex else 0,
+                        if (found >= 0) resumePos else 0L,
+                        seq,
+                    )
+                    // 注意：这里**不能** return —— 还要去后台刷新一次。
+                    // 刷新回来发现首轮已经有内容在播，就不会再切一次（见 refreshShows）。
                 }
+                refreshShows(lib, cfg, seq, resumeShow, resumeIndex, resumePos, dir)
             }
 
             is Library.Live -> loadChannels(lib, Config.channel(this), seq)
+        }
+    }
+
+    /** 后台刷新剧列表：拿到新结果就更新缓存与界面，拿不到就继续用缓存。 */
+    private fun refreshShows(
+        lib: Library.Video,
+        cfg: Config.Smb,
+        seq: Int,
+        resumeShow: String,
+        resumeIndex: Int,
+        resumePos: Long,
+        dir: Int,
+    ) {
+        ioHandler.post {
+            val list = try {
+                Scanner.shows(cfg, lib)
+            } catch (t: Throwable) {
+                // 有缓存就没必要打扰用户；没有才报故障
+                if (shows.isEmpty()) postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
+                return@post
+            }
+            val snap = LibraryCache.withShows(cache ?: LibraryCache.withLibraries(null, libraries), lib.name, list)
+            commitCache(snap)
+            postIf(seq) {
+                if (list.isEmpty()) {
+                    // 这个库一部剧都没有：换下一个库
+                    selectLibrary(libIndex + dir, "", 0, 0L, dir)
+                    return@postIf
+                }
+                val firstRun = shows.isEmpty()
+                cachedShowsLib = lib.name
+                shows = list
+                if (firstRun) {
+                    val found = list.indexOf(resumeShow)
+                    playShow(lib, if (found >= 0) found else 0, if (found >= 0) resumeIndex else 0, if (found >= 0) resumePos else 0L, seq)
+                }
+            }
         }
     }
 
@@ -358,14 +501,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun switchLibrary(delta: Int) {
         if (libraries.isEmpty()) return
         val target = Navigator.horizontal(libIndex, libraries.size, delta)
-        // 只有在「目标库 == 上次记录的库」时才有记忆位置可用
+        // 记忆位置只对「上次看的那个库」有效，否则会拿着别的内容的名字去这个库里找
         val spot = Config.spot(this)
-        val same = libraries[target].name == spot.lib
+        val start = Navigator.startPoint(spot.lib, libraries[target].name, spot.show, spot.index, spot.posMs)
         selectLibrary(
             target,
-            resumeShow = if (same) spot.show else "",
-            resumeIndex = spot.index,
-            resumePos = if (same) spot.posMs else 0L,
+            resumeShow = start.show,
+            resumeIndex = start.episode,
+            resumePos = start.positionMs,
             dir = if (delta == 0) 1 else delta,
         )
     }
@@ -383,6 +526,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         when (action) {
             is Navigator.Action.PlayShow -> {
                 val lib = libraries.getOrNull(libIndex) as? Library.Video ?: return
+                // 先把剧名打出来：列剧集目录还要等一下，不能让屏幕一动不动
+                shows.getOrNull(action.showIndex)?.let { announce(it) }
                 playShow(lib, action.showIndex, action.episodeIndex, action.startMs, librarySeq)
             }
 
@@ -405,9 +550,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         null -> Navigator.Current.None
     }
 
-    /** 当前库的剧列表；只在首次需要时问一次 NAS。 */
+    /** 当前库的剧列表。内存 → 落盘缓存 → 最后才问 NAS。 */
     private fun loadShows(lib: Library.Video): List<String> {
         if (cachedShowsLib == lib.name && shows.isNotEmpty()) return shows
+        val cached = cache?.showsOf(lib.name).orEmpty()
+        if (cached.isNotEmpty()) {
+            cachedShowsLib = lib.name
+            shows = cached
+            return cached
+        }
         val list = try {
             Scanner.shows(Config.smb(this), lib)
         } catch (t: Throwable) {
@@ -431,23 +582,41 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         val wanted = shows[showIdx.coerceIn(0, shows.size - 1)]
         showName = wanted
         val cfg = Config.smb(this)
+
+        // 这部剧的集列表如果已经在缓存里（且是靠后缀认出来的），直接开播，不再问 NAS。
+        // 「切换很慢」的主因就是这个：以前每按一次上下键都要重新列一遍剧集目录。
+        val cached = cache?.episodesOf(wanted)
+        if (!cached.isNullOrEmpty()) {
+            episodes = cached
+            cachedShow = wanted
+            episodeIndex = epIdx.coerceIn(0, cached.size - 1)
+            playEpisode(startMs)
+        }
+
         ioHandler.post {
             val eps = try {
-                Scanner.episodes(cfg, lib, wanted)
+                Scanner.episodesDetailed(cfg, lib, wanted)
             } catch (t: Throwable) {
-                postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
+                if (episodes.isEmpty()) postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
                 return@post
             }
+            val snap = LibraryCache.withEpisodes(cache, wanted, eps.names, eps.byContent)
+            commitCache(snap)
             postIf(seq) {
-                if (eps.isEmpty()) {
-                    // 无视频文件的文件夹一律跳过（DESIGN §4）
-                    showFault("《$wanted》里没有能播放的视频", retry = false)
-                    main.postDelayed({ switchShowOrChannel(1) }, 3000)
-                } else {
-                    episodes = eps
-                    cachedShow = wanted
-                    episodeIndex = epIdx.coerceIn(0, eps.size - 1)
-                    playEpisode(startMs)
+                when {
+                    eps.names.isEmpty() -> {
+                        // 无视频文件的文件夹一律跳过（DESIGN §4）
+                        showFault("《$wanted》里没有能播放的视频", retry = false)
+                        main.postDelayed({ switchShowOrChannel(1) }, 3000)
+                    }
+                    // 首轮已经在播了就别切，免得画面刚出来又被重启
+                    cachedShow == wanted -> Unit
+                    else -> {
+                        episodes = eps.names
+                        cachedShow = wanted
+                        episodeIndex = epIdx.coerceIn(0, eps.names.size - 1)
+                        playEpisode(startMs)
+                    }
                 }
             }
         }
@@ -467,6 +636,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         val ep = episodes.getOrNull(episodeIndex) ?: return
         val path = Scanner.episodePath(lib, showName, ep)
         currentTitle = showName
+        // 先出名字，再去做后面那些可能慢的事
+        announce(showName)
         Config.saveSpot(this, lib.name, showName, episodeIndex, startMs)
 
         if (!surfaceReady) {
@@ -482,6 +653,32 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             } catch (t: Throwable) {
                 Log.w(TAG, "播放失败 $path", t)
                 main.post { onError("这个视频无法播放", fatal = true) }
+            }
+        }
+        checkAudio(path)
+    }
+
+    /**
+     * 起播前认一下音频编码。
+     *
+     * 实测：ijkplayer 的内核没有 AC-3 解码器，而《娘道》76 集全是 AC-3 ——
+     * 表现是「画面好好的，就是没声音」，用户只能反复重启电视。
+     * 认出来就直说，并且明确「画面能看」，别让人以为是电视坏了。
+     *
+     * 只读开头 1MB，纯字节解析，不依赖任何解码器，所以结论是确定的。
+     */
+    private fun checkAudio(path: String) {
+        audioWarning = null
+        val cfg = Config.smb(this)
+        ioHandler.post {
+            val head = runCatching {
+                SmbStore.with(cfg) { it.head(path, PROBE_BYTES) }
+            }.getOrNull() ?: return@post
+            val verdict = AudioSupport.probeFor(PlaybackMode.Kind.ON_DEMAND, head)
+            val warn = verdict.warning ?: return@post
+            main.post {
+                audioWarning = warn
+                Log.i(TAG, "音频提示：$warn")
             }
         }
     }
@@ -518,22 +715,34 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             playChannel()
             return
         }
+        // 落盘缓存里也有：冷启动换台不必等 NAS
+        val cached = cache?.channels?.get(lib.name)
+        if (!cached.isNullOrEmpty()) {
+            channels = cached
+            channelLib = lib.name
+            channelIndex = startIndex.coerceIn(0, cached.size - 1)
+            playChannel()
+        }
         val cfg = Config.smb(this)
         ioHandler.post {
             val list = try {
                 LiveSource.channels(cfg, lib)
             } catch (t: Throwable) {
-                postIf(seq) { showFault("直播源暂时无法加载", retry = true) }
+                if (channels.isEmpty()) postIf(seq) { showFault("直播源暂时无法加载", retry = true) }
                 return@post
             }
+            commitCache(LibraryCache.withChannels(cache, lib.name, list))
             postIf(seq) {
                 if (list.isEmpty()) {
                     showFault("直播源暂时无法加载", retry = true)
                 } else {
+                    val firstRun = channels.isEmpty()
                     channels = list
                     channelLib = lib.name
-                    channelIndex = startIndex.coerceIn(0, list.size - 1)
-                    playChannel()
+                    if (firstRun) {
+                        channelIndex = startIndex.coerceIn(0, list.size - 1)
+                        playChannel()
+                    }
                 }
             }
         }
@@ -542,6 +751,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun playChannel() {
         val ch = channels.getOrNull(channelIndex) ?: return
         currentTitle = ch.name
+        announce(ch.name) // 立刻出频道名，换台不能看起来没反应
+        engine.setMode(PlaybackMode.Kind.LIVE)
         engine.setLiveReconnect(true) { channels.getOrNull(channelIndex)?.url }
         engine.playUrl(ch.url)
     }
@@ -596,7 +807,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             "明天 $it.dayText$night ${it.tempMin}~${it.tempMax}°"
         }.orEmpty()
 
-        overlay.show(clock, dateParts.joinToString("  "), weatherText, tomorrow, currentTitle)
+        overlay.show(clock, dateParts.joinToString("  "), weatherText, tomorrow, currentTitle, audioWarning.orEmpty())
 
         // 天气过期就后台刷新，不阻塞浮层其他内容（DESIGN §8）
         if (Config.weather(this).ready && System.currentTimeMillis() - lastWeatherAt > WEATHER_TTL_MS) {
@@ -681,15 +892,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         return NUM_DIGITS[tens] + "十" + if (ones == 0) "" else NUM_DIGITS[ones]
     }
 
-    /** 按当前库类型原样重播当前位置（音频焦点拿回来时用）。 */
-    private fun replayCurrent() {
+    /**
+     * 音频焦点拿回来时重播。
+     *
+     * [resumeMs] 由 [AudioFocusPolicy] 给出：点播是真的进度，直播恒为 0。
+     * 以前直播也走「按库类型原样重播」，而直播的 positionMs 是从开播算起的毫秒数，
+     * 拿它去 seek 就是长时间音画不同步 —— 用户实测到的正是这个。
+     */
+    private fun replayCurrent(resumeMs: Long) {
         when (libraries.getOrNull(libIndex)) {
-            is Library.Video -> if (episodes.isNotEmpty()) playEpisode(engine.positionMs())
-            is Library.Live -> if (channels.isNotEmpty()) {
-                // 直播没有进度概念，直接重新起播当前频道
-                engine.setLiveReconnect(true) { channels.getOrNull(channelIndex)?.url }
-                playChannel()
-            }
+            is Library.Video -> if (episodes.isNotEmpty()) playEpisode(resumeMs)
+            is Library.Live -> if (channels.isNotEmpty()) playChannel()
             null -> Unit
         }
     }
@@ -738,6 +951,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     override fun onPrepared(durationMs: Long) {
         showFault(null)
+        // 「正在打开…」换成内容名，1.6 秒后收起 —— 这一刻用户才算确认换台/换剧成功
+        onContentPicked(currentTitle)
     }
 
     override fun onCompletion() {
@@ -745,6 +960,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     override fun onError(friendlyMessage: String, fatal: Boolean) {
+        hud.dismiss()
+        renderHud()
         if (fatal) {
             // 单集文件损坏：3 秒后跳下一个（DESIGN §8）
             showFault(friendlyMessage, retry = false)
@@ -763,7 +980,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     // ---- 续播写盘（5 秒防抖，避免频繁 IO 卡顿） ----
 
+    /**
+     * 只给**点播**记进度。
+     *
+     * 直播的 currentPosition 是从频道开播算起的毫秒数，会一路涨到几十小时；
+     * 它一旦被写进 last_pos，下次就会拿这个假进度去 seek，结果就是起播后长时间
+     * 音画不同步（用户实测到的现象）。所以直播直接不写（见 [PlaybackMode]）。
+     */
     private fun savePositionDebounced() {
+        if (!PlaybackMode.remembersPosition(PlaybackMode.of(libraries.getOrNull(libIndex)))) return
         val pos = engine.positionMs()
         if (pos <= 0) return
         val now = System.currentTimeMillis()
@@ -782,6 +1007,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     override fun onPause() {
         super.onPause()
+        // 直播没有进度可存，存了下次就会拿它去 seek 出一条不同步的流
+        if (!PlaybackMode.remembersPosition(PlaybackMode.of(libraries.getOrNull(libIndex)))) return
         val pos = engine.positionMs()
         if (pos > 0) Config.savePosition(this, pos)
     }
@@ -790,6 +1017,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // DESIGN §7 防泄漏硬要求，逐条来
         main.removeCallbacksAndMessages(null)
         ioHandler.removeCallbacksAndMessages(null)
+        runCatching { hud.dismiss() }
         runCatching { engine.release() }
         runCatching { tts.shutdown() }
         runCatching { abandonAudioFocus() }
@@ -806,6 +1034,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         private const val RETRY_MS = 10_000L
         private const val POSITION_INTERVAL_MS = 5_000L
         private const val SAVE_DEBOUNCE_MS = 5_000L
+        private const val HUD_TICK_MS = 200L
+
+        /** 起播前认音频编码时读多少字节：1MB 足够覆盖 PAT/PMT。 */
+        private const val PROBE_BYTES = 1 shl 20
         private const val WEATHER_TTL_MS = 30 * 60 * 1000L
         private val NUM_DIGITS = arrayOf("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
     }

@@ -30,6 +30,10 @@ object Config {
     private const val KEY_LAST_POS = "last_pos"
     private const val KEY_LAST_CH = "last_ch"
 
+    private const val KEY_CACHE = "scan_cache"
+    private const val KEY_CACHE_KEY = "scan_cache_key"
+    private const val KEY_CACHE_EPOCH = "scan_cache_epoch"
+
     private fun sp(ctx: Context): SharedPreferences =
         ctx.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -138,5 +142,40 @@ object Config {
 
     fun saveChannel(ctx: Context, ch: Int) {
         sp(ctx).edit().putInt(KEY_LAST_CH, ch).apply()
+    }
+
+    // ---- NAS 目录结构缓存 ----
+    //
+    // 缓存归属：换了 NAS / 共享 / 根目录 / 账号，旧缓存一律作废（否则会拿 A 的剧名去 B 上找）。
+    // 这里不存密码本身，只存它的哈希，够用来判断「是不是同一套凭据」。
+    // epoch 在配置页保存成功时 +1，用来强制丢弃（用户换过 NAS 内容时也会走这条路）。
+
+    fun cacheKey(ctx: Context): String {
+        val s = smb(ctx).normalized()
+        val dup = "$s\u0000${s.pass.hashCode()}"
+        return "$KEY_CACHE_KEY:${dup.hashCode()}:${sp(ctx).getInt(KEY_CACHE_EPOCH, 0)}"
+    }
+
+    /** 配置变更后调用：下一次 [cacheKey] 一定和旧的不同。 */
+    fun invalidateCache(ctx: Context) {
+        val p = sp(ctx)
+        p.edit()
+            .putInt(KEY_CACHE_EPOCH, p.getInt(KEY_CACHE_EPOCH, 0) + 1)
+            .remove(KEY_CACHE)
+            .apply()
+    }
+
+    /** 读缓存。key 不匹配（换了 NAS）就当没有。 */
+    fun loadCache(ctx: Context): String? {
+        val p = sp(ctx)
+        if (p.getString(KEY_CACHE_KEY, null) != cacheKey(ctx)) return null
+        return p.getString(KEY_CACHE, null)
+    }
+
+    fun saveCache(ctx: Context, text: String) {
+        sp(ctx).edit()
+            .putString(KEY_CACHE_KEY, cacheKey(ctx))
+            .putString(KEY_CACHE, text)
+            .apply()
     }
 }

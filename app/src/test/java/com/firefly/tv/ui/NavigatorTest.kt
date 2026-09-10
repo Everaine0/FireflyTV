@@ -106,4 +106,36 @@ class NavigatorTest {
     fun `没有库时不会越界`() {
         assertEquals(0, Navigator.horizontal(0, 0, +1))
     }
+
+    // ---- 切库时的起播点 ----
+
+    @Test
+    fun `切回上次看的库才认那份记忆`() {
+        val s = Navigator.startPoint("电视剧", "电视剧", "娘道", 5, 120_000L)
+        assertEquals("娘道", s.show)
+        assertEquals(5, s.episode)
+        assertEquals(120_000L, s.positionMs)
+    }
+
+    @Test
+    fun `换到别的库一律从第一部第一集开始`() {
+        // 记忆里是 IPTV 那个库，现在切到电视剧库 —— 拿「娘道」去 IPTV 里找就是串库
+        val s = Navigator.startPoint("IPTV", "电视剧", "娘道", 5, 120_000L)
+        assertEquals("", s.show)
+        assertEquals(0, s.episode)
+        assertEquals(0L, s.positionMs)
+    }
+
+    @Test
+    fun `从没看过任何东西时也是从第一部开始`() {
+        val s = Navigator.startPoint("", "IPTV", "", 0, 0L)
+        assertEquals("", s.show)
+        assertEquals(0L, s.positionMs)
+    }
+
+    @Test
+    fun `脏进度会被夹掉`() {
+        val s = Navigator.startPoint("电视剧", "电视剧", "娘道", -3, -1L)
+        assertEquals(0L, s.positionMs)
+    }
 }

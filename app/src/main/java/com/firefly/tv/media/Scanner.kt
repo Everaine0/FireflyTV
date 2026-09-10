@@ -54,9 +54,6 @@ object Scanner {
 
     const val MAX_ENTRIES = 2000
 
-    /** 按内容探测时最多看几个文件，避免整柜非视频文件把列目录拖慢。 */
-    private const val CONTENT_PROBE_LIMIT = 32
-
     /**
      * 列根目录下的媒体库。
      * 容错：无视频文件的文件夹、无有效内容的库一律跳过（DESIGN §4）。
@@ -104,19 +101,13 @@ object Scanner {
     }
 
     /** 按内容逐个确认（只在后缀判断全军覆没时才调用，代价有界）。 */
-    private fun hasVideoByContent(cfg: Config.Smb, dir: String, names: List<String>): Boolean {
-        for (name in names.asSequence().take(CONTENT_PROBE_LIMIT)) {
-            val head = try {
-                SmbStore.with(cfg) { it.head("$dir/$name", MediaSniff.HEAD_BYTES) }
-            } catch (_: Throwable) {
-                continue
-            }
-            if (MediaSniff.looksLikeVideoByContent(head)) return true
-        }
-        return false
-    }
+    private fun hasVideoByContent(cfg: Config.Smb, dir: String, names: List<String>): Boolean =
+        probeNamesByContent(cfg, dir, names).isNotEmpty()
 
-    /** 视频库顶层 = 剧列表（每个子文件夹一部剧）。 */
+    /**
+     * 视频库顶层 = 剧列表（每个子文件夹一部剧）。[LibraryCache] 命中时由调用方直接用缓存，
+     * 走不到这里 —— 保留它是为了「后台刷新」和首次扫描。
+     */
     fun shows(cfg: Config.Smb, lib: Library.Video): List<String> =
         SmbStore.with(cfg) { it.list(lib.name) }
             .asSequence()
@@ -127,17 +118,26 @@ object Scanner {
             .toList()
 
     /**
+     * 集列表 + **这些集是怎么认出来的**。缓存需要知道这一点：
+     * 靠后缀认出来的结果下次可以直接复用，靠内容探出来的不行（见 [LibraryCache.Episodes]）。
+     */
+    class Episodes(val names: List<String>, val byContent: Boolean)
+
+    /**
      * 读某部剧的集数。两级结构：
      *  - 库/剧名/剧集文件（常见）
      *  - 库/剧名/季/剧集文件（多季，取"第 1 季"或第一层子目录）
      */
-    fun episodes(cfg: Config.Smb, lib: Library.Video, show: String): List<String> {
+    fun episodes(cfg: Config.Smb, lib: Library.Video, show: String): List<String> =
+        episodesDetailed(cfg, lib, show).names
+
+    fun episodesDetailed(cfg: Config.Smb, lib: Library.Video, show: String): Episodes {
         val base = "${lib.name}/$show"
         val entries = SmbStore.with(cfg) { it.list(base) }
         val direct = entries.filter { !it.isDir && MediaExt.isVideo(it.name) }
             .map { it.name }
             .sortedWith(NaturalOrder)
-        if (direct.isNotEmpty()) return direct.take(MAX_ENTRIES)
+        if (direct.isNotEmpty()) return Episodes(direct.take(MAX_ENTRIES), byContent = false)
 
         // 没有直接视频 → 找第一层子目录当季
         val season = entries.filter { it.isDir }
@@ -152,17 +152,48 @@ object Scanner {
                 .sortedWith(NaturalOrder)
                 .take(MAX_ENTRIES)
                 .toList()
-            if (vids.isNotEmpty()) return vids
+            if (vids.isNotEmpty()) return Episodes(vids, byContent = false)
         }
 
         // 后缀一个都不认识：按内容挑出实际是媒体的那些文件
-        return entries.asSequence()
-            .filter { !it.isDir && !MediaExt.isM3u(it.name) }
-            .map { it.name }
-            .filter { name -> isVideoByContent(cfg, "$base/$name") }
-            .sortedWith(NaturalOrder)
-            .take(MAX_ENTRIES)
-            .toList()
+        val found = probeNamesByContent(cfg, base, entries.filter { !it.isDir && !MediaExt.isM3u(it.name) }.map { it.name })
+        return Episodes(found, byContent = true)
+    }
+
+    /** 剧集文件的完整相对路径（相对库根）。 */
+    fun episodePath(lib: Library.Video, show: String, episode: String): String = "${lib.name}/$show/$episode"
+
+    // ---- 按内容探测 ----
+
+    /**
+     * 逐个读文件头判断是不是媒体。
+     *
+     * 实测「娘道」76 集后缀是 .mp4、内容却是 MPEG-TS，所以这条路必须留。
+     * 但它是最慢的一条路（每个文件一次 SMB 往返），所以：
+     *  - 只在后缀全军覆没时才走；
+     *  - 并发探测（SmbStore 内部串行，开并发只是让网络往返重叠起来），
+     *    实测 76 个文件从「按秒等」降到基本瞬发。
+     */
+    private fun probeNamesByContent(cfg: Config.Smb, dir: String, names: List<String>): List<String> {
+        if (names.isEmpty()) return emptyList()
+        val candidates = names.take(PROBE_LIMIT)
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(PROBE_THREADS) { r ->
+            Thread(r, "firefly-probe").apply { isDaemon = true }
+        }
+        return try {
+            val futures = candidates.map { name ->
+                pool.submit(java.util.concurrent.Callable { name to isVideoByContent(cfg, "$dir/$name") })
+            }
+            futures.asSequence()
+                .mapNotNull { f -> runCatching { f.get() }.getOrNull() }
+                .filter { it.second }
+                .map { it.first }
+                .sortedWith(NaturalOrder)
+                .take(MAX_ENTRIES)
+                .toList()
+        } finally {
+            pool.shutdownNow()
+        }
     }
 
     private fun isVideoByContent(cfg: Config.Smb, relativePath: String): Boolean = try {
@@ -172,6 +203,12 @@ object Scanner {
         false
     }
 
-    /** 剧集文件的完整相对路径（相对库根）。 */
-    fun episodePath(lib: Library.Video, show: String, episode: String): String = "${lib.name}/$show/$episode"
+    /** 并发探测的线程数。电视只有 1–2 条 SMB 连接，再多也没用。 */
+    private const val PROBE_THREADS = 4
+
+    /**
+     * 按内容探测的上限。原来的 32 太小 —— 「娘道」有 76 集、猫和老鼠 157 集，
+     * 一旦后缀全不可信，32 个之后整集整集地丢。这里放宽到能覆盖常见整季。
+     */
+    private const val PROBE_LIMIT = 400
 }

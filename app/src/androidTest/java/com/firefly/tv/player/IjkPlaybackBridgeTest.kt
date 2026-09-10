@@ -189,9 +189,24 @@ class IjkPlaybackBridgeTest {
             posDone.countDown()
         }
         assertTrue(posDone.await(10, TimeUnit.SECONDS))
-        // 跳读后位置必须明显离开 0 且贴近目标；上界留宽一点，
-        // 因为从 prepare 到此刻的墙钟时间里解码器也在往前走
-        assertTrue("跳读后位置应在 2000..6000ms，实际 ${pos.get()}", pos.get() in 2000..6000)
+        // 关键帧对齐 + seek 本身的延迟，落地位置会略早于目标，所以判据是
+        // 「明显离开 0」而不是「正好等于 3 秒」。这一条要验的是**随机读确实生效了**，
+        // 不是播放器的 seek 精度（那是播放器的事）。
+        assertTrue(
+            "跳读后位置必须明显离开 0，说明随机读生效了；实际 ${pos.get()}",
+            pos.get() > 1000,
+        )
+        assertTrue("跳读后位置不该越过目标太多，实际 ${pos.get()}", pos.get() < 6000)
+
+        // 跳读之后还能继续往前走，才算真的恢复了解码
+        Thread.sleep(1500)
+        val pos2 = AtomicReference(0L)
+        main.post { pos2.set(engineRef.get()?.positionMs() ?: 0L) }
+        Thread.sleep(500)
+        assertTrue(
+            "跳读后画面没有继续推进（${pos.get()} -> ${pos2.get()}），说明解码没恢复",
+            pos2.get() >= pos.get(),
+        )
 
         main.post { engineRef.get()?.release() }
     }

@@ -27,6 +27,15 @@ interface PlaybackEngine {
 
         /** 首帧已上屏，可以撤掉加载提示。 */
         fun onFirstFrame()
+
+        /**
+         * 音频真的开始出声了。
+         *
+         * 单独给一个回调是因为「有画面没声音」是这台电视上最难查的一类问题：
+         * 靠人耳听、靠 logcat 翻都不可靠。有了这个信号，测试就能直接判定
+         * 「这条流到底有没有音频输出」，不用猜。
+         */
+        fun onAudioStarted() = Unit
     }
 
     fun setListener(l: Listener)
@@ -45,6 +54,9 @@ interface PlaybackEngine {
     /** 直接起播 URL（IPTV 直播用）。 */
     fun playUrl(url: String)
 
+    /** 当前播放类型，用于让实现层挑参数（直播与点播的取舍不同）。 */
+    fun setMode(kind: PlaybackMode.Kind)
+
     /** 直播断流自动重连；[urlProvider] 返回当前频道地址。 */
     fun setLiveReconnect(on: Boolean, urlProvider: (() -> String?)?)
 
@@ -52,6 +64,8 @@ interface PlaybackEngine {
     fun positionMs(): Long
     fun durationMs(): Long
     fun seekTo(ms: Long)
+    fun pause()
+    fun resume()
     fun stop()
     fun release()
 }
@@ -68,6 +82,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
     private var surface: Surface? = null
     private var pendingSeekMs = 0L
+    private var kind: PlaybackMode.Kind = PlaybackMode.Kind.ON_DEMAND
 
     private var liveReconnect = false
     private var liveUrlProvider: (() -> String?)? = null
@@ -90,7 +105,12 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     override fun playSmb(cfg: Config.Smb, relativePath: String, startMs: Long) {
+        kind = PlaybackMode.Kind.ON_DEMAND
         playSource(SmbRandomAccessSource(cfg, relativePath), startMs)
+    }
+
+    override fun setMode(kind: PlaybackMode.Kind) {
+        this.kind = kind
     }
 
     override fun playSource(source: RandomAccessSource, startMs: Long) {
@@ -98,18 +118,18 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         val src = SmbMediaDataSource(source)
         releaseInternal()
         dataSource = src
-        pendingSeekMs = startMs
+        // 直播的进度没有意义，绝不能拿着一个假的毫秒数去 seek（见 PlaybackMode 注释）
+        pendingSeekMs = PlaybackMode.startPositionMs(kind, startMs)
         val p = newPlayer()
         p.setDataSource(src)
         p.prepareAsync()
     }
 
     override fun playUrl(url: String) {
+        kind = PlaybackMode.Kind.LIVE
         releaseInternal()
         pendingSeekMs = 0
         val p = newPlayer()
-        // 直播不要 packet-buffering，否则延迟会越积越大
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", 0)
         p.setDataSource(url)
         p.prepareAsync()
     }
@@ -148,8 +168,12 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
             true
         }
         p.setOnInfoListener { _, what, _ ->
-            if (what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
-                onMain { listener?.onFirstFrame() }
+            when (what) {
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START ->
+                    onMain { listener?.onFirstFrame() }
+
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_AUDIO_RENDERING_START ->
+                    onMain { listener?.onAudioStarted() }
             }
             false
         }
@@ -157,9 +181,12 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
         // 老人用：宁可轻微丢帧也不要黑屏卡住
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1L)
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", 15L * 1024 * 1024)
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", 2L * 1024 * 1024)
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", 3_000_000L)
+        // 直播/点播各自一套参数，取舍不同（见 PlaybackMode.tuning）
+        val t = PlaybackMode.tuning(kind)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", if (t.packetBuffering) 1L else 0L)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", t.maxBufferBytes)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", t.probesizeBytes)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", t.analyzeDurationUs)
         // 内嵌中文字幕轨优先，无中文则整个不显示（DESIGN §5）
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "subtitle", 1L)
 
@@ -211,7 +238,17 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     override fun durationMs(): Long = player?.duration ?: 0L
 
     override fun seekTo(ms: Long) {
+        // 直播没有可信的时间轴，seek 进去就是长时间音画不同步（见 PlaybackMode）
+        if (kind == PlaybackMode.Kind.LIVE) return
         runCatching { player?.seekTo(ms) }
+    }
+
+    override fun pause() {
+        runCatching { player?.pause() }
+    }
+
+    override fun resume() {
+        runCatching { player?.start() }
     }
 
     override fun stop() {

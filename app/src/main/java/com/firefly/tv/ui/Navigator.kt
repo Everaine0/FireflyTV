@@ -74,6 +74,26 @@ object Navigator {
     fun horizontal(currentIndex: Int, count: Int, delta: Int): Int =
         if (count <= 0) 0 else wrap(currentIndex + delta, count)
 
+    /**
+     * 切库时该从哪儿开始播。
+     *
+     * 这是「按上键跳回 CCTV5」那类串库 bug 的根：记忆里存着「哪个库、哪部剧、第几集」，
+     * 如果拿它去另一个库上找，找到的就是另一部内容。所以只有**记忆里的库 == 目标库**
+     * 时才认这份记忆，否则一律当作「第一次看这个库」。
+     */
+    class StartPoint(val show: String, val episode: Int, val positionMs: Long) {
+        companion object {
+            val FIRST = StartPoint("", 0, 0L)
+        }
+    }
+
+    fun startPoint(rememberedLib: String, targetLib: String, show: String, episode: Int, positionMs: Long): StartPoint =
+        if (rememberedLib == targetLib) {
+            StartPoint(show, episode, positionMs.coerceAtLeast(0L))
+        } else {
+            StartPoint("", 0, 0L)
+        }
+
     /** 取模并保证结果非负（Kotlin 的 % 对负数返回负值）。 */
     private fun wrap(v: Int, size: Int): Int = ((v % size) + size) % size
 }

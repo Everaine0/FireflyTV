@@ -21,6 +21,7 @@ class OverlayScreen(context: Context) : FrameLayout(context) {
     private val weather = major()
     private val tomorrow = body()
     private val current = body()
+    private val warning = body()
 
     init {
         setBackgroundColor(Color.parseColor("#E6000000"))
@@ -48,6 +49,11 @@ class OverlayScreen(context: Context) : FrameLayout(context) {
         current.gravity = Gravity.CENTER
         col.addView(current, marginTop(26))
 
+        // 「没声音」的原因放在最下面一行，用暖色区分，不抢主要内容
+        warning.setTextColor(Color.parseColor("#FFFFB74D"))
+        warning.gravity = Gravity.CENTER
+        col.addView(warning, marginTop(12))
+
         addView(col, LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER))
 
         // 5% 安全边距
@@ -60,14 +66,17 @@ class OverlayScreen(context: Context) : FrameLayout(context) {
         weatherText: String,
         tomorrowText: String,
         currentText: String,
+        warningText: String = "",
     ) {
         clock.text = timeText
         dateLine.text = dateText
         weather.text = weatherText
         tomorrow.text = tomorrowText
         current.text = currentText
+        warning.text = warningText
         tomorrow.visibility = if (tomorrowText.isBlank()) GONE else VISIBLE
         current.visibility = if (currentText.isBlank()) GONE else VISIBLE
+        warning.visibility = if (warningText.isBlank()) GONE else VISIBLE
     }
 
     private fun divider() = FrameLayout(context).apply {

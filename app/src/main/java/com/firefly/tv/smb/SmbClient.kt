@@ -86,6 +86,30 @@ class SmbClient(private val cfg: Config.Smb) {
         }
     }
 
+    /**
+     * 这条连接还能用吗。
+     *
+     * 为什么需要：底层 socket 断了、NAS 重启了、或者别处把这个 share close 掉了以后，
+     * 原来缓存的 share 会一直报 "DiskShare has already been closed"，
+     * 之后**每一次**调用都失败 —— 表现就是「电视再也连不上 NAS，只能重启应用」。
+     * 有了这个判断，[SmbStore] 就能把它丢掉重连。
+     *
+     * 判据走反射取 `isStale()`：smbj 0.15.0 的 `DiskShare` 里没有这个方法
+     * （它在更新的版本里才有），直接调会编译不过。拿不到就只信连接的存活状态。
+     */
+    @Synchronized
+    fun isUsable(): Boolean {
+        val sh = share ?: return true // 还没连过，不算坏
+        return try {
+            if (connection?.isConnected != true) return false
+            val m = sh.javaClass.methods.firstOrNull { it.name == "isStale" && it.parameterCount == 0 }
+            val stale = m?.invoke(sh) as? Boolean ?: false
+            !stale
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     /** 只列一层。返回结果已剔除 . 与 ..。 */
     fun list(relative: String): List<Entry> {
         val p = path(relative)
@@ -196,25 +220,67 @@ object SmbStore {
     private var client: SmbClient? = null
     private var current: Config.Smb? = null
 
-    /** 用指定配置串行执行；配置变了就换连接。 */
+    /**
+     * 用指定配置串行执行。
+     *
+     * 两条自愈规则，都是被真实故障逼出来的：
+     *  1. 连接不可用（socket 断了 / NAS 重启了）→ 丢掉重连
+     *  2. 操作因为**会话已关**失败 → 丢掉重连，**再试一次**
+     *
+     * 第 2 条是必须的：smbj 0.15.0 的 `DiskShare` 没有能查出「已经被关掉」的方法
+     * （`isStale()` 在更新的版本里才有），所以光靠事前检查查不出来。
+     * 没有重试的话，底层断过一次以后每次调用都会撞
+     * "DiskShare has already been closed"，表现就是「电视再也连不上 NAS，只能重启应用」。
+     */
     fun <T> with(cfg: Config.Smb, block: (SmbClient) -> T): T = synchronized(lock) {
-        val wanted = cfg.normalized()
-        var c = client
-        if (c == null || current != wanted) {
-            runCatching { c?.close() }
-            c = SmbClient(wanted)
-            client = c
-            current = wanted
-        }
         try {
-            block(c)
+            run(cfg, block)
+        } catch (t: Throwable) {
+            if (!isSessionGone(t)) throw t
+            runCatching { client?.close() }
+            client = null
+            current = null
+            run(cfg, block)
+        }
+    }
+
+    private fun <T> run(cfg: Config.Smb, block: (SmbClient) -> T): T {
+        val wanted = cfg.normalized()
+        val cached = client
+        val reusable = cached != null && current == wanted && cached.isUsable()
+        if (cached != null && !reusable) runCatching { cached.close() }
+
+        val live = if (reusable) cached!! else SmbClient(wanted)
+        client = live
+        current = wanted
+        try {
+            return block(live)
         } catch (t: Throwable) {
             // 会话可能是坏的，下次调用重建
-            runCatching { c.close() }
+            runCatching { live.close() }
             client = null
             current = null
             throw t
         }
+    }
+
+    /** 这个异常是不是「底层会话已经没了」。 */
+    private fun isSessionGone(t: Throwable): Boolean {
+        var e: Throwable? = t
+        var depth = 0
+        while (e != null && depth++ < 8) {
+            val m = (e.message ?: "").lowercase()
+            if (m.contains("already been closed") ||
+                m.contains("connection was closed") ||
+                m.contains("transport") && m.contains("closed") ||
+                m.contains("broken pipe") ||
+                m.contains("socket closed")
+            ) {
+                return true
+            }
+            e = e.cause
+        }
+        return false
     }
 
     /** 网络断了/NAS 重启后强制丢掉当前会话。 */
