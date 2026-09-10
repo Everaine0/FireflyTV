@@ -179,7 +179,7 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | 7 | 4K 面板 + 老系统缩放假象 | 1080p 逻辑基准 + dp + 5% 安全边距 |
 | 8 | **非 faststart 的 mp4 播不了**（moov 在文件尾） | ✅ **已修**：`MoovRelocatingSource` 在 Java 侧把 moov 搬到虚拟文件头。见下节 |
 
-### 风险 8：从「实测限制」到已修复
+### 风险 8：moov 在文件尾 —— 修了两次才对
 
 **现象**：ijkplayer 0.8.8 在 `IMediaDataSource` 通道下**只顺序读、从不回尾读 moov**，
 读满第一个 32KB 块后直接报 `moov atom not found`。
@@ -192,17 +192,72 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | :--- | :--- | :--- |
 | 大宅门（4K H265） | 40 | 全部在**尾部** |
 | 猫和老鼠 50 周年 | 157 | 全部在**尾部** |
-| 娘道 | 76 | 文件头不是 `ftyp`，见下面的开放问题 |
+| 娘道 | 76 | 文件头不是 `ftyp`，实际是 **MPEG-TS**（后缀骗人），不需要重排 |
 
-即：**197 集全部无法直接播放**。这不是边角情况，是全部内容。
+即：**197 集里需要重排的那 197 集一开始全都播不了**。这不是边角情况，是全部内容。
 
 **修法**：[MoovRelocatingSource] 在 Java 侧解析顶层 box，把字节流重新排布成
 `ftyp + moov + 其余按原顺序`，只改动 view 层，不改一个字节的源文件、不做转码、不落临时文件。
 `readAt` 里按段映射虚拟偏移到物理偏移，段数只有个位数，代价可忽略。
 本来 moov 就在头部的文件原样透传。
 
-**验证**：`IjkPlaybackBridgeTest.moov在末尾的mp4也能播放` +
-`SmbEndToEndTest.能通过SMB播放并出首帧`（对真实 NAS 的 4K H265 片源）。
+#### ⚠️ 第一次修得不完整：搬了 moov 却**没改 chunk 偏移**（这是"卡住"的真根因）
+
+这一条值得单独记，因为它骗过了我好几轮。
+
+`stco` / `co64` 里存的是 chunk 的**绝对文件偏移**。把 moov 从文件尾搬到头部之后，
+mdat 整体后移了，**这些偏移却还是老值** —— 播放器按老偏移去读，
+读到的其实是 moov 自己的字节，于是报一堆
+`Invalid NAL unit size` / `Error splitting the input into NAL units`，
+**永远出不了首帧**。
+
+现场实测（猫和老鼠，245,453,247 字节）：
+
+```
+原始布局  ftyp(28) free(8) mdat(245,040,408) moov(412,803)
+重排之后  ftyp(28) moov(412,803) free(8) mdat(...)
+
+第一个视频样本：stco 说在 44
+  原文件 44 处        = 0000001940010c01...  ← 真正的样本数据
+  重排后 44 处        = moov 内部的字节
+  正确的新位置        = 44 + 28(ftyp) = 72
+```
+
+**修法**：搬运时把所有 `stco`/`co64` 条目整体加上一个常量增量。
+增量对所有 chunk 相同 —— moov 原本前面是全部数据，搬到头之后前面只剩 ftyp，
+于是它后面的内容整体平移了 `ftyp.size`。
+实现上把 moov 整段读进内存改写（实测 412 KB ~ 2.5 MB），
+避免「某个偏移项正好跨在块缓冲边界上」这类边界情况。
+
+**这个 bug 为什么长期没被发现**：原来的单元测试用**人造的极简 box**，
+`stco` 里的偏移是 0 或很小，改不改都"看起来对"。
+这是「测试范围没覆盖到 bug 所在位置」的典型 —— 测试全绿，功能是坏的。
+
+#### 附带：跨段短读
+
+重排后的虚拟文件由物理上不连续的段拼成，`read` 很容易跨段。
+旧实现遇到边界只返回当前段剩下的字节，上层会把它当成「文件到这儿就没了」。
+同样是只有需要重排的片源才复现。
+旧的回归测试用 7 字节零碎读，**永远不跨段**，所以也发现不了。
+
+**验证（可复跑）**：
+- `EveryShowPlaysTest` —— 全库扫描，用**严格首帧判据**（`MEDIA_INFO_VIDEO_RENDERING_START`，
+  不是 `VIDEO_SIZE_CHANGED`）断言每一部剧都能出画面
+- `SmbRelocationIntegrityTest` —— mdat 数据区逐字节比对，且 moov 里**确实发生了**
+  偏移改写（差异必须 > 0）
+- 运行日志可直接看到：`chunk 偏移增量 = 412803` / `已改写 22792 个 chunk 偏移项`
+
+修前 / 修后（真实 NAS，模拟器）：
+
+| 剧 | 修前 | 修后 |
+| :--- | :--- | :--- |
+| 娘道（MPEG-TS，不需重排） | ✅ 首帧 0.7s | ✅ 首帧 0.8s |
+| 大宅门（4K H265） | ❌ **永远出不了首帧** | ✅ 首帧 ~36s（模拟器纯软解） |
+| 猫和老鼠（2960×2160 H265） | ❌ **永远出不了首帧** | ✅ 首帧 ~27s（同上） |
+
+> 那 27~36 秒是**模拟器纯软件解码**的代价，不是代码问题：
+> 目标电视有硬件 H.265 解码器。用户实测确认为「有画面了，就是卡，估计性能不够」。
+
 
 ### 格式兼容性：逐类实测结论（2026-09-11 更新）
 
@@ -387,8 +442,9 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 | 项 | 现状 | 说明 |
 | :--- | :--- | :--- |
 | **字幕规则**（§5） | ❌ 未实现 | 当前只开了 `subtitle=1`，会把文件里的**任意**字幕轨显示出来，违反「无中文字幕则不显示任何字幕」。要做对需要：枚举字幕轨、判断语言（`IjkMediaMeta` 的轨语言/轨名），再决定开关或外挂同名 `.srt`/`.ass`。需要带多语言字幕轨的测试片源才能验证 |
-| **AC-3 / MP2 片源没有声音** | ✅ 已解决 | **两个根因都修了才有效**：①自己编了带 AC-3/E-AC-3/MP2/DTS 的内核；②点播探测窗口从 2 MB 提到 16 MB（见「格式兼容性」）。`Ac3AudioTest` 直连真实 NAS 播整集娘道断言出声 |
-| **切换剧集卡在当前页面** | ✅ 已解决 | 已修的两处：①`surfaceUsable()` 改成按状态查询 + 轮询兜底（原来等一个可能永不再来的回调）；②`MoovRelocatingSource.read()` 跨段短读（见下）。`EveryShowPlaysTest` 全库扫描断言首帧，修复后 3/3 通过 |
+| **AC-3 / MP2 片源没有声音** | ✅ 已解决 | **两个根因都修了才有效**：①自己编了带 AC-3/E-AC-3/MP2/DTS 的内核；②点播探测窗口从 2 MB 提到 16 MB（见「格式兼容性」）。`Ac3AudioTest` 直连真实 NAS 播整集娘道断言出声。用户已确认娘道有声音 |
+| **切换剧集卡在当前页面** | ✅ 已解决 | 三个根因：①`surfaceUsable()` 改成按状态查询 + 轮询兜底（原来等一个可能永不再来的回调）；②**moov 重排没改 `stco` 偏移**（真根因，见风险 8）；③首帧判据假绿导致看门狗被提前撤销。`EveryShowPlaysTest` 全库扫描断言严格首帧，3/3 通过；**用户已确认大宅门 / 猫和老鼠「有画面了」** |
+| **播放中「播放器悄悄死亡」没有自救** | ❌ **未解决** | 现场已定性（抓线程栈看到 ijkplayer 线程全部消失、CPU 增量为 0，但既无 `onError` 也无 `onCompletion`）。看门狗框架已写，但**唯一候选判据在 SMB 通路上恒为 0**（`outputFps` 在本地文件上正常，SMB 上恒 0），拿它当判据会把正常播放误判成死机、不断重启画面。已加 `LIVENESS_ENABLED = false` 默认关闭，**不要只把开关改成 true**。可行方向写在 `MainActivity.livenessWatchdog` 注释里 |
 | 键值差异（风险 6） | ⏳ 待真机 | 代码同时处理 `DPAD_*` 与 `ENTER`，但**设置键的 keyCode 尚未在真机上确认**；模拟器遥控器没有设置键 |
 | 中文 TTS（风险 2） | ⏳ 待真机 | 运行时探测、失败退化为纯文字，逻辑已写；模拟器没有中文 TTS 引擎，**必须在目标电视上验证** |
 | 天气接口（风险 5） | ⏳ 待真机 | 接口形态已按和风 v7 确认（`X-QW-Api-Key` + `lang=zh`），但 Android 5.1 的 TLS 握手只能真机验证 |
@@ -404,7 +460,9 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 | 项 | 说明 |
 | :--- | :--- |
 | **崩溃闪退** | ijkplayer 的 `onPrepared/onError/onCompletion/onInfo` 在它自己的 `IjkMediaPlayer$EventHandler` 线程回调。之前直接透传给界面层，界面在非 UI 线程碰 View，抛 `CalledFromWrongThreadException` 当场崩；Activity 重建后又立刻报同样的错，于是「闪退之后再也打不开」。现在 `IjkPlaybackEngine` 用 `onMain{}` 统一把回调切回主线程 |
-| **moov 在尾部** | 真实 NAS 上 197 集全部是 non-faststart，原来一集都播不了。`MoovRelocatingSource` 把 moov 搬到虚拟文件头后正常起播（风险 8） |
+| **moov 在尾部播不了** | 真实 NAS 上需要重排的片源原来一集都播不了。`MoovRelocatingSource` 把 moov 搬到虚拟文件头后正常起播（风险 8） |
+| **moov 重排但没改 `stco` 偏移** | 搬了 moov 却没改 chunk 的绝对偏移，播放器按老偏移读到的其实是 moov 自己的字节 —— 表现为**大宅门 / 猫和老鼠永远出不了首帧**（「切换其他电视剧卡死」的真根因）。已补偏移改写，风险 8 有完整说明 |
+| **首帧判据假绿导致看门狗被提前撤销** | `onFirstFrame` 同时挂在 `VIDEO_RENDERING_START` 和 **`VIDEO_SIZE_CHANGED`** 上，而后者在**准备阶段**就触发（解码器刚拿到分辨率就报，一帧都没解出来）。`onFirstFrame` 的第一件事是撤掉起播看门狗，于是**看门狗在画面真正出来之前就被撤了**，解码器随后卡住就再也没人报故障。现在首帧只由 `VIDEO_RENDERING_START` 触发并去重。这条在**所有设备**上都成立 |
 | **`MoovRelocatingSource` 跨段短读** | 重排后的虚拟文件由物理上不连续的段拼成，`read` 很容易跨段。旧实现遇到边界就只返回当前段剩下的字节 —— 上层会把这个短读当成「文件到这儿就没了」。**只有 moov 在尾部、需要重排的片源才会复现**，表现为播到一半「播完」或画面花掉。已补循环填满，并加了**用大块读**的回归测试（旧的测试用 7 字节零碎读，永远不跨段，所以一直没发现） |
 | **按上键跳回 CCTV5** | 切库时没清掉上一个库的缓存，于是拿 IPTV 遗留的频道列表去换台。现在切库整体清空，并把决策抽成 `Navigator`（类型 + 缓存归属），11 项单元测试钉住 |
 | **切库看起来像卡死** | 切库要等 SMB 列目录，这段时间屏幕上什么都不变。现在任何一次按键都立刻出反馈条（`SwitchHud`，9 项测试） |
@@ -416,7 +474,7 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 | **配置页把「跳过」说成「连接成功」** | 天气留空会跳过检测，却回「天气 连接成功」，用户会以为天气已经配好了。现在区分「连接成功」和「没填，已跳过（电视上不显示天气）」 |
 | **配置页底部文字被裁切** | 写死的 420dp 二维码把整列撑出 1080p 屏幕，**最下面那行地址被切掉一半** —— 而那是唯一能手动输入的入口。改成按屏幕短边比例算（34%），并补了窄屏媒体查询与 safe-area 留白 |
 | SMB 端到端 | 对真实 NAS（SMB 3.1.1）跑通：列库 → 跳过空目录 → 识别直播库 → 列剧列集 → 逐集探 moov → m3u 解析 → 随机读 → 播放出首帧 |
-| 格式兼容性 | 逐类实测，结论见「格式兼容性」一节：AAC / AC-3 / E-AC-3 / MP2 在 TS 与 MP4 下全部出声；真实 NAS 上 3 部剧全部出首帧 |
+| 格式兼容性 | 逐类实测，结论见「格式兼容性」一节：AAC / AC-3 / E-AC-3 / MP2 在 TS 与 MP4 下全部出声；真实 NAS 上 3 部剧全部出首帧（用户已确认大宅门 / 猫和老鼠「有画面了」） |
 
 ## 11. 构建与部署要点
 
@@ -427,12 +485,15 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 | **ABI** | 必须含 `armeabi-v7a` + `arm64-v8a`（电视）+ **`x86`**（模拟器，缺了会直接崩） |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**95 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**31 项**，含对真实 NAS 与真实直播源的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**108 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**48 项**，含对真实 NAS 与真实直播源的联调；未配 `local.properties` 时自动跳过） |
 | 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
 | 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |
+| 全库起播扫描 | `…class=com.firefly.tv.EveryShowPlaysTest`，结果看 `adb logcat -s FireflyEveryShow`。**这是判断「能不能播」最可信的一条** —— 每部剧真起播一次，断言严格首帧 |
+| 音频编码矩阵 | `…class=com.firefly.tv.AudioCodecMatrixTest`，结果看 `adb logcat -s FireflyAudioMatrix`。同一段视频只换音频编码，把「内核缺解码器」和「流参数探测失败」分开 |
 | 网络诊断 | `…class=com.firefly.tv.diag.NetworkDiagTest`，结果看 `adb logcat -s FireflyDiag`（模拟器里 `ping` 不通是正常的，NAT 不回 ICMP，**只有 TCP 能说明问题**） |
-| 测试素材 | `.\scripts\make-test-media.ps1` 用 ffmpeg 生成（AAR 与生成的 mp4 都不入库）；`app/src/test/resources/real-ac3.ts` 是入库的 TS 语料，用来验证轨道探测 |
+| 测试素材 | `.\scripts\make-test-media.ps1`（moov 位置对照）+ `.\scripts\make-audio-fixtures.ps1`（音频编码对照）。生成的媒体**都不入库**，见 `app/src/androidTest/assets/README.md`；`app/src/test/resources/real-ac3.ts` 是入库的 TS 语料，用来验证轨道探测 |
+| 诊断脚本 | `scripts/ts-psi.py`（正确的 PAT/PMT 解析，文件头写了三个踩过的假象）、`scripts/push-config.py`（本机联调直接写配置，账号从 `local.properties` 读）、`scripts/check-ac3-decode.ps1` |
 | 装到电视 | U 盘拷 APK → 电视文件管理安装；或手机电视助手局域网推送 |
 | 电视设置 | 开「允许未知来源应用」；设置开机自启；尝试设为默认桌面 |
 
