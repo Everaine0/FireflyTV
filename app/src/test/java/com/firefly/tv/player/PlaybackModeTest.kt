@@ -66,4 +66,42 @@ class PlaybackModeTest {
         assertTrue("直播探流应比点播快", t.probesizeBytes < v.probesizeBytes)
         assertTrue(t.analyzeDurationUs < v.analyzeDurationUs)
     }
+
+    // ---- 自动跳集的门槛 ----
+    //
+    // 被真实故障逼出来的：《娘道》那种 AC-3 的 TS，内核报出来的时长是 1700ms
+    // （实际 2560 秒）。播放器很快认为「播完了」，于是自动跳下一集、下一部 ——
+    // 用户什么都没按，剧集却自己跑掉了。所以时长不可信时必须拒绝自动跳。
+
+    @Test
+    fun `时长正常时点播可以自动跳集`() {
+        assertTrue(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 2_560_000L))
+        assertTrue(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 45_000L))
+    }
+
+    @Test
+    fun `娘道那种假时长必须拒绝自动跳集`() {
+        // 实测值：内核报 1700ms
+        assertFalse(
+            "1700ms 是坏时长，绝不能据此跳集",
+            PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 1_700L),
+        )
+        assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 5_405L))
+        assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 0L))
+        assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, -1L))
+    }
+
+    @Test
+    fun `直播永远不自动跳集`() {
+        // 直播的 duration 恒为 0，而且「播完了」通常只是断流
+        assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.LIVE, 0L))
+        assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.LIVE, 3_600_000L))
+    }
+
+    @Test
+    fun `门槛是十秒`() {
+        assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 9_999L))
+        assertTrue(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 10_000L))
+        assertEquals(10_000L, PlaybackMode.MIN_TRUSTED_DURATION_MS)
+    }
 }

@@ -206,19 +206,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     override fun surfaceCreated(holder: SurfaceHolder) {
         surfaceReady = true
         engine.attach(holder.surface)
-        // 播放请求可能早于 Surface 就绪，这里补上
-        pendingEpisode?.let { p ->
-            pendingEpisode = null
-            val cfg = Config.smb(this)
-            ioHandler.post {
-                try {
-                    engine.playSmb(cfg, p.path, p.startMs)
-                } catch (t: Throwable) {
-                    Log.w(TAG, "播放失败 ${p.path}", t)
-                    main.post { onError("这个视频无法播放", fatal = true) }
-                }
-            }
-        }
+        launchPendingEpisode()
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -228,6 +216,78 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         surfaceReady = false
         engine.detachSurface()
+    }
+
+    /** Surface 现在到底能不能用（按对象问，不靠标志位猜）。 */
+    private fun surfaceUsable(): Boolean =
+        surfaceView.holder.surface?.isValid == true
+
+    /**
+     * 把排队等 Surface 的那一集放出去。
+     *
+     * 这里原来只有一个隐患很大的前提：「播放请求排上队以后，surfaceCreated 一定会再来一次」。
+     * 实测不成立 —— 从后台回到前台时 `dispatchKeyEvent` 是可以触发的，但 Surface 早就建好了，
+     * `surfaceCreated` 不会再回调，于是 [pendingEpisode] 永远躺在队列里：
+     * **屏幕停在上一集或上一个库的画面，按键却都有反应**，用户看到的就是「卡在当前页面」。
+     * （日志里那一行 `startMs=1180132 surfaceReady=false` 就是它。）
+     *
+     * 现在改成：只要有排队的东西，就当场问一次 Surface 能不能用，能用就立刻起播；
+     * 排队超时就明确报故障，不再无声无息地烂在队列里。
+     */
+    private fun launchPendingEpisode() {
+        val p = pendingEpisode ?: return
+        if (!surfaceUsable()) {
+            trace("launchPendingEpisode 仍在等 Surface：《${p.show}》")
+            return
+        }
+        pendingEpisode = null
+        main.removeCallbacks(pendingTimeout)
+        surfaceReady = true
+        trace("launchPendingEpisode 起播《${p.show}》startMs=${p.startMs}")
+        playEpisodeNow(p.path, p.startMs)
+    }
+
+    private val pendingTimeout = Runnable {
+        val p = pendingEpisode ?: return@Runnable
+        pendingEpisode = null
+        Log.w(TAG, "等 Surface 超时，放弃起播《${p.show}》")
+        showFault("画面还没准备好，请按一下遥控器上的返回键再试", retry = false)
+    }
+
+    private fun playEpisodeNow(path: String, startMs: Long) {
+        val cfg = Config.smb(this)
+        startedAt = System.currentTimeMillis()
+        gotFirstFrame = false
+        main.removeCallbacks(stallWatchdog)
+        main.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
+        ioHandler.post {
+            try {
+                engine.playSmb(cfg, path, startMs)
+            } catch (t: Throwable) {
+                Log.w(TAG, "播放失败 $path", t)
+                main.post { onError("这个视频无法播放", fatal = true) }
+            }
+        }
+    }
+
+    private var startedAt = 0L
+    private var gotFirstFrame = false
+
+    /**
+     * 起播卡死看门狗。
+     *
+     * 「卡在当前页面」是用户实测到的最烦人的一种故障：按键都有反应、浮层也出得来，
+     * 就是画面不动，而且**永远不会自己好**。以前的代码在这种情况下一声不吭。
+     *
+     * 这里给每次起播都挂一个超时：到点还没出首帧就当作播放失败处理
+     * （跳故障页 → 自动重试）。宁可让它自己重试几次，也不要留一个死的画面。
+     */
+    private val stallWatchdog = Runnable {
+        if (gotFirstFrame) return@Runnable
+        val waited = System.currentTimeMillis() - startedAt
+        Log.w(TAG, "起播 ${waited}ms 还没出首帧，判定卡死，走故障页重试")
+        trace("stallWatchdog 卡死 ${waited}ms")
+        onError("这个视频打不开，正在换下一个", fatal = false)
     }
 
     // ---- 按键（只有三类） ----
@@ -273,8 +333,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     private fun onConfigured() {
-        configScreen.recycle()
-        configScreen.visibility = View.GONE
+        // 保存成功到出画面要连 NAS、列目录、起播，可能好几秒。
+        // 这段先显示「正在打开」，别让用户以为没保存上。
+        configScreen.showStarting()
+        main.postDelayed(configStartingTick, CONFIG_STARTING_MS)
         startPlayback()
         main.removeCallbacks(positionTick)
         main.postDelayed(positionTick, POSITION_INTERVAL_MS)
@@ -283,6 +345,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun closeConfigServer() {
         configServer?.stop()
         configServer = null
+    }
+
+    /** 过渡态最多显示这么久；到点就交回播放（画面出来时也会提前撤掉）。 */
+    private val configStartingTick = Runnable {
+        if (configScreen.visibility == View.VISIBLE) {
+            configScreen.recycle()
+            configScreen.visibility = View.GONE
+        }
     }
 
     // ---- 播放 ----
@@ -416,6 +486,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     ) {
         if (libraries.isEmpty()) return
         libIndex = ((index % libraries.size) + libraries.size) % libraries.size
+        trace("selectLibrary idx=$index -> ${libraries[libIndex].name} resumeShow=[$resumeShow] resumeEp=$resumeIndex dir=$dir")
 
         // 换库即作废上一个库的所有缓存
         channels = emptyList()
@@ -500,6 +571,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     /** 换库：循环，播放目标库的记忆位置。 */
     private fun switchLibrary(delta: Int) {
         if (libraries.isEmpty()) return
+        trace("switchLibrary delta=$delta from=${libraries.getOrNull(libIndex)?.name}")
         val target = Navigator.horizontal(libIndex, libraries.size, delta)
         // 记忆位置只对「上次看的那个库」有效，否则会拿着别的内容的名字去这个库里找
         val spot = Config.spot(this)
@@ -516,6 +588,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     /** ↑ / ↓：决策交给 [Navigator]（有单元测试钉住），这里只负责执行。 */
     private fun switchShowOrChannel(delta: Int) {
         if (libraries.isEmpty()) return
+        trace("switchShowOrChannel delta=$delta lib=${libraries.getOrNull(libIndex)?.name} shows=${shows.size} chans=${channels.size}")
         val action = Navigator.vertical(
             lib = libraries.getOrNull(libIndex),
             shows = shows,
@@ -590,6 +663,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             episodes = cached
             cachedShow = wanted
             episodeIndex = epIdx.coerceIn(0, cached.size - 1)
+            trace("playShow 《$wanted》用缓存集列表 ${cached.size} 集 -> 直接起播")
             playEpisode(startMs)
         }
 
@@ -597,9 +671,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             val eps = try {
                 Scanner.episodesDetailed(cfg, lib, wanted)
             } catch (t: Throwable) {
+                trace("playShow 《$wanted》列集失败：${t.message}")
                 if (episodes.isEmpty()) postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
                 return@post
             }
+            trace("playShow 《$wanted》列到 ${eps.names.size} 集 byContent=${eps.byContent}")
             val snap = LibraryCache.withEpisodes(cache, wanted, eps.names, eps.byContent)
             commitCache(snap)
             postIf(seq) {
@@ -622,13 +698,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         }
     }
 
-    /**
-     * 回到主线程执行，但只在「还是同一轮切库」时才执行。
-     * 用它可以避免在嵌套 post 里写 `return@post` —— 那会产生
-     * “more than one label with such a name” 的歧义警告。
-     */
+    /** 回到主线程执行，但只在「还是同一轮切库」时才执行。 */
     private inline fun postIf(seq: Int, crossinline block: () -> Unit) {
         main.post { if (seq == librarySeq) block() }
+    }
+
+    /**
+     * 排查用的调用链日志。
+     *
+     * 按键/切库这类问题的现象是「它自己跳到别的库去了」，光看代码推不出来是哪条路进去的，
+     * 必须有调用链。默认关闭，只在排查时把 [DEBUG_TRACE] 改成 true 重新打包。
+     */
+    private fun trace(msg: String) {
+        if (DEBUG_TRACE) Log.i(TAG_TRACE, msg)
     }
 
     private fun playEpisode(startMs: Long) {
@@ -639,23 +721,36 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 先出名字，再去做后面那些可能慢的事
         announce(showName)
         Config.saveSpot(this, lib.name, showName, episodeIndex, startMs)
+        trace("playEpisode 《$showName》[$ep] startMs=$startMs surfaceUsable=${surfaceUsable()}")
 
-        if (!surfaceReady) {
-            // Surface 还没就绪，等 surfaceCreated
-            pendingEpisode = PendingEpisode(path, startMs)
+        if (!surfaceUsable()) {
+            // Surface 还没建好：排队等着，并在 surfaceCreated 或超时时处理
+            pendingEpisode = PendingEpisode(path, startMs, showName)
+            main.removeCallbacks(pendingTimeout)
+            main.postDelayed(pendingTimeout, SURFACE_WAIT_MS)
+            main.postDelayed(surfacePoll, SURFACE_POLL_MS)
             return
         }
-        val cfg = Config.smb(this)
-        ioHandler.post {
-            try {
-                // 在 IO 线程打开 SMB 文件（playSmb 会阻塞），避免卡主线程
-                engine.playSmb(cfg, path, startMs)
-            } catch (t: Throwable) {
-                Log.w(TAG, "播放失败 $path", t)
-                main.post { onError("这个视频无法播放", fatal = true) }
+        playEpisodeNow(path, startMs)
+        checkAudio(path)
+    }
+
+    /**
+     * 排队等 Surface 时的轮询兜底。
+     *
+     * 不想只依赖 `surfaceCreated`：它是回调，不是状态 —— 回调错过一次就永远不会再来。
+     * 每 500ms 自己问一次「Surface 现在能用了吗」，问到了就起播，问不到就一直等
+     * （直到 [pendingTimeout] 兜底报故障）。
+     */
+    private val surfacePoll = object : Runnable {
+        override fun run() {
+            if (pendingEpisode == null) return
+            if (surfaceUsable()) {
+                launchPendingEpisode()
+            } else {
+                main.postDelayed(this, SURFACE_POLL_MS)
             }
         }
-        checkAudio(path)
     }
 
     /**
@@ -675,6 +770,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 SmbStore.with(cfg) { it.head(path, PROBE_BYTES) }
             }.getOrNull() ?: return@post
             val verdict = AudioSupport.probeFor(PlaybackMode.Kind.ON_DEMAND, head)
+            trace("checkAudio head=${head.size}B 判定=${verdict.codec} canProbe=${verdict.canProbe} 提示=${verdict.warning}")
             val warn = verdict.warning ?: return@post
             main.post {
                 audioWarning = warn
@@ -683,11 +779,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         }
     }
 
-    private class PendingEpisode(val path: String, val startMs: Long)
+    private class PendingEpisode(val path: String, val startMs: Long, val show: String)
     private var pendingEpisode: PendingEpisode? = null
 
     /** 一集播完自动下一集 → 全剧播完下一部剧 → 最后一部回到该库第一部（DESIGN §5）。 */
     private fun onEpisodeFinished() {
+        trace("onEpisodeFinished lib=${libraries.getOrNull(libIndex)?.name} show=[$showName] ep=$episodeIndex/${episodes.size}")
         if (episodeIndex + 1 < episodes.size) {
             episodeIndex++
             playEpisode(0L)
@@ -956,6 +1053,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     override fun onCompletion() {
+        val kind = PlaybackMode.of(libraries.getOrNull(libIndex))
+        val dur = engine.durationMs()
+        trace("onCompletion lib=${libraries.getOrNull(libIndex)?.name} duration=${dur}ms")
+        // 时长不可信时绝不自动跳集：那种流（AC-3 的 TS）会被内核误判成「已经播完」，
+        // 一集接一集地自己往前跑，用户什么都没按却停在了别的剧上。
+        if (!PlaybackMode.canAutoAdvance(kind, dur)) {
+            Log.w(TAG, "时长不可信（${dur}ms），不自动跳集，原地接着播")
+            return
+        }
         onEpisodeFinished()
     }
 
@@ -967,7 +1073,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             showFault(friendlyMessage, retry = false)
             main.postDelayed({
                 showFault(null)
-                onEpisodeFinished()
+                // 这里同样要先确认时长可信，否则损坏文件会把整部剧一路跳完
+                val kind = PlaybackMode.of(libraries.getOrNull(libIndex))
+                if (PlaybackMode.canAutoAdvance(kind, engine.durationMs())) {
+                    onEpisodeFinished()
+                } else {
+                    Log.w(TAG, "时长不可信，损坏后不自动跳集")
+                }
             }, 3000)
         } else {
             showFault(friendlyMessage, retry = true)
@@ -975,7 +1087,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     override fun onFirstFrame() {
+        gotFirstFrame = true
+        main.removeCallbacks(stallWatchdog)
         showFault(null)
+        // 画面已经出来了，「正在打开…」的过渡页就没必要再占着屏幕
+        main.removeCallbacks(configStartingTick)
+        configStartingTick.run()
     }
 
     // ---- 续播写盘（5 秒防抖，避免频繁 IO 卡顿） ----
@@ -1018,6 +1135,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         main.removeCallbacksAndMessages(null)
         ioHandler.removeCallbacksAndMessages(null)
         runCatching { hud.dismiss() }
+        runCatching { main.removeCallbacks(stallWatchdog) }
         runCatching { engine.release() }
         runCatching { tts.shutdown() }
         runCatching { abandonAudioFocus() }
@@ -1030,6 +1148,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     companion object {
         private const val TAG = "FireflyTV"
+        private const val TAG_TRACE = "FireflyTrace"
+
+        /** 排查切库/按键问题时改成 true，用 `adb logcat -s FireflyTrace` 看调用链。 */
+        private const val DEBUG_TRACE = true
         private const val OVERLAY_MS = 10_000L
         private const val RETRY_MS = 10_000L
         private const val POSITION_INTERVAL_MS = 5_000L
@@ -1038,6 +1160,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 起播前认音频编码时读多少字节：1MB 足够覆盖 PAT/PMT。 */
         private const val PROBE_BYTES = 1 shl 20
+
+        /** 等 Surface 的最长时间；超过就报故障，不无声地卡住。 */
+        private const val SURFACE_WAIT_MS = 8_000L
+
+        /** 等 Surface 时的问询间隔。 */
+        private const val SURFACE_POLL_MS = 500L
+
+        /** 「配置已保存，正在打开」最多显示这么久。 */
+        private const val CONFIG_STARTING_MS = 15_000L
+
+        /** 起播后多久没出首帧就判定卡死。4K 大文件要留足时间。 */
+        private const val STALL_TIMEOUT_MS = 25_000L
         private const val WEATHER_TTL_MS = 30 * 60 * 1000L
         private val NUM_DIGITS = arrayOf("零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十")
     }

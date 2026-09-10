@@ -50,18 +50,39 @@ object PlaybackMode {
     )
 
     /**
+     * 播完了能不能自动跳下一个。
+     *
+     * 这条判据是被真实故障逼出来的：《娘道》那种 AC-3 的 TS，因为音频解不了，
+     * 内核报出来的时长是错的（一集实际 2560 秒，报 1700ms）。
+     * 时长是错的 → 播放器很快就认为「播完了」→ 自动跳下一集、下一部，
+     * 用户什么都没按，剧集却在自己往前跑，最后停在别的剧上。
+     *
+     * 所以只有「时长可信」时才敢自动跳。时长不可信时宁可原地接着播同一集 ——
+     * 对老人来说，「这一集反复播」远比「整部剧自己跑掉」好收拾。
+     *
+     * @param durationMs 播放器报出来的时长；直播恒为 0
+     */
+    fun canAutoAdvance(kind: Kind, durationMs: Long): Boolean =
+        kind == Kind.ON_DEMAND && durationMs >= MIN_TRUSTED_DURATION_MS
+
+    /** 短于十秒的时长一定是错的（没有哪一集电视剧只有几秒）。 */
+    const val MIN_TRUSTED_DURATION_MS = 10_000L
+
+    /**
      * 直播和点播的取舍不一样：
      *  - 点播放开缓冲，宁可多等一点也不要中途卡；
-     *  - 直播必须及时出画面，但**不能**完全关掉包缓冲 —— 关了以后视频钟会先跑，
-     *    音频还在等 AudioTrack 起播，起播那几秒就是音画不同步。用一个小缓冲把
-     *    两者的起点对齐，代价只是多半秒。
+     *  - 直播必须贴近实时。缓冲堆得越多，画面离「现在」就越远 ——
+     *    实测 CCTV1 是「画面比声音**慢**」，正是缓冲堆积造成的落后，
+     *    所以直播的缓冲要压到最小：能起播就行，不追求抗抖动。
      */
     fun tuning(kind: Kind): Tuning = when (kind) {
         Kind.LIVE -> Tuning(
+            // 保留包缓冲：完全关掉时视频钟会先跑，音频还在等 AudioTrack 起播，
+            // 起播那几秒反而会不同步。留一个很小的缓冲，两头都顾上。
             packetBuffering = true,
-            maxBufferBytes = 2L * 1024 * 1024,
-            probesizeBytes = 512L * 1024,
-            analyzeDurationUs = 1_000_000L,
+            maxBufferBytes = 512L * 1024,
+            probesizeBytes = 256L * 1024,
+            analyzeDurationUs = 500_000L,
         )
 
         Kind.ON_DEMAND -> Tuning(

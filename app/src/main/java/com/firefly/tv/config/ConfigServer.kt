@@ -319,6 +319,34 @@ class ConfigServer(
   .msg.ok  { display:block; background:#1e3320; color:var(--ok); }
   .row { display:flex; gap:10px; }
   .row > div { flex:1; }
+  /* 保存时的等待反馈：转圈 + 一条来回走的进度条。
+     保存要连 NAS 实测，可能好几秒；没有反馈用户会以为卡死并反复点。 */
+  #spin { display:none; width:15px; height:15px; margin-right:8px; vertical-align:-2px;
+          border:2px solid #6b5c48; border-top-color:var(--accent); border-radius:50%;
+          animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #bar { display:none; position:relative; overflow:hidden; height:4px; margin-top:14px;
+         border-radius:2px; background:#2a2420; }
+  #bar::after { content:''; position:absolute; top:0; left:-40%; width:40%; height:100%;
+                background:var(--accent); border-radius:2px; animation:slide 1.1s ease-in-out infinite; }
+  @keyframes slide { 0% { left:-40%; } 100% { left:100%; } }
+  @media (prefers-reduced-motion: reduce) {
+    #spin, #bar::after { animation:none; }
+  }
+  /* ---- 手机适配 ----
+     配置页几乎只用手机打开（扫电视上的二维码），所以按手机优先来做：
+      · 已设 width=device-width：不会按 980px 桌面宽度缩放
+      · 输入框字号锁 16px：iOS 上小于 16px 会在聚焦时自动放大页面，很难退回
+      · 窄屏收掉左右留白；底部留出「手势条」的安全区，避免按钮被系统条挡住 */
+  @media (max-width: 420px) {
+    body { padding:14px 12px 40px; }
+    section { padding:14px; }
+    h1 { font-size:19px; }
+    button { padding:15px; font-size:17px; }
+  }
+  @supports (padding: env(safe-area-inset-bottom)) {
+    body { padding-bottom: calc(48px + env(safe-area-inset-bottom)); }
+  }
 </style>
 </head>
 <body>
@@ -369,7 +397,8 @@ class ConfigServer(
 </section>
 
 <button class="test" id="btnTest" type="button">先测试一下</button>
-<button id="btnSave" type="button">保存并开始使用</button>
+<button id="btnSave" type="button"><span id="spin"></span>保存并开始使用</button>
+<div id="bar"></div>
 <div class="msg" id="msg"></div>
 
 <script>
@@ -392,6 +421,7 @@ async function call(path, btn, okText) {
   btn.disabled = true;
   const old = btn.textContent;
   btn.textContent = '正在检查…';
+  msg.className = 'msg';
   try {
     const r = await fetch(path, {
       method: 'POST',
@@ -410,12 +440,25 @@ async function call(path, btn, okText) {
     btn.textContent = old;
   }
 }
+
+// 保存要连 NAS 实测，可能要等好几秒 —— 这期间必须让人看到「在做事」，
+// 按钮转圈 + 一条会动的提示，否则用户会以为卡死了然后反复点。
+function busy(on) {
+  const spinner = document.getElementById('spin');
+  const bar = document.getElementById('bar');
+  spinner.style.display = on ? 'inline-block' : 'none';
+  bar.style.display = on ? 'block' : 'none';
+}
+
 // 「先测试一下」只检查，不会保存、也不会开始播放 —— 文案必须说清楚，
 // 否则用户以为已经生效，看着电视还停在二维码页会一头雾水。
 document.getElementById('btnTest').onclick = e =>
   call('/api/test', e.target, '检查通过。确认没问题后，请点下面的「保存并开始使用」。');
 document.getElementById('btnSave').onclick = async e => {
+  busy(true);
+  msg.className = 'msg';
   const ok = await call('/api/save', e.target, '已保存，电视马上开始播放…');
+  busy(false);
   if (ok) {
     document.getElementById('btnSave').disabled = true;
     document.getElementById('btnTest').disabled = true;
