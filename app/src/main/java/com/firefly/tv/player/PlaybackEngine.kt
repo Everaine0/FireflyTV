@@ -88,6 +88,18 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     private var liveUrlProvider: (() -> String?)? = null
     private var retryCount = 0
 
+    /**
+     * 覆盖探测窗口（`probesize` / `analyzeduration`），null 表示用 [PlaybackMode.tuning] 的默认值。
+     *
+     * 给排查用：流参数探测失败（表现为「有画面没声音」）时，
+     * 需要单独把窗口放大来区分「窗口不够」和「时间戳有问题」这两种原因。
+     */
+    private var probeOverride: Pair<Long, Long>? = null
+
+    fun setProbeOverride(probesizeBytes: Long, analyzeDurationUs: Long) {
+        probeOverride = probesizeBytes to analyzeDurationUs
+    }
+
     private val main = Handler(Looper.getMainLooper())
 
     override fun setListener(l: PlaybackEngine.Listener) {
@@ -183,10 +195,11 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1L)
         // 直播/点播各自一套参数，取舍不同（见 PlaybackMode.tuning）
         val t = PlaybackMode.tuning(kind)
+        val probe = probeOverride
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", if (t.packetBuffering) 1L else 0L)
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", t.maxBufferBytes)
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", t.probesizeBytes)
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", t.analyzeDurationUs)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", probe?.first ?: t.probesizeBytes)
+        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", probe?.second ?: t.analyzeDurationUs)
         // 内嵌中文字幕轨优先，无中文则整个不显示（DESIGN §5）
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "subtitle", 1L)
 

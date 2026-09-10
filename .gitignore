@@ -5,8 +5,11 @@ app/libs/**/*.aar
 # 自己编译 ijkplayer 内核时的产物/中间产物（体积大、可重编，见 scripts/build-ijkplayer.sh）
 build-out/
 
-# 测试用媒体：由 scripts/make-test-media.ps1 生成，不入库
+# 测试用媒体：由脚本生成，不入库（生成方式见 app/src/androidTest/assets/README.md）
+#   make-test-media.ps1     -> *.mp4（moov 位置对照）
+#   make-audio-fixtures.ps1 -> audio-*.ts（音频编码对照）
 app/src/androidTest/assets/*.mp4
+app/src/androidTest/assets/audio-*.ts
 
 # 构建产物
 *.iml

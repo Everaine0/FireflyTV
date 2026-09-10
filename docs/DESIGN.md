@@ -215,31 +215,75 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | 《猫和老鼠》157 集 | MP4（moov 在尾部） | H.264 | AAC | ✅ | ✅ | ✅ |
 | 《大宅门》40 集 | MP4（moov 在尾部） | H.265 4K | AAC | ✅ | ✅ | ✅ |
 | CCTV1 / CCTV3 等 18 个频道 | HLS（10 秒 TS 分片） | H.264 1080p25 | AAC | ✅ | ✅ | ✅ |
-| **《娘道》76 集** | **MPEG-TS**（后缀却叫 `.mp4`） | H.264 High 1080p50 | **AC-3** | ✅ | ✅ | ❌ |
-| **CCTV5** | HLS（10 秒 TS 分片） | H.264 1080p25 | **MP2** | ✅ | ✅ | ❌ |
+| **《娘道》76 集** | **MPEG-TS**（后缀却叫 `.mp4`） | H.264 High 1080p50 | **AC-3** | ✅ | ✅ | ✅ |
+| **CCTV5** | HLS（10 秒 TS 分片） | H.264 1080p25 | **MP2** | ✅ | ✅ | ✅ |
 | CCTV17 等 4 个频道 | UDP 组播 / 直链 mp4 | — | — | ⚠️ | — | — |
 
-#### 根因：官方 ijkplayer 0.8.8 的内核里没有 AC-3 / MP2 解码器
+#### 「没声音」有两个完全不同的根因，现象一模一样
 
-把官方 `libijkffmpeg.so` 里注册的解码器标志符全部列出来，只有 **23 个**：
+这一节值钱的地方不是结论，而是**排查过程中踩过的三个假象**。
+两个根因都会表现成「画面完全正常，就是没声音」，不区分开就只能瞎猜：
+
+**根因 A：这条流的音频编码，内核解不了。**
+官方 ijkplayer 0.8.8 的 `libijkffmpeg.so` 里注册的解码器标志符只有 **23 个**：
 
 ```
 视频: ff_h264 ff_hevc ff_mpeg4 ff_h263 ff_h263i ff_h263p ff_flv ff_vp6 ff_vp6a ff_vp6f ff_vp8 ff_vp9
 音频: ff_aac ff_aac_latm ff_mp3 ff_mp3float ff_mp3adu ff_mp3adufloat ff_mp3on4 ff_mp3on4float ff_flac
 ```
 
-**没有 `ff_ac3_decoder`，没有 `ff_eac3_decoder`，也没有 `ff_mp2_decoder`**（mp3 有，mp2 没有）。
-而用户的片源恰好命中这两个缺口，所以是「画面好好的，就是没声音」。
+**没有 `ff_ac3_decoder`，没有 `ff_eac3_decoder`，也没有 `ff_mp2_decoder`。**
+这一类要靠换内核解决（下面「重新编译内核」一节）。
 
-这条结论经过三重交叉验证：
+**根因 B：音频流的参数没被探测出来。**
+FFmpeg 认得出「这是 AC-3」，但采样率和声道数是 0，
+于是 `AVCodecContext` 打不开，音频组件**静默失败**（不打任何错误日志）。
+设备日志里只有一句很不显眼的：
 
-1. 合成片源：H.264 + **AC-3** 的 TS 起播、出首帧，但**不出声**；同样参数换成 AAC 立刻出声
-2. 真实片源：`娘道` 与 `CCTV5` 无声，`大宅门`（AAC）有声 —— 与解码器清单完全吻合
-3. 二进制清单：上面那 23 个标志符，两个缺口都在
+```
+W/IJKMEDIA: Could not find codec parameters for stream 1
+            (Audio: ac3 ([129][0][0][0] / 0x0081), 0 channels, fltp): unspecified sample rate
+W/IJKMEDIA: Consider increasing the value for the 'analyzeduration' and 'probesize' options
+```
 
-顺带解释了一个附带现象：这类流的**时长也是错的**（`娘道` 一集实际 2560 秒，报 1700ms；
-6 秒的合成片报 5405ms）。根因还是在音频：解不出音频帧，时长估算就崩了。
-所以它不是独立 bug，是同一个根因的第二个症状 —— 这一点后来被换内核的结果证实了。
+**《娘道》真正的根因是 B，不是 A。** 这一点绕了很久才认清。
+
+实测数据：`娘道` 的第一条音频包在文件的 **2,340,788 字节（2.34 MB）**处
+（视频包很大，单包 291 KB，把音频压在后面），而当时的探测窗口只有 **2 MB** ——
+差了 340 KB，于是播放器把窗口读完了也没碰到一个音频包。
+二分实测（`ffprobe -probesize N`）：
+
+```
+  2.0 MB -> 0 channels          （旧值，音频组件打不开）
+  3.0 MB -> 48000 Hz, 2 ch      （刚够）
+```
+
+修法：点播的 `probesize` 提到 **16 MB**（`PlaybackMode.MIN_PROBESIZE_BYTES`），
+`PlaybackModeTest` 把下限钉住，防止以后有人为了「起播快一点」调回去。
+
+**验证（可复跑）**：`Ac3AudioTest.niangdaoViaSmbProducesAudio`
+直接播 NAS 上的整集（2.4 GB，走真实 SMB 路径），断言拿到
+`FFP_MSG_AUDIO_RENDERING_START`。修复前失败、修复后通过，设备侧能看到
+`CHANNEL_OUT_STEREO` + `ff_aout_android` 线程起动。
+
+#### 排查中踩到的三个假象（比结论更值得记）
+
+| 假象 | 真相 |
+| :--- | :--- |
+| 「娘道的 PAT/PMT 是坏的：`section_length=176`、`PMT_PID=0x0AC3`、CRC 全错」 | 我自己的工具错了。**PSI 包的 payload 第一个字节是 `pointer_field`**，没跳过它就从错误偏移读 section。垃圾里恰好出现 `0x0AC3`，看着特别像「AC-3 标记」，把方向带偏很久。真实值是 `section_length=13`、`PMT_PID=0x109A`、CRC 正确 |
+| 「用 CRC 判断表是否损坏」 | **MPEG-TS 的 PSI 不用 zlib 那套 CRC**，用 zlib 校验会把**所有正确的表判成损坏**。识破办法：拿一份已知正确的 TS 校验工具本身 —— 连 ffmpeg 亲手生成的样本都「全部 CRC 错误」，那错的必然是校验器 |
+| 「音频包在 13 KB 处（找到了 AC-3 的 `0x0B77`）」 | 假阳性。`0x0B77` 只有两个字节，在视频数据里会撞车。真实偏移是 2.34 MB |
+
+共同点：**每一个都给出了「看起来很有道理」的错误答案**。
+所以现在凡是靠工具得出的结论，都要求先在**已知正确的样本**上验证工具本身
+（`scripts/ts-psi.py` 就是这么写出来的，可以拿两份文件互相印证）。
+
+#### 附带修好的：时长算不出来
+
+`娘道` 一集实际 2560 秒，播放器报 1700ms。这和根因 B 同源 ——
+音频参数解不出来，时长估算跟着崩。**注意「同源」不等于「可互换的指标」**：
+修好探测窗口后音频已经正常出声，但 `player.duration` **仍然是 1700ms**。
+所以验证音频问题要用音频参数本身，不能拿时长当代理指标。
 
 #### 解决方式：重新编译内核（已落地）
 
@@ -260,14 +304,22 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 
 | 片源 | 音频 | 换内核前 | 换内核后 |
 | :--- | :--- | :--- | :--- |
-| 《娘道》76 集 | AC-3 | ❌ 无声 | ✅ 画面 + 声音 |
-| CCTV5 | MP2 | ❌ 无声 | ✅ 画面 + 声音 |
+| 自生成的 AC-3 样本 | AC-3 | — | ✅ 画面 + 声音 |
+| 自生成的 E-AC-3 / MP2 样本 | E-AC-3 / MP2 | — | ✅ 画面 + 声音 |
 | 《大宅门》《猫和老鼠》 | AAC | ✅ | ✅ |
 | CCTV1 / CCTV3 等 | AAC | ✅ | ✅ |
-| 合成 AC-3 TS 报出的时长 | — | 5405ms（错） | **6005ms（对）** |
+| 《娘道》76 集（真实 NAS，2.4 GB 走 SMB） | AC-3 | ❌ 无声 | ✅ 画面 + 声音 |
 
 判据用的是 ijkplayer 的 `MEDIA_INFO_AUDIO_RENDERING_START` 回调，不靠人耳听；
-设备侧也确认了 `SDL_Android_AudioTrack` 起播、`ff_aout_android` 线程在跑。
+设备侧也确认了 `SDL_Android_AudioTrack` 起播（`CHANNEL_OUT_STEREO`）、
+`ff_aout_android` 线程在跑。
+
+音频编码矩阵（`AudioCodecMatrixTest`，同一段视频只换音频编码）：
+**AAC / AC-3 / E-AC-3 / MP2 在 TS 与 MP4 两种容器下全部出声。**
+
+> ⚠️ 换内核**只是必要条件，不是充分条件**。它解决了根因 A；
+> 《娘道》还额外撞上了根因 B（探测窗口不够），那个要靠 `probesize` 解决。
+> 两个都修好之后娘道才有声音 —— 这也是为什么「换了内核还是没声音」曾经成立。
 
 #### 编这一版踩到的三个坑（都写成了补丁脚本）
 

@@ -14,6 +14,16 @@ import android.util.Log
  * 解复用器看到 moov 在头部，就正常了 —— 不需要重新编码，也不需要临时文件。
  *
  * 只在确实需要时才启用（moov 在 mdat 之后）；本来就在头部的文件原样返回。
+ *
+ * ## read 必须尽量填满缓冲区
+ *
+ * 重排后的虚拟文件是由若干**物理上不连续**的段拼起来的（ftyp、moov、然后是 mdat 等），
+ * 一次 `read` 很容易横跨段边界。早先的实现遇到边界就只返回当前段剩下的字节，
+ * 调用方（`SmbMediaDataSource` 的块缓存、ijkplayer 的读线程）拿到的就比要的少。
+ *
+ * 上层不一定都会自己补齐，短读会被当成「文件到这儿就没了」——
+ * 表现是播到一半「播完了」或者画面花掉，而**只有在需要重排的片源上才复现**。
+ * 所以这里必须循环读到填满（或确实到文件末尾）为止。
  */
 class MoovRelocatingSource private constructor(
     private val source: RandomAccessSource,
@@ -33,20 +43,29 @@ class MoovRelocatingSource private constructor(
     override fun read(offset: Long, buf: ByteArray, bufOffset: Int, len: Int): Int {
         if (offset < 0 || offset >= size) return -1
 
-        // 定位虚拟偏移落在哪一段
-        var seg: Segment? = null
-        for (s in segments) {
-            if (offset >= s.virtualStart && offset < s.virtualStart + s.length) {
-                seg = s
-                break
+        var done = 0
+        var pos = offset
+        while (done < len && pos < size) {
+            // 定位虚拟偏移落在哪一段
+            var seg: Segment? = null
+            for (s in segments) {
+                if (pos >= s.virtualStart && pos < s.virtualStart + s.length) {
+                    seg = s
+                    break
+                }
             }
-        }
-        if (seg == null) return -1
+            if (seg == null) break
 
-        val inSeg = offset - seg.virtualStart
-        // 不跨段读：上层是 256KB 块，这里最多多几次物理读，换来实现简单不易错
-        val n = minOf(len.toLong(), seg.length - inSeg).toInt()
-        return source.read(seg.physicalStart + inSeg, buf, bufOffset, n)
+            val inSeg = pos - seg.virtualStart
+            val n = minOf((len - done).toLong(), seg.length - inSeg).toInt()
+            if (n <= 0) break
+
+            val got = source.read(seg.physicalStart + inSeg, buf, bufOffset + done, n)
+            if (got <= 0) break
+            done += got
+            pos += got
+        }
+        return if (done == 0) -1 else done
     }
 
     override fun close() {

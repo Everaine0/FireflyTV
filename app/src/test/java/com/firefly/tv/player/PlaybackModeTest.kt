@@ -67,6 +67,43 @@ class PlaybackModeTest {
         assertTrue(t.analyzeDurationUs < v.analyzeDurationUs)
     }
 
+    // ---- 探测窗口的下限 ----
+    //
+    // 《娘道》没声音的**真正根因**就在这里，不是解码器缺失。
+    //
+    // 它的第一条音频包在文件的 2,340,788 字节（2.34 MB）处 —— 视频包很大
+    // （单包 291 KB），音频包被压在很后面。旧值 2 MB 的探测窗口读不到音频参数，
+    // FFmpeg 只报一句很不显眼的
+    //   "Could not find codec parameters for stream 1 (Audio: ac3 ... 0 channels)"
+    // 然后音频组件**静默失败**：画面完全正常，就是没声音。
+    //
+    // 二分实测（ffprobe -probesize）：2.0 MB → 0 channels；3.0 MB → 48000 Hz/2ch。
+    // 这个测试把下限钉住，防止有人为了「起播快一点」把它调回去。
+
+    @Test
+    fun `点播探测窗口必须足够大才能读到音频参数`() {
+        val v = PlaybackMode.tuning(PlaybackMode.Kind.ON_DEMAND)
+        assertTrue(
+            "点播 probesize 不能小于娘道需要的 2.34 MB（否则整部剧没声音）",
+            v.probesizeBytes > 2_340_788L,
+        )
+        assertEquals(
+            "下限应显式声明，方便以后有实测数据时调整",
+            PlaybackMode.MIN_PROBESIZE_BYTES,
+            v.probesizeBytes,
+        )
+    }
+
+    @Test
+    fun `探测窗口下限留了余量`() {
+        // 实测「刚够」是 3 MB。取值必须明显大于它，
+        // 免得换一部音频包更靠后的剧又踩同一个坑。
+        assertTrue(
+            "下限应比实测的临界值（3 MB）留出余量",
+            PlaybackMode.MIN_PROBESIZE_BYTES >= 8L * 1024 * 1024,
+        )
+    }
+
     // ---- 自动跳集的门槛 ----
     //
     // 被真实故障逼出来的：《娘道》那种 AC-3 的 TS，内核报出来的时长是 1700ms

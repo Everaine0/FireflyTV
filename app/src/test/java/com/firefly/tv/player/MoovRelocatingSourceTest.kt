@@ -175,4 +175,44 @@ class MoovRelocatingSourceTest {
         val wrapped = MoovRelocatingSource.wrap(base)
         assertSame("不该白包一层", base, wrapped)
     }
+
+    /**
+     * 一次 read 横跨段边界时必须把缓冲区填满。
+     *
+     * 这个 bug 曾经真的存在于线上，而 [readAll] 那种 7 字节零碎读**发现不了它**
+     * —— 读得足够小就永远不跨段。真实调用方（块缓存一次要 256KB、
+     * ijkplayer 的读线程也是一次要一大块）做的正是这里模拟的大块读。
+     *
+     * 症状之所以难查：**只有 moov 在尾部、需要重排的片源才会复现**，
+     * 表现为播到一半「播完」或者画面花屏，正常片源完全无事。
+     */
+    @Test
+    fun `大块读跨段时必须填满缓冲区`() {
+        val data = tailMoovFile() // ftyp(24) | mdat(72) | moov(40)
+        val relocated = MoovRelocatingSource.buildFrom(ByteArrayRandomAccessSource(data), scan(data))!!
+        val view = readAll(relocated) // 先用零碎读拿到正确的期望值
+
+        // 跨 ftyp -> moov 边界读一大块
+        val buf = ByteArray(64)
+        val n = relocated.read(8, buf, 0, 64)
+        assertEquals("跨段读必须返回请求的字节数，不能只返回当前段剩下的", 64, n)
+        assertArrayEquals(
+            "跨段读的内容必须和逐字节读出来的一致",
+            view.copyOfRange(8, 8 + 64),
+            buf,
+        )
+    }
+
+    /** 缓冲区大于剩余文件时，返回「实际读到的字节数」而不是报错，也不能少填。 */
+    @Test
+    fun `读到最后一段时按剩余长度返回`() {
+        val data = tailMoovFile()
+        val relocated = MoovRelocatingSource.buildFrom(ByteArrayRandomAccessSource(data), scan(data))!!
+        val view = readAll(relocated)
+
+        val buf = ByteArray(4096)
+        val n = relocated.read(relocated.size - 10, buf, 0, 4096)
+        assertEquals("应该只返回剩下那 10 字节", 10, n)
+        assertArrayEquals(view.copyOfRange(view.size - 10, view.size), buf.copyOfRange(0, 10))
+    }
 }
