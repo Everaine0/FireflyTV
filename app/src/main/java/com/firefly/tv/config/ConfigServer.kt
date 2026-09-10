@@ -178,10 +178,24 @@ class ConfigServer(
         return result(null, null)
     }
 
+    /**
+     * 组装回包。
+     *
+     * 措辞上区分「测通了」和「没填、跳过了」—— **跳过不等于通过**。
+     * 早先两者都回「连接成功」，用户留空天气却看到「天气 连接成功」，
+     * 会以为天气已经配好了，等发现电视上不显示天气又要重新排查一遍。
+     * （同类问题之前出现过一次：配置页说「检查通过，正在开始播放」但其实没保存。）
+     */
     private fun result(smbMsg: String?, wMsg: String?): String {
         val ok = smbMsg == null && wMsg == null
-        return """{"ok":$ok,"smb":${json(smbMsg ?: "连接成功")},"weather":${json(wMsg ?: "连接成功")}}"""
+        val smbText = smbMsg ?: if (smbSkipped) "没填，已跳过" else "连接成功"
+        val wText = wMsg ?: if (weatherSkipped) "没填，已跳过（电视上不显示天气）" else "连接成功"
+        return """{"ok":$ok,"smb":${json(smbText)},"weather":${json(wText)}}"""
     }
+
+    /** 上一次 [testSmb] / [testWeather] 是不是「没填所以跳过」。 */
+    private var smbSkipped = false
+    private var weatherSkipped = false
 
     /** 返回 null = 通过（含"没填，跳过"），否则是给老人看的中文原因。 */
     private fun testSmb(p: Map<String, String>): String? {
@@ -189,6 +203,7 @@ class ConfigServer(
             p["host"].orEmpty(), p["share"].orEmpty(), p["root"].orEmpty(),
             p["user"].orEmpty(), p["pass"].orEmpty(), p["domain"].orEmpty(),
         )
+        smbSkipped = false
         if (!cfg.ready) return "请填写 NAS 地址和共享文件夹名"
         return try {
             SmbStore.with(cfg) { it.probe() }
@@ -198,12 +213,16 @@ class ConfigServer(
         }
     }
 
-    /** 天气是可选项：三项全空 = 跳过（通过）；填了任意一项就必须测通。 */
+    /** 天气是可选项：三项全空 = 跳过（不算失败，但也不能说成"连接成功"）。 */
     private fun testWeather(p: Map<String, String>): String? {
         val key = p["wkey"].orEmpty().trim()
         val host = p["whost"].orEmpty().trim()
         val loc = p["wloc"].orEmpty().trim()
-        if (key.isBlank() && host.isBlank() && loc.isBlank()) return null // 可选，留空即跳过
+        weatherSkipped = false
+        if (key.isBlank() && host.isBlank() && loc.isBlank()) {
+            weatherSkipped = true
+            return null // 可选，留空即跳过
+        }
         if (key.isBlank() || host.isBlank() || loc.isBlank()) return "天气三项要么都填，要么都留空"
         return WeatherClient.test(Config.Weather(key, host, loc))
     }
