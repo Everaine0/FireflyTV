@@ -35,20 +35,34 @@ object AudioSupport {
     }
 
     /**
-     * ijkplayer 0.8.8 内核里**确定存在**的音频解码器。
+     * 随包内核里**确定存在**的音频解码器。
      *
-     * 依据是对 `libijkffmpeg.so` 里解码器注册符号的检查：
-     * 只有 `ff_mp3_decoder` / `ff_aac_decoder` 等少数几个；
-     * `ff_ac3_decoder` 和 `ff_mp2_decoder` 都**不存在**。
+     * 依据是逐 ABI 用 `nm` 读 `libijkffmpeg.so` 符号表的结果
+     * （`scripts/verify-ijkplayer-decoders.sh`），不是猜的。
+     *
+     * 这里曾经只有 aac/mp3/flac —— 当时用的是官方 Maven 包，它只编进了 23 个解码器，
+     * **AC-3 和 MP2 都没有**，于是娘道（AC-3）和 CCTV5（MP2）「有画面没声音」。
+     * 现在换成自己编的内核（`app/libs/ijkplayer-full-0.8.8.aar`），这两个补上了。
+     *
+     * **改内核必须同步改这里**，两个方向都会误导用户：
+     * 漏报 —— 明明能出声却提示「不支持」；误报 —— 用户以为有声音其实没有。
+     * 单元测试 `AudioSupportTest` 会遍历 [ALL_FAMILIES] 把两个方向都钉住。
      */
     private val BUILT_IN = setOf(
         Codec.AAC,
         Codec.MP3,
+        Codec.MP2,   // 随包内核含 ff_mp2_decoder（CCTV5 就是 MP2）
+        Codec.AC3,   // 随包内核含 ff_ac3_decoder（娘道就是 AC-3）
+        Codec.EAC3,  // 随包内核含 ff_eac3_decoder
+        Codec.DTS,   // 随包内核含 ff_dca_decoder
         Codec.PCM,
         Codec.FLAC,
         Codec.VORBIS,
         Codec.OPUS,
     )
+
+    /** 全部已知编码；测试遍历用，避免以后新增编码时漏掉断言。 */
+    val ALL_FAMILIES: List<Codec> = Codec.values().toList()
 
     /** 从 TS 流类型映射过来。 */
     fun fromTs(kind: TsProbe.Kind): Codec = when (kind) {

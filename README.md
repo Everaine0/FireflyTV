@@ -21,22 +21,29 @@
 >
 > 重入配置页：**设置键 + OK**，或 **返回键 + OK**（不在正常操作路径上，不会误触）
 
-## 已知限制：部分片源没有声音
+## 播放内核是自己编的
 
-**这不是配置问题，也不是电视坏了。** 播放内核 ijkplayer 0.8.8 自带的 FFmpeg
-只编进了 23 个解码器，**没有 AC-3、E-AC-3、DTS，也没有 MP2**：
+ijkplayer 官方包自带的 FFmpeg **只编进了 23 个解码器，没有 AC-3、没有 MP2、没有 DTS**。
+而实际片源恰好命中这两个缺口 —— 娘道 76 集是 **AC-3**、CCTV5 是 **MP2**，
+表现就是「画面好好的，就是没声音」。
 
-| 片源 | 音频 | 声音 |
+所以本仓库用的是一份**重新编译、把 AC-3 / E-AC-3 / MP2 / DTS 都打开**的内核：
+`app/libs/ijkplayer-full-0.8.8.aar`（不含在仓库里，重建方式见
+[`app/libs/README.md`](app/libs/README.md)）。
+
+实测结果（模拟器直连真实 NAS 与真实直播源）：
+
+| 片源 | 音频 | 结果 |
 | :--- | :--- | :--- |
-| 《猫和老鼠》《大宅门》等 AAC 片源 | AAC | ✅ |
-| 直播频道（18 个） | AAC | ✅ |
-| 《娘道》76 集 | **AC-3** | ❌ 画面正常，无声 |
-| CCTV5 | **MP2** | ❌ 画面正常，无声 |
+| 《娘道》76 集 | AC-3 | ✅ 画面 + 声音 |
+| CCTV5 | MP2 | ✅ 画面 + 声音 |
+| 《大宅门》《猫和老鼠》 | AAC | ✅ 画面 + 声音 |
+| CCTV1 / CCTV3 等 | AAC | ✅ 画面 + 声音 |
 
-应用会**认出来并明确告知**（OK 浮层里显示「这个片子画面能看，声音放不出来（AC-3 音频，这台电视不支持）」），
-而不是留一个哑巴画面。详见 [方案设计 · 格式兼容性](docs/DESIGN.md)。
+判据是 ijkplayer 的 `MEDIA_INFO_AUDIO_RENDERING_START` 回调，不是靠人耳听。
 
-> 有些电视（Amlogic 方案）系统自带 AC-3 解码，判据走设备能力查询，所以真机上结论可能不同。
+> 内核换了以后要同步改 `AudioSupport.BUILT_IN`，否则会误报「这台电视不支持」。
+> 单元测试会遍历所有编码把两个方向都钉住。
 
 ## 项目信息
 
@@ -52,8 +59,8 @@
 ```powershell
 # 本机（访问不到 services.gradle.org，脚本直接用缓存的 Gradle 8.11.1）
 .\build.ps1                      # 打 debug APK
-.\build.ps1 testDebugUnitTest    # 单元测试（90 项：农历/节气/缓存/导航/按键反馈/格式判定）
-.\build.ps1 connectedDebugAndroidTest   # 插桩测试（20 项：播放桥接/配置页/真 NAS 联调/格式实测）
+.\build.ps1 testDebugUnitTest    # 单元测试（95 项：农历/节气/缓存/导航/按键反馈/格式判定）
+.\build.ps1 connectedDebugAndroidTest   # 插桩测试（31 项：播放桥接/配置页/真 NAS 联调/格式实测）
 ```
 
 联网机器上标准的 `.\gradlew assembleDebug` 同样可用。

@@ -1,5 +1,9 @@
 # 本地二进制依赖：ijkplayer AAR 不在 Maven 上，体积大不入库
-app/libs/*.aar
+# 用 ** 是为了连 app/libs/stock-aar/ 这种子目录里的也一起排除
+app/libs/**/*.aar
+
+# 自己编译 ijkplayer 内核时的产物/中间产物（体积大、可重编，见 scripts/build-ijkplayer.sh）
+build-out/
 
 # 测试用媒体：由 scripts/make-test-media.ps1 生成，不入库
 app/src/androidTest/assets/*.mp4

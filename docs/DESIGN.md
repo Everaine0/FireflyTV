@@ -219,9 +219,9 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | **CCTV5** | HLS（10 秒 TS 分片） | H.264 1080p25 | **MP2** | ✅ | ✅ | ❌ |
 | CCTV17 等 4 个频道 | UDP 组播 / 直链 mp4 | — | — | ⚠️ | — | — |
 
-#### 根因：ijkplayer 0.8.8 的内核里没有 AC-3 / MP2 解码器
+#### 根因：官方 ijkplayer 0.8.8 的内核里没有 AC-3 / MP2 解码器
 
-把 `libijkffmpeg.so` 里注册的解码器标志符全部列出来，只有 **23 个**：
+把官方 `libijkffmpeg.so` 里注册的解码器标志符全部列出来，只有 **23 个**：
 
 ```
 视频: ff_h264 ff_hevc ff_mpeg4 ff_h263 ff_h263i ff_h263p ff_flv ff_vp6 ff_vp6a ff_vp6f ff_vp8 ff_vp9
@@ -238,31 +238,59 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 3. 二进制清单：上面那 23 个标志符，两个缺口都在
 
 顺带解释了一个附带现象：这类流的**时长也是错的**（`娘道` 一集实际 2560 秒，报 1700ms；
-6 秒的合成片报 5405ms）。原因是解析时长要靠已解码帧的信息，音频解不了，估算就崩了。
-用 `probesize` 从 512KB 试到 32MB 都改不了这个结果，所以不是探测参数的问题。
+6 秒的合成片报 5405ms）。根因还是在音频：解不出音频帧，时长估算就崩了。
+所以它不是独立 bug，是同一个根因的第二个症状 —— 这一点后来被换内核的结果证实了。
 
-#### 处理方式：认出来就说清楚，而不是留个哑巴画面
+#### 解决方式：重新编译内核（已落地）
 
-`TsProbe` 直接解析 MPEG-TS 的 PAT/PMT（纯字节，不依赖任何解码器），得出**确定的**音频编码；
-`AudioSupport` 再对比「内核支持哪些」和「系统 `MediaCodec` 支持哪些」，
-两边都不行就在 OK 浮层里加一行：
+用户明确否掉了「指望电视自带解码」这条路（原话：「不能指望自带，没有就添加，不要赌用户的使用环境」），
+所以走的是**自己编一份内核**：
 
-> 这个片子画面能看，声音放不出来（AC-3 音频，这台电视不支持）
+```
+scripts/build-ijkplayer.sh     # 拉源码 → 编 FFmpeg（打开 ac3/eac3/mp2/dca）→ 编 ijkplayer
+scripts/collect-ijkplayer.sh   # 收集 .so，用 nm 逐 ABI 校验解码器
+scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
+```
 
-判据走**设备能力**而不是写死清单 —— 有些 Amlogic 方案的电视系统自带 AC-3 解码，那种情况不该误报。
-探测不出来时**不提示**：误报比不报更糟。
+关键是 `config/module-firefly.sh`（ijkplayer 用 `module.sh` 决定 FFmpeg 开关）里把
+`--enable-decoder=ac3/eac3/mp2/mp1/dca/truehd/mlp` 和对应的 parser/demuxer 打开。
+内核体积从 3 MB 涨到 8.7 / 12 / 13 MB（armv7a / arm64 / x86），换来「什么都能出声」。
+
+**实测结果（换内核后，模拟器直连真实 NAS 与真实直播源）：**
+
+| 片源 | 音频 | 换内核前 | 换内核后 |
+| :--- | :--- | :--- | :--- |
+| 《娘道》76 集 | AC-3 | ❌ 无声 | ✅ 画面 + 声音 |
+| CCTV5 | MP2 | ❌ 无声 | ✅ 画面 + 声音 |
+| 《大宅门》《猫和老鼠》 | AAC | ✅ | ✅ |
+| CCTV1 / CCTV3 等 | AAC | ✅ | ✅ |
+| 合成 AC-3 TS 报出的时长 | — | 5405ms（错） | **6005ms（对）** |
+
+判据用的是 ijkplayer 的 `MEDIA_INFO_AUDIO_RENDERING_START` 回调，不靠人耳听；
+设备侧也确认了 `SDL_Android_AudioTrack` 起播、`ff_aout_android` 线程在跑。
+
+#### 编这一版踩到的三个坑（都写成了补丁脚本）
+
+都是「2018 年的代码遇上 2026 年的系统」：
+
+| 补丁 | 挡住的错误 |
+| :--- | :--- |
+| `patch-ffmpeg-for-modern-linux.sh` | FFmpeg n3.4 无条件 `include <linux/perf_event.h>`，而 Debian 13 的内核头不再提供它 |
+| `patch-ijkplayer-no-avdevice.sh` | ijkplayer 调 `avdevice_register_all()`，但它默认 `--disable-avdevice`，链接必失败。（加 `--enable-avdevice` 不管用：disable 在后面，configure 以最后一个为准） |
+| `wsl-fix-apt.sh` | WSL 镜像里过期的 NVIDIA 源用 SHA1 签名，Debian 13 的 sqv 拒收，导致 `apt update` 整体失败 |
+
+另外 `TsProbe` + `AudioSupport` 这套「起播前认出音频编码」的能力保留着 ——
+现在它不再报警，但它仍然是**换内核后验证有没有生效**的手段，
+也是以后遇到新编码时第一个能给出确定答案的地方。
 
 #### 还没解决的部分（写清楚，别当成已支持）
 
-- **AC-3 片源仍然没有声音**。要真出声只有三条路，都还没做：
-  1. 换一个带 AC-3 解码器的 ijkplayer/FFmpeg 内核（需要自己编译）
-  2. 引入软件 AC-3 解码（Java/Kotlin 移植版）并与视频轨对齐
-  3. 服务端把音轨转成 AAC
-- 目标电视（Amlogic 方案的 CHiQ）**可能自带 AC-3 解码**，
-  所以「这台电视不支持」这句话在真机上要重测一次 —— `AudioSupport` 已经会问系统，重测即准。
-- H.265 4K 在**模拟器**上会把模拟器整个搞崩（软解扛不住），测试里已按 500MB 体积阈值跳过；
-  真机（armv7/arm64）走 ijkplayer 自带软解，另有结论。
+- **字幕规则**（§5）仍未实现。
+- **`AudioSupport.BUILT_IN` 必须跟着内核一起维护**：换了内核却忘了改这张表，
+  就会误报「这台电视不支持」。单元测试会遍历所有编码把两个方向都钉住。
 - 4 个频道是 UDP 组播地址（`udp://239.x.x.x`）或百度网盘直链，无法当作常规直播源验证。
+- H.265 4K 在**模拟器**上会把模拟器整个搞崩（软解扛不住），测试里按 500MB 体积阈值跳过；
+  真机（armv7/arm64）走 ijkplayer 自带软解，另有结论。
 
 ### 关键实现参数
 
@@ -307,8 +335,8 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | 项 | 现状 | 说明 |
 | :--- | :--- | :--- |
 | **字幕规则**（§5） | ❌ 未实现 | 当前只开了 `subtitle=1`，会把文件里的**任意**字幕轨显示出来，违反「无中文字幕则不显示任何字幕」。要做对需要：枚举字幕轨、判断语言（`IjkMediaMeta` 的轨语言/轨名），再决定开关或外挂同名 `.srt`/`.ass`。需要带多语言字幕轨的测试片源才能验证 |
-| **AC-3 片源没有声音** | ❌ 未解决 | 内核没有 AC-3 解码器（见「格式兼容性」一节）。现在会明确提示用户，但**声音仍然出不来**。三条出路（换内核 / 自研解码 / 服务端转码）都还没做 |
-| **MP2 直播源没有声音** | ❌ 未解决 | 同上，CCTV5 就是这一类。其余 18 个频道正常 |
+| **AC-3 片源没有声音** | ✅ 已解决 | 自己编了带 AC-3/E-AC-3/MP2/DTS 的 ijkplayer 内核，实测娘道有声音（见「格式兼容性」） |
+| **MP2 直播源没有声音** | ✅ 已解决 | 同上，CCTV5 实测有声音 |
 | 键值差异（风险 6） | ⏳ 待真机 | 代码同时处理 `DPAD_*` 与 `ENTER`，但**设置键的 keyCode 尚未在真机上确认**；模拟器遥控器没有设置键 |
 | 中文 TTS（风险 2） | ⏳ 待真机 | 运行时探测、失败退化为纯文字，逻辑已写；模拟器没有中文 TTS 引擎，**必须在目标电视上验证** |
 | 天气接口（风险 5） | ⏳ 待真机 | 接口形态已按和风 v7 确认（`X-QW-Api-Key` + `lang=zh`），但 Android 5.1 的 TLS 握手只能真机验证 |
@@ -340,9 +368,11 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 | 构建 | 联网机器：`.\gradlew assembleDebug`；**本机：`.\build.ps1`**（本机访问不到 services.gradle.org，脚本直接用缓存里的 Gradle 8.11.1） |
 | 环境 | SDK `<Android SDK>`，JDK 17，Gradle 8.11.1（均已就绪） |
 | **ABI** | 必须含 `armeabi-v7a` + `arm64-v8a`（电视）+ **`x86`**（模拟器，缺了会直接崩） |
-| 依赖 | ijkplayer AAR 不入库，见 `app/libs/README.md`；阿里云镜像优先（settings.gradle.kts） |
+| 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**90 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**20 项**，含对真实 NAS 与真实直播源的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**95 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**31 项**，含对真实 NAS 与真实直播源的联调；未配 `local.properties` 时自动跳过） |
+| 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
+| 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |
 | 网络诊断 | `…class=com.firefly.tv.diag.NetworkDiagTest`，结果看 `adb logcat -s FireflyDiag`（模拟器里 `ping` 不通是正常的，NAT 不回 ICMP，**只有 TCP 能说明问题**） |
 | 测试素材 | `.\scripts\make-test-media.ps1` 用 ffmpeg 生成（AAR 与生成的 mp4 都不入库）；`app/src/test/resources/real-ac3.ts` 是入库的 TS 语料，用来验证轨道探测 |
