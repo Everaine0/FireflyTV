@@ -1,0 +1,20 @@
+# 统一换行符：仓库里一律 LF，检出到 Windows 时也不转 CRLF。
+# 不设的话 Git 会在检出时把 LF 换成 CRLF，造成整文件级别的假改动。
+* text=auto eol=lf
+
+# 二进制：不要让 Git 碰
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.aar binary
+*.jar binary
+*.so binary
+*.mp4 binary
+*.apk binary
+*.keystore binary
+*.jks binary
+
+# 行尾敏感
+*.bat text eol=crlf
+*.ps1 text eol=crlf

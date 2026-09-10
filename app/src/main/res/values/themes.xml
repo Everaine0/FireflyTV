@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      按 1080p 逻辑像素 + dp 布局：4K 面板由系统缩放。
+      正文 >= 24sp，主要信息 >= 32sp，时间/天气 >= 64sp。
+    -->
+    <style name="FireflyTheme" parent="@style/Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+        <item name="android:colorBackground">@color/bg</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <style name="TextBody">
+        <item name="android:textColor">@color/fg</item>
+        <item name="android:textSize">24sp</item>
+        <item name="android:includeFontPadding">false</item>
+    </style>
+
+    <style name="TextMajor">
+        <item name="android:textColor">@color/fg</item>
+        <item name="android:textSize">32sp</item>
+        <item name="android:includeFontPadding">false</item>
+    </style>
+
+    <style name="TextHuge">
+        <item name="android:textColor">@color/fg</item>
+        <item name="android:textSize">64sp</item>
+        <item name="android:includeFontPadding">false</item>
+    </style>
+</resources>

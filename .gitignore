@@ -1,0 +1,20 @@
+# 本地二进制依赖：ijkplayer AAR 不在 Maven 上，体积大不入库
+app/libs/*.aar
+
+# 测试用媒体：由 scripts/make-test-media.ps1 生成，不入库
+app/src/androidTest/assets/*.mp4
+
+# 构建产物
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.keystore
+*.jks
