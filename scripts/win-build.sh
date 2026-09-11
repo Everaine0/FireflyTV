@@ -21,6 +21,25 @@ set -euo pipefail
 TASKS="${*:-assembleDebug}"
 TAIL="${TAIL:-45}"
 
+# 预检：播放内核的 AAR 是本地二进制、不入库。纯源码状态下它不在，
+# 这时候 Gradle 会以「Kotlin 找不到 tv.danmaku.ijk.media.player.*」的形式报错，
+# 那条报错完全看不出「你只是还没编内核」—— 所以这里先拦一道，把话说明白。
+AAR="app/libs/ijkplayer-full-0.8.8.aar"
+if [ ! -f "$AAR" ]; then
+    cat >&2 <<'MSG'
+✗ 缺少 app/libs/ijkplayer-full-0.8.8.aar（播放内核，二进制、不入库）
+
+  纯源码状态下必须先把内核编出来（需 Linux/WSL，会下载 NDK ~1GB 并 clone ijkplayer）：
+      scripts/build-ijkplayer.sh     # 交叉编译 FFmpeg + ijkplayer（三个 ABI，耗时较长）
+      scripts/collect-ijkplayer.sh   # 收集产物
+      scripts/pack-ijkplayer-aar.sh  # 打成 app/libs/ijkplayer-full-0.8.8.aar
+
+  它不在 git 里（二进制不入库），所以除了重编没有别的恢复途径；
+  唯一还留着的是已打好的 APK（lib/*/libijk*.so 在里面），那救不了构建。
+MSG
+    exit 1
+fi
+
 WSL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WIN_ROOT="${WIN_ROOT:-<Windows 源码树>}"
 
