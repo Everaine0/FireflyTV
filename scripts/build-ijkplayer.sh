@@ -18,8 +18,10 @@ set -euo pipefail
 # ---- 可调项 ----
 IJK_REPO="${IJK_REPO:-https://github.com/bilibili/ijkplayer.git}"
 IJK_TAG="${IJK_TAG:-k0.8.8}"
-WORK="${WORK:-$HOME/ijkbuild}"
-OUT="${OUT:-/mnt/e/project/Firefly Initiative/FireflyTV/build-out/ijkplayer-full}"
+# 默认放在仓库内的 build/（已被 .gitignore 排除）：
+# 这样在受限沙箱里也能编译，不用往 $HOME 之类的工作区外面写东西。
+WORK="${WORK:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/ijkbuild}"
+OUT="${OUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build-out/ijkplayer-full}"
 ABIS="${ABIS:-armv7a arm64 x86}"
 NDK_VERSION="${NDK_VERSION:-r10e}"          # ijkplayer k0.8.8 时代配套的 NDK
 ANDROID_SDK="${ANDROID_SDK:-/mnt/d/AndroidSDK}"
@@ -29,10 +31,23 @@ log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---- 1) 依赖 ----
-log "安装编译依赖"
-sudo -n apt-get update -qq
-sudo -n apt-get install -y -qq \
-  g++ yasm nasm cmake pkg-config make git curl unzip python3 bc 2>&1 | tail -3
+# 只补缺的那些。没有免密 sudo 时（受限沙箱）也不该直接失败 ——
+# 工具齐了照样能编，缺了会在下一步以更清楚的方式报出来。
+MISSING=""
+for c in g++ yasm nasm cmake pkg-config make git curl unzip python3 bc; do
+  command -v "$c" >/dev/null 2>&1 || MISSING="$MISSING $c"
+done
+if [ -n "$MISSING" ]; then
+  log "缺少依赖：$MISSING —— 尝试安装"
+  if sudo -n true 2>/dev/null; then
+    sudo -n apt-get update -qq
+    sudo -n apt-get install -y -qq $MISSING 2>&1 | tail -3
+  else
+    echo "⚠️  没有免密 sudo，跳过安装；请先自行装好：$MISSING"
+  fi
+else
+  log "编译依赖已齐全，跳过安装"
+fi
 
 mkdir -p "$WORK"
 cd "$WORK"
@@ -122,6 +137,11 @@ ls -l config/module.sh
 # 不补这一下，FFmpeg 第一步就编译不过（见补丁脚本里的说明）。
 log "给 FFmpeg 打「现代 Linux」补丁"
 bash "$ROOT/scripts/patch-all-ffmpeg.sh" "$WORK/ijkplayer/android/contrib"
+
+# x86 必须**打开汇编**，否则模拟器上的软解慢到没法看。
+# 见 scripts/patch-ffmpeg-x86-asm.sh 的长注释（这是「模拟器 4K 只有 4fps」的根因）。
+log "给 x86 打开 FFmpeg 汇编（SSE/AVX）"
+bash "$ROOT/scripts/patch-ffmpeg-x86-asm.sh" "$WORK/ijkplayer/android/contrib"
 
 log "编译 FFmpeg（$ABIS）—— 这步最慢，20 核大概几分钟"
 for abi in $ABIS; do

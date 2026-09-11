@@ -2,9 +2,13 @@ package com.firefly.tv.player
 
 import android.content.Context
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
+import android.util.Log
 import android.view.Surface
 import com.firefly.tv.core.Config
+import com.firefly.tv.diag.DiagHub
+import com.firefly.tv.diag.Knobs
 import tv.danmaku.ijk.media.player.IjkMediaPlayer
 
 /**
@@ -36,6 +40,37 @@ interface PlaybackEngine {
          * 「这条流到底有没有音频输出」，不用猜。
          */
         fun onAudioStarted() = Unit
+
+        /**
+         * 硬解不可用，已经**自动改用软解重播**（见 [PlaybackEngine.canFallbackToSoftware]）。
+         *
+         * 界面层必须知道这件事：软解重播等于把起播时间重新归零，
+         * 起播看门狗要跟着重新起算，否则会在软解刚建解码器的时候就误报「打不开」。
+         *
+         * @param reason 给 logcat 看的原因，不给用户看
+         */
+        fun onDecoderFallback(reason: String) = Unit
+
+        /**
+         * 直播断流/连不上，引擎**正在自动重连**（第 [attempt] 次）。
+         *
+         * ## 为什么单开一个回调
+         *
+         * 直播的失败**不会**走 [onError]：引擎开了 `liveReconnect`，它会自己
+         * 退避重试到天荒地老（见 `PlaybackEngine.handleError`）。这对「看一半断流」
+         * 是对的，但以前它**顺手把界面层也蒙在鼓里** —— 一次回调都不发。
+         *
+         * 用户实测到的现象就是这句话：「从电视[剧]换回直播，又卡住了」。
+         * 现场是：频道 403 连不上，屏幕上是**上一个内容冻住的最后一帧**，
+         * 按键有反应（浮层、语音都正常），但画面永远不会变，
+         * 也没有任何提示 —— 看起来就是死机。
+         *
+         * 所以引擎必须把「我在重连」这件事说出来，让界面层至少能给用户一句话。
+         *
+         * @param attempt 连续失败次数，从 1 开始
+         * @param url 正在重连的地址，给 logcat 看
+         */
+        fun onLiveRetry(attempt: Int, url: String?) = Unit
     }
 
     fun setListener(l: Listener)
@@ -51,11 +86,28 @@ interface PlaybackEngine {
     /** 从任意随机读字节源起播（测试用本地文件，将来也可用于 U 盘）。 */
     fun playSource(source: RandomAccessSource, startMs: Long)
 
+    /**
+     * 同 [playSource]，但给的是「怎么再打开一份」而不是已经打开的对象。
+     *
+     * 硬解失败要用软解重播时，必须能**重新打开**字节源 —— 已经 close 掉的
+     * `RandomAccessFile` / SMB 句柄不能复用（`SmbMediaDataSource.close()` 会把它关掉）。
+     * 所以能重建的字节源请走这个重载，否则兜底重播会读不出数据。
+     */
+    fun playSource(open: () -> RandomAccessSource, startMs: Long)
+
     /** 直接起播 URL（IPTV 直播用）。 */
     fun playUrl(url: String)
 
     /** 当前播放类型，用于让实现层挑参数（直播与点播的取舍不同）。 */
     fun setMode(kind: PlaybackMode.Kind)
+
+    /**
+     * 当前**实际**在播的类型（`live` / `on_demand`）。
+     *
+     * 诊断页原先是从界面层的「当前媒体库」推出来的，于是「用远程接口直接打开一个
+     * 文件」时会被报成 `live`（因为那时还停在直播库上）—— 量数据的人一眼看错对象。
+     */
+    fun kindName(): String = ""
 
     /** 直播断流自动重连；[urlProvider] 返回当前频道地址。 */
     fun setLiveReconnect(on: Boolean, urlProvider: (() -> String?)?)
@@ -65,27 +117,139 @@ interface PlaybackEngine {
     fun durationMs(): Long
 
     /**
-     * 画面实际输出的帧率。
+     * 真实输出的帧率（`stat.vfps` = 每秒**真的送进视频层**的帧数）。
      *
-     * 这是「播放器还活着吗」的**唯一可靠判据**，`isPlaying()` 和 `positionMs()` 都不行：
+     * ## 硬解通路上它也是有值的（这一点以前的注释写错了）
      *
-     *  - `isPlaying()` 在原生侧只查 `mp_state` 这个状态变量
-     *    （`ff_ffplay.c` 的 `ijkmp_is_playing`），**播放器内部线程全死光了它照样返回 true**。
-     *  - `positionMs()` 实测在 SMB + IMediaDataSource 通路上恒为 0，没法当判据。
+     * 曾经这里写着「MediaCodec 通路上 `vp->bmp` 恒为空、于是 vfps 永远是 0」，
+     * 并据此把「播放中存活看门狗」关掉了。**源码核对下来这个判断是错的**：
+     * MediaCodec 的帧走 `SDL_VoutAMediaCodec_CreateOverlay`，
+     * 它的 overlay 格式是 `SDL_FCC__AMC`（`ijksdl_vout_overlay_android_mediacodec.c`
+     * 的 `func_fill_frame`），所以 `ff_ffplay.c:880` 的 `if (vp->bmp)` 是**成立**的；
+     * 显示时走 `SDL_VoutOverlayAMediaCodec_releaseFrame_l(overlay, NULL, true)`
+     * → `MediaCodec.releaseOutputBuffer(idx, render=true)`（解码结果直接进 Surface，零拷贝）。
+     * 实机也印证了：长虹 43Q3T 硬解播 4K 时面板上「送显 18.2 帧/秒」，不是 0。
      *
-     * 而输出帧率来自视频时钟，解码链一断就掉到 0。
-     * 现场佐证：用户报「卡住」时抓线程栈，ijkplayer 的线程
-     * （`ff_read`/`ff_audio_dec`/`ff_video_dec`/`ff_aout_android`）一个都不存在，
-     * 进程 CPU 增量为 0 —— 这时输出帧率必然是 0。
+     * 所以它是「**显示通路每秒真的收下了几帧**」的真值 ——
+     * 和解码帧率（[Diag.decodeFps]）一比，就能把「解不出来」和「送不出去」分开：
+     * 电视实测 解码 24.6 / 送显 18.2 / 丢帧 0%，说明**瓶颈在显/合成**，
+     * 而且中间那 6.4 帧是被 `video_refresh()` 里那条**不计数**的迟到帧跳过吃掉的
+     * （`ff_ffplay.c:1373`，只有 `framedrop>0` 时才走）。
      */
     fun outputFps(): Float
+
+    /** 视频解码实际走的通路（[decoderInUse] 的返回值）。 */
+    enum class Decoder {
+        /** 还没起播，或者播放器已经释放。 */
+        UNKNOWN,
+
+        /** FFmpeg 软解（`FFP_PROPV_DECODER_AVCODEC = 1`）。 */
+        SOFTWARE,
+
+        /** MediaCodec 硬解（`FFP_PROPV_DECODER_MEDIACODEC = 2`）。 */
+        HARDWARE,
+    }
+
+    /**
+     * 视频解码通路的**真值**。
+     *
+     * ## 为什么必须问播放器，而不是记住「我设了硬解选项」
+     *
+     * ijkplayer 的硬解是**静默回落**的：`func_open_video_decoder`
+     * （`ffpipeline_android.c:73-77`）试建 MediaCodec 管线，
+     * **任何一步失败都只有一行 ALOGE，然后直接换 FFmpeg 软解**，
+     * Java 层一个回调都没有。也就是说：
+     *
+     *  - 「选码回调被调用了」只说明**问过**，不说明建成了；
+     *  - 「我设了 `mediacodec-all-videos=1`」更不说明建成了。
+     *
+     * 唯一可靠的判据是 `IjkMediaPlayer.getVideoDecoder()`
+     * （= `ffp->stat.vdec_type`）：
+     * `ffppipenode_android_mediacodec_vdec.c:2081` 只在 **MediaCodec 管线真的建成**时
+     * 写 `FFP_PROPV_DECODER_MEDIACODEC(2)`，
+     * 而 `ffpipenode_ffplay_vdec.c:57` 在软解通路上写 `AVCODEC(1)`。
+     *
+     * 用户实机反馈「感觉电视的硬解没开」时，这个函数就是答案。
+     */
+    fun decoderInUse(): Decoder
+
+    /**
+     * 诊断面板要的一屏数字。**全部是播放器报出来的真值**，这里不做推算。
+     *
+     * 为什么要专门做一份：实机上「帧率不高」有四种完全不同的原因，
+     * 只看画面分不出来，而老人家里不会有 adb：
+     *
+     * | 现象 | 结论 |
+     * | :--- | :--- |
+     * | 解码 ≈ 片源帧率，丢帧 ≈ 0 | 本来就是 25/24 帧的片源，没问题 |
+     * | 解码 ≈ 片源帧率，丢帧 > 0 | 解码跟得上，是渲染/合成来不及（CPU 或 GPU） |
+     * | 解码 < 片源帧率 | 解码本身不够快（硬解没生效 → 看 [decoderInUse]） |
+     * | 缓存长期接近 0 | 是 SMB 读取供不上，不是解码 |
+     */
+    class Diag(
+        /** 真值：MediaCodec 还是 FFmpeg 软解。 */
+        val decoder: Decoder,
+        /** 选码时选中的解码器名（硬件时才非空）。 */
+        val decoderName: String?,
+        /** 播放器自报的视频解码模块，例如 `MediaCodec` / `avcodec`。 */
+        val videoModule: String?,
+        /** 模块后面的实现名，例如 `OMX.MTK.VIDEO.DECODER.HEVC` / `hevc`。 */
+        val videoImpl: String?,
+        val audioCodec: String?,
+        val videoWidth: Int,
+        val videoHeight: Int,
+        /**
+         * **片源自己的**帧率（`avg_frame_rate`，从 ijkplayer 的 media meta 里取）。
+         *
+         * 这个数是回答「帧率不高，25 甚至更低」的关键：电视剧 25、动画 23.976，
+         * 拿它和 [outputFps] 一比就知道是「片源本来就只有 25 帧」还是「播的时候掉了帧」。
+         * 取不到时为 0（调用方要能容忍 —— 有些流不报 avg_frame_rate）。
+         */
+        val sourceFps: Float,
+        /** 每秒**解码**出来的帧数。 */
+        val decodeFps: Float,
+        /** 每秒**送显**的帧数（真的进了视频层的帧，硬解软解都有值，见 [outputFps]）。 */
+        val outputFps: Float,
+        /** 每秒丢掉的帧数（`framedrop` 打开时才有意义）。 */
+        val dropFps: Float,
+        /** 已缓存时长（毫秒）。 */
+        val cachedMs: Long,
+        val cachedBytes: Long,
+        /** 累计读取字节数。 */
+        val trafficBytes: Long,
+        /** 播放器自报的码率（bit/s）；0 = 不知道。面板用它算「这条流要多少 MB/秒」。 */
+        val bitRateBps: Long,
+        /**
+         * 这次起播**有没有请求**硬解（`playXxx` 时的决定）。
+         *
+         * 注意它和「现在跑的是不是硬解」是两件事：静默回落软解之后
+         * [decoder] 会变成 [Decoder.SOFTWARE]，但这里仍然是 true —— 面板要的正是这个
+         * 「本来想硬解、结果没成」的组合（见 [codecOffered]）。
+         */
+        val requestedHardware: Boolean,
+        /**
+         * 选码器**有没有给出**解码器名。
+         *
+         *  - `true`  + [decoder] 还是软解 ⇒ **静默回落**（ijkplayer 建 MediaCodec 失败，
+         *    只在 native 层打了一行 ALOGE 就换了 FFmpeg）—— 这是要修的那一种；
+         *  - `false` + [decoder] 是软解 ⇒ 这台设备**根本没有**可用的硬解解码器
+         *    （或这个编码不交给 MediaCodec），不是故障。
+         */
+        val codecOffered: Boolean,
+        /** 本次运行里硬解静默退回软解的次数。 */
+        val silentFallbacks: Int,
+        /** 本次运行里因为**没建成**而被禁用的解码器名。 */
+        val bannedCodecs: List<String>,
+    )
+
+    fun diag(): Diag
 
     /**
      * 一份用于判断「播放器还活着吗」的快照。
      *
-     * 为什么不是单一指标：实测在 SMB + `IMediaDataSource` 通路上，
-     * **输出帧率和 `currentPosition` 都恒为 0**（见 `PlayerLivenessTest`），
-     * 拿任何一个单独做判据都会失效。
+     * 为什么不是单一指标：在 SMB + `IMediaDataSource` 通路上，
+     * **`currentPosition` 实测恒为 0**，而输出帧率在软解通路上也没有意义
+     * （`PlayerLivenessTest` 钉的就是这件事），拿任何一个单独做判据都会失效。
      * 所以把几个不同来源的计数器一起取回来，让调用方用「全都长时间不变」来判定。
      */
     class Liveness(
@@ -113,11 +277,31 @@ interface PlaybackEngine {
     fun resume()
     fun stop()
     fun release()
+
+    /**
+     * 还能不能「退回软解重播」。
+     *
+     * 仅当**本次起播正在用硬解**、而且还有上一次的起播请求可重放时为 true。
+     * 界面层的起播看门狗拿到 true 就该调 [retryInSoftware]，而不是直接出故障页 ——
+     * 有些电视的 MediaCodec 建得出来、却一帧都不吐，这时软解仍然能看。
+     */
+    fun canFallbackToSoftware(): Boolean = false
+
+    /**
+     * 用软解把同一份内容重播一遍。
+     *
+     * @return true = 已经重新起播；false = 没东西可重播（或已经在软解上跑了）
+     */
+    fun retryInSoftware(): Boolean = false
 }
 
 /**
  * ijkplayer 实现。目标设备是 2016 年的 Android 5.1 电视，系统硬解不可靠；
  * ijkplayer 自带完整 FFmpeg 软解兜底，且支持 RMVB/TS/FLV（DESIGN §6）。
+ *
+ * **解码策略是「硬解优先、软解兜底」**：不打开硬解时 ijkplayer 一律软解，
+ * 4K H.265 在这台电视上就是几百毫秒一帧（用户实测「极慢 + 没声音」）。
+ * 详见 [VideoDecodePolicy]。
  */
 class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
@@ -145,6 +329,27 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         probeOverride = probesizeBytes to analyzeDurationUs
     }
 
+    /**
+     * 排查「送显跟不上」用的旋钮。
+     *
+     * 现场数据（长虹 43Q3T，Android 5.1，4K 面板 / 逻辑 1080p@50Hz）：
+     * 只有 **3840×2160** 的《大宅门》掉到 **送显 18.2 帧/秒**（片源 25），
+     * 而 2960×2160 的《猫和老鼠》、1080p50 的《娘道》都正常。
+     * 三个片源需要的像素率分别是 207 / 153 / 103 Mpx/秒，
+     * 而 18.2 帧/秒 × 3840×2160 = **151 Mpx/秒** —— 但用户实测「像素率最高能到 200，
+     * 大部分时间 118~150 徘徊」，所以它**不是一条硬天花板**，更像是有东西在时不时卡住。
+     *
+     * 所以变量全部做成了运行时可写的旋钮（[com.firefly.tv.diag.Knobs]），
+     * 由局域网 HTTP 通道（[com.firefly.tv.diag.DiagHub]）在电视上当场切换、当场重播 ——
+     * 每换一个变量都要「改代码 → 打包 → 装电视」，一轮十几分钟，根本试不动。
+     *
+     * ## 为什么这些选项必须在这里读
+     *
+     * ijkplayer 的 `setOption` **只在 `prepareAsync()` 之前**被读取
+     * （`ff_ffplay.c` 的 `ijkmp_set_option` 写进字典，prepare 时一次性 `av_opt_set_dict`）。
+     * 所以旋钮改动一律靠**重播**生效，不能指望运行中改一下就有效果。
+     */
+
     private val main = Handler(Looper.getMainLooper())
 
     override fun setListener(l: PlaybackEngine.Listener) {
@@ -166,6 +371,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     private fun fireFirstFrame() {
         if (firstFrameFired) return
         firstFrameFired = true
+        cancelHardwareWatchdog()
         onMain { listener?.onFirstFrame() }
     }
 
@@ -179,34 +385,217 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         surface = null
     }
 
+    // ---- 起播请求 ----
+    //
+    // 记下「这一次要播什么」，硬解失败时才能用软解把同一份内容重播一遍。
+    // 字节源不能直接复用（SmbMediaDataSource.close() 会把 SMB 句柄关掉），
+    // 所以存的是**重开方式**而不是已经打开的对象。
+
+    private sealed class LastRequest {
+        abstract val startMs: Long
+
+        class Smb(val cfg: Config.Smb, val path: String, override val startMs: Long) : LastRequest()
+
+        class Source(val factory: () -> RandomAccessSource, override val startMs: Long) : LastRequest()
+
+        class Url(val url: String) : LastRequest() {
+            override val startMs: Long get() = 0L
+        }
+    }
+
+    private var lastRequest: LastRequest? = null
+
+    /** 本次起播是否跑在硬解上。 */
+    private var usingHardware = false
+
+    /**
+     * 这次起播**请求过**硬解（不受后续回落影响）。
+     * 面板要区分「想硬解但没建成」和「这台设备本来就没有硬解」，判据就是它 +
+     * [DecoderPath]（见 [PlaybackEngine.Diag.codecOffered]）。
+     */
+    private var hardwareRequested = false
+
+    /**
+     * 本次运行里已经证实「选中了，但实际没接上」的解码器名。
+     *
+     * 为什么需要：ijkplayer 硬解失败是**静默回落软解**的（见 [decoderInUse]），
+     * 每次都白试同一个坏解码器，永远退不到「次优但能用」的那个。
+     * 拉黑之后 [MediaCodecChoice.pick] 会自动选下一个候选。
+     * 只在进程内有效（重启应用重新评估）—— 解码器不会因为重启就变好或变坏，
+     * 但**设备状态**会（换片源、系统更新），所以不做持久化。
+     */
+    private val bannedCodecs = mutableSetOf<String>()
+
+    /** 硬解静默退回软解的次数（诊断面板显示用）。 */
+    @Volatile
+    private var silentFallbacks = 0
+
+    /**
+     * 硬失败（解码器报错 / 界面层判定卡死）的次数。
+     *
+     * 这类失败说明**这台设备的硬解这条路真的不通**，达到
+     * [VideoDecodePolicy.MAX_FAILURES] 就本次运行不再试，免得每集都白等一个超时。
+     */
+    private var hardFailures = 0
+
+    /**
+     * 超时失败（建了解码器却不出首帧）的次数。
+     *
+     * 和 [hardFailures] 分开计数，是因为它**可能是冤枉的**：
+     * 片源在 SMB 上打开得慢、moov 要搬到头部、探流窗口 16MB，
+     * 这些都可能让首帧晚到，而解码器本身没问题。
+     * 所以它只对**当前这一份内容**生效，换内容（下一集/换剧/换台）就重新给硬解机会。
+     * 用户报的「电视上硬解好像没开」，最怕的就是一次误判把硬解永久关掉。
+     */
+    private var softFailures = 0
+
+    /** 当前内容的标识，用来判断「是不是换内容了」。 */
+    private var contentKey: String? = null
+
+    /**
+     * 换了内容就重新给硬解机会。
+     *
+     * 只有**超时类**失败会因此归零；真报错的硬失败要累计到 MAX_FAILURES 才关
+     * （那种情况每集都重试就是「每集黑屏十几秒」）。
+     */
+    private fun noteContent(key: String) {
+        if (key == contentKey) return
+        contentKey = key
+        if (softFailures > 0) {
+            Log.i(TAG, "换了内容，超时计数 $softFailures → 0，重新给硬解一次机会")
+            softFailures = 0
+        }
+    }
+
+    /**
+     * 视频解码实际走的通路 —— 「电视上还是很慢」这类问题需要它给出确定答案，
+     * 靠猜（`DISABLE_HW` 有没有生效、这台电视有没有硬解）都不可靠。
+     *
+     * 判据是 ijkplayer 的 MediaCodec 选码回调**有没有被调用**：
+     * 只有真的要建 MediaCodec 解码器时它才会被问。
+     */
+    enum class DecoderPath {
+        /** 没被问过 —— 硬解选项没生效，或者还没起播。 */
+        NOT_ASKED,
+
+        /** 选了 MediaCodec 解码器，名字见 [IjkPlaybackEngine.decoderName]。 */
+        MEDIACODEC,
+
+        /** 问过了，但这台设备没有可用的硬解解码器（已退回软解）。 */
+        NO_CODEC,
+    }
+
+    @Volatile
+    private var decoderPath: DecoderPath = DecoderPath.NOT_ASKED
+
+    @Volatile
+    private var decoderName: String? = null
+
+    /** 给插桩测试与真机排查用（logcat 之外的第二条证据）。 */
+    fun decoderPath(): DecoderPath = decoderPath
+
+    /** 走硬解时用的是哪个解码器；否则 null。 */
+    fun decoderName(): String? = decoderName
+
+    private fun wantHardware(): Boolean =
+        VideoDecodePolicy.canTryHardware(hardFailures) && VideoDecodePolicy.canTryHardware(softFailures)
+
     override fun playSmb(cfg: Config.Smb, relativePath: String, startMs: Long) {
         kind = PlaybackMode.Kind.ON_DEMAND
-        playSource(SmbRandomAccessSource(cfg, relativePath), startMs)
+        lastRequest = LastRequest.Smb(cfg, relativePath, startMs)
+        noteContent("smb:$relativePath")
+        startPlayback(wantHardware())
     }
 
     override fun setMode(kind: PlaybackMode.Kind) {
         this.kind = kind
     }
 
-    override fun playSource(source: RandomAccessSource, startMs: Long) {
-        // 非 faststart 的 mp4 由 SmbMediaDataSource 内部负责把 moov 搬到头部（DESIGN 风险 8）
-        val src = SmbMediaDataSource(source)
-        releaseInternal()
-        dataSource = src
-        // 直播的进度没有意义，绝不能拿着一个假的毫秒数去 seek（见 PlaybackMode 注释）
-        pendingSeekMs = PlaybackMode.startPositionMs(kind, startMs)
-        val p = newPlayer()
-        p.setDataSource(src)
-        p.prepareAsync()
+    override fun kindName(): String =
+        if (kind == PlaybackMode.Kind.LIVE) "live" else "on_demand"
+
+    override fun playSource(source: RandomAccessSource, startMs: Long) =
+        playSource({ source }, startMs)
+
+    override fun playSource(open: () -> RandomAccessSource, startMs: Long) {
+        lastRequest = LastRequest.Source(open, startMs)
+        noteContent("src:$startMs")
+        startPlayback(wantHardware())
     }
 
     override fun playUrl(url: String) {
         kind = PlaybackMode.Kind.LIVE
+        lastRequest = LastRequest.Url(url)
+        noteContent("url:$url")
+        startPlayback(wantHardware())
+    }
+
+    /**
+     * 按最后一次请求起播。
+     *
+     * @param hardware 是否让 MediaCodec 接管视频解码；false = 纯 FFmpeg 软解
+     */
+    private fun startPlayback(hardware: Boolean) {
+        val req = lastRequest ?: return
         releaseInternal()
-        pendingSeekMs = 0
-        val p = newPlayer()
-        p.setDataSource(url)
+        usingHardware = hardware
+        hardwareRequested = hardware
+        val p = newPlayer(hardware)
+        // Surface 必须在 prepareAsync 之前挂上：MediaCodec 解码器是在准备阶段建的，
+        // 那一刻没有 Surface 的话 ijkplayer 会建一个**假的**解码器（收数据、不出画面），
+        // 之后再 setSurface 只能靠重新配置解码器补救。正常路径上 Surface 早就有了
+        // （playEpisode 会先查 surfaceUsable），这里只是把顺序钉死。
+        surface?.let { p.setSurface(it) }
+
+        when (req) {
+            is LastRequest.Url -> {
+                pendingSeekMs = 0
+                p.setDataSource(req.url)
+            }
+
+            is LastRequest.Smb -> {
+                // 非 faststart 的 mp4 由 SmbMediaDataSource 内部负责把 moov 搬到头部（DESIGN 风险 8）
+                val src = openOrReport("打不开这一集") {
+                    SmbMediaDataSource(SmbRandomAccessSource(req.cfg, req.path))
+                } ?: return
+                dataSource = src
+                // 直播的进度没有意义，绝不能拿着一个假的毫秒数去 seek（见 PlaybackMode 注释）
+                pendingSeekMs = PlaybackMode.startPositionMs(kind, req.startMs)
+                p.setDataSource(src)
+            }
+
+            is LastRequest.Source -> {
+                val src = openOrReport("打不开这个文件") {
+                    SmbMediaDataSource(req.factory())
+                } ?: return
+                dataSource = src
+                pendingSeekMs = PlaybackMode.startPositionMs(kind, req.startMs)
+                p.setDataSource(src)
+            }
+        }
         p.prepareAsync()
+    }
+
+    /**
+     * 建字节源时抛异常 → 走故障页，**不要让它冒到调用方**。
+     *
+     * `FileRandomAccessSource` / `SmbRandomAccessSource` 都是在构造函数里就把句柄打开的，
+     * 所以「文件被删了」「NAS 掉线了」这类事是在这一行**同步**炸出来的。
+     * 以前这个异常会一路冒到 MainActivity 的 Handler（或主线程）上：
+     *  - 后台线程：UncaughtExceptionHandler 直接**杀进程**；
+     *  - 主线程：同样崩。
+     * 用户看到的不是「打不开这一集」，而是应用整个消失 —— 对一个给老人用的电视应用
+     * 来说这是最糟的失败方式。
+     *
+     * 现在统一在这里兜住：出一句人话，交给故障页去重试。
+     */
+    private fun <T> openOrReport(what: String, block: () -> T): T? = try {
+        block()
+    } catch (t: Throwable) {
+        Log.w(TAG, "$what：${t.javaClass.simpleName}: ${t.message}")
+        releaseInternal()
+        onMain { listener?.onError(what, fatal = false) }
+        null
     }
 
     override fun setLiveReconnect(on: Boolean, urlProvider: (() -> String?)?) {
@@ -215,11 +604,17 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         if (on) retryCount = 0
     }
 
-    private fun newPlayer(): IjkMediaPlayer {
-        // 每次起播都要重置：这两个标志描述的是「当前这一次播放」，
-        // 不清掉的话第二次起播会永远收不到首帧（被 firstFrameFired 挡住）。
+    private fun newPlayer(hardware: Boolean): IjkMediaPlayer {
+        // 每次起播都要重置：这几个标志描述的都是「当前这一次播放」。
+        // 不清掉的话第二次起播会永远收不到首帧（被 firstFrameFired 挡住），
+        // 解码通路的诊断结论也会停在上一集上。
         firstFrameFired = false
         sizeKnown = false
+        decoderPath = DecoderPath.NOT_ASKED
+        decoderName = null
+        watchdogGrace = 0
+        cachedMediaInfo = null
+        cancelHardwareTruthCheck()
         val p = IjkMediaPlayer()
         p.setOnPreparedListener(object : tv.danmaku.ijk.media.player.IMediaPlayer.OnPreparedListener {
             override fun onPrepared(mp: tv.danmaku.ijk.media.player.IMediaPlayer) {
@@ -251,8 +646,24 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
                 tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START ->
                     fireFirstFrame()
 
-                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_AUDIO_RENDERING_START ->
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_AUDIO_RENDERING_START -> {
+                    Log.i(TAG, "音频已开始输出（AUDIO_RENDERING_START）")
                     onMain { listener?.onAudioStarted() }
+                }
+
+                // 下面几条只为排查留痕：真机上「没声音」「没画面」时，
+                // 这几行能直接说明是「解码器没打开」还是「打开了但没送数据」。
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_AUDIO_DECODED_START ->
+                    Log.i(TAG, "音频首帧已解出（AUDIO_DECODED_START）")
+
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_DECODED_START ->
+                    Log.i(TAG, "视频首帧已解出（VIDEO_DECODED_START）")
+
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_BUFFERING_START ->
+                    Log.i(TAG, "开始缓冲")
+
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_BUFFERING_END ->
+                    Log.i(TAG, "缓冲结束")
             }
             false
         }
@@ -271,8 +682,37 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         p.setOnVideoSizeChangedListener { _, _, _, _, _ ->
             sizeKnown = true
         }
+        // 硬解到底有没有被用上、用的是哪个解码器，只有这一行日志能回答。
+        // 真机上排查「还是很慢」时先看它：没有这行 = 根本没走 MediaCodec 通路。
+        //
+        // ⚠️ 这里返回一个非空的名字**不等于硬解建成了** —— ijkplayer 在后面
+        // reconfigure/configure 失败时会静默改用 FFmpeg 软解（见 [decoderInUse]）。
+        // 真值要等起播以后问 [decoderInUse]（[hardwareTruthCheck]）。
+        p.setOnMediaCodecSelectListener { _, mime, profile, level ->
+            val chosen = MediaCodecChoice.choose(mime, profile, level, bannedCodecs)
+            decoderName = chosen
+            decoderPath = if (chosen.isNullOrBlank()) DecoderPath.NO_CODEC else DecoderPath.MEDIACODEC
+            Log.i(
+                TAG,
+                "硬解选码器 mime=$mime profile=$profile level=$level -> " +
+                    (chosen ?: "没有可用的硬解解码器，改用软解"),
+            )
+            if (chosen.isNullOrBlank()) {
+                // 这台设备没有可用硬解（或这个编码/档次不交给 MediaCodec），实际跑的是软解：
+                // 既不该算「硬解失败」，更不该给它挂「硬解卡住」的超时 ——
+                // 软解本来就慢（模拟器上 4K 首帧要二三十秒），拿硬解的超时去催它
+                // 只会把一次正常播放变成「重播 + 故障页」。
+                usingHardware = false
+                cancelHardwareWatchdog()
+            } else {
+                // 真的开始建硬解解码器了，这时才值得给它一个首帧超时
+                armHardwareWatchdog()
+                armHardwareTruthCheck()
+            }
+            chosen
+        }
 
-        // 老人用：宁可轻微丢帧也不要黑屏卡住
+        // 老人用：宁可轻微丢帧也不要黑屏卡住（默认值；下面那批远程旋钮可以覆盖它）
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1L)
         // 直播/点播各自一套参数，取舍不同（见 PlaybackMode.tuning）
         val t = PlaybackMode.tuning(kind)
@@ -281,6 +721,16 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", t.maxBufferBytes)
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "probesize", probe?.first ?: t.probesizeBytes)
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "analyzeduration", probe?.second ?: t.analyzeDurationUs)
+        // 解码策略：硬解优先、软解兜底（4K H.265 必须走硬解，见 VideoDecodePolicy）
+        for (o in VideoDecodePolicy.options(hardware)) {
+            p.setOption(categoryOf(o.category), o.name, o.value)
+        }
+        // 网络层：关掉 ijkplayer 那份「只按主机名做键」的 DNS 缓存。
+        // 不关的话：央视直播地址（:82 重定向到 :81 带 token 的地址）在换台
+        // 第二次开始必定 403，且进程内永不恢复（见 VideoDecodePolicy.NETWORK_OPTIONS）
+        for (o in VideoDecodePolicy.NETWORK_OPTIONS) {
+            p.setOption(categoryOf(o.category), o.name, o.value)
+        }
         // 内嵌中文字幕轨优先，无中文则整个不显示（DESIGN §5）
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "subtitle", 1L)
 
@@ -301,9 +751,189 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
             p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 1L)
         }
 
+        // **最后**再落一遍远程旋钮：它们要能覆盖上面那套默认参数
+        // （上面是「老人用的稳妥值」，旋钮是排查时故意要走极端的值）。
+        // 放在最后还有个实际原因：`max-buffer-size` 这类选项写超上限会让
+        // `av_opt_set_dict` 整体失败，后面的选项全部静默失效 ——
+        // 所以「可能出错的那一条」必须排在最后。
+        val knobOptions = Knobs.options(context)
+        for (o in knobOptions) {
+            val cat = when (o.category) {
+                Knobs.Category.PLAYER -> IjkMediaPlayer.OPT_CATEGORY_PLAYER
+                Knobs.Category.FORMAT -> IjkMediaPlayer.OPT_CATEGORY_FORMAT
+                Knobs.Category.CODEC -> IjkMediaPlayer.OPT_CATEGORY_CODEC
+            }
+            runCatching {
+                // setOption 只有 Long / String 两个重载
+                val v = o.value
+                if (v is Long) p.setOption(cat, o.name, v) else p.setOption(cat, o.name, v.toString())
+            }
+        }
+        if (knobOptions.isNotEmpty()) {
+            DiagHub.log("旋钮选项已交给播放器：${knobOptions.joinToString(" ") { "${it.name}=${it.value}" }}")
+        }
+
         player = p
+        // 硬解看门狗**不在这里挂**：此刻还不知道会不会真的走 MediaCodec。
+        // 要等选码回调告诉我们结果（见上面的 setOnMediaCodecSelectListener）：
+        // 选了硬解才挂，没选到就当软解慢慢跑，不催它。
         return p
     }
+
+    private fun categoryOf(c: VideoDecodePolicy.Category): Int = when (c) {
+        VideoDecodePolicy.Category.PLAYER -> IjkMediaPlayer.OPT_CATEGORY_PLAYER
+        VideoDecodePolicy.Category.FORMAT -> IjkMediaPlayer.OPT_CATEGORY_FORMAT
+        VideoDecodePolicy.Category.CODEC -> IjkMediaPlayer.OPT_CATEGORY_CODEC
+    }
+
+    // ---- 硬解兜底 ----
+    //
+    // 为什么需要它：有些电视（尤其是 Android 5.x 的老机型）的 MediaCodec
+    // **建得出来、却一帧都不吐**，而且不报错 —— 画面永远黑的，也没有 onError。
+    // 对老人来说这就是「电视坏了」。软解虽然慢，但至少能看，
+    // 所以硬解卡住要能自己退回去，而不是把故障页甩给用户。
+
+    /** 一个超时周期内解码器有没有真的拿到数据。 */
+    private fun decoderHasData(): Boolean {
+        val p = player ?: return false
+        return runCatching {
+            p.videoCachedBytes > 0 || p.videoCachedDuration > 0
+        }.getOrDefault(false)
+    }
+
+    /** 首帧看门狗宽限了几次（见 [hardwareWatchdog]）。 */
+    private var watchdogGrace = 0
+
+    private val hardwareWatchdog = Runnable {
+        if (firstFrameFired || !usingHardware) return@Runnable
+        // 解码器还没拿到数据就先别怪它：SMB 打开 + 探流（probesize 16MB）本来就要几秒，
+        // 这段时间「没出首帧」是正常的。宽限两次，再没有才判定硬解不行。
+        // 不加这一层的话，一次网络抖动就会把硬解判死（而这台电视上硬解是 4K 唯一的活路）。
+        if (watchdogGrace < WATCHDOG_GRACE && !decoderHasData()) {
+            watchdogGrace++
+            Log.i(TAG, "硬解还没拿到数据，首帧超时先宽限一次（第 $watchdogGrace 次）")
+            armHardwareWatchdog()
+            return@Runnable
+        }
+        fallbackToSoftware("硬解 ${VideoDecodePolicy.FIRST_FRAME_TIMEOUT_MS / 1000} 秒没出首帧")
+    }
+
+    /**
+     * 「选中了硬解、实际却在软解」的检测 —— 这是用户报「电视的硬解没开」的**唯一**可靠证据。
+     *
+     * ijkplayer 在建 MediaCodec 失败时**静默换 FFmpeg 软解**，一个回调都不发
+     * （见 [decoderInUse] 的说明）。不查这一下，界面上永远显示「走的是硬解」，
+     * 而用户看到的是 4K 幻灯片 —— 排查方向会完全跑偏。
+     *
+     * 查到之后：把那个解码器拉黑（下次自动换一个候选），
+     * 但**不重播**（已经跑在软解上了，重播没有意义）。
+     */
+    private val hardwareTruthCheck = Runnable {
+        if (!usingHardware) return@Runnable
+        when (decoderInUse()) {
+            PlaybackEngine.Decoder.HARDWARE -> Log.i(
+                TAG,
+                "解码通路确认：硬解 ${decoderName}（vdec_type=2）",
+            )
+
+            PlaybackEngine.Decoder.SOFTWARE -> {
+                usingHardware = false
+                silentFallbacks++
+                val name = decoderName
+                if (!name.isNullOrBlank()) bannedCodecs.add(name)
+                Log.w(
+                    TAG,
+                    "硬解没建成：选中的 ${name ?: "?"} 实际没接上，ijkplayer 已经静默改用软解" +
+                        "（vdec_type=1）。本次运行不再选它，下次自动换下一个候选",
+                )
+            }
+
+            PlaybackEngine.Decoder.UNKNOWN -> Log.w(TAG, "解码通路还问不出来（播放器可能已经释放）")
+        }
+    }
+
+    /**
+     * 兜底重播的专用工作线程。
+     *
+     * 为什么必须离开主线程：重播要**重新打开字节源**（SMB 打开是阻塞的网络操作）。
+     * 而触发兜底的两条路都在主线程上 —— 硬解看门狗是主线程的 Handler，
+     * 界面层的 `retryInSoftware()` 也在主线程。在主线程上做 SMB I/O 会直接抛
+     * `NetworkOnMainThreadException`，就算不抛也会把整屏卡住。
+     *
+     * 线程按需创建、不主动 quit：`release()` 之后引擎还会被复用
+     * （例如界面层「自动重连」就是先 release 再重播），quit 掉会让后续
+     * `post` 静默失败。一个引擎实例最多留一个空转的 looper 线程。
+     */
+    private var workerThread: HandlerThread? = null
+    private var worker: Handler? = null
+
+    private fun onWorker(block: () -> Unit) {
+        val h = synchronized(this) {
+            val alive = workerThread?.isAlive == true
+            if (!alive) {
+                val t = HandlerThread("firefly-decode")
+                t.start()
+                workerThread = t
+                worker = Handler(t.looper)
+            }
+            worker
+        }
+        if (h?.post(block) != true) Log.w(TAG, "兜底重播没能排上工作线程")
+    }
+
+    private fun armHardwareWatchdog() {
+        cancelHardwareWatchdog()
+        watchdogGrace = 0
+        main.postDelayed(hardwareWatchdog, VideoDecodePolicy.FIRST_FRAME_TIMEOUT_MS)
+    }
+
+    private fun cancelHardwareWatchdog() {
+        main.removeCallbacks(hardwareWatchdog)
+    }
+
+    private fun armHardwareTruthCheck() {
+        cancelHardwareTruthCheck()
+        main.postDelayed(hardwareTruthCheck, TRUTH_CHECK_DELAY_MS)
+    }
+
+    private fun cancelHardwareTruthCheck() {
+        main.removeCallbacks(hardwareTruthCheck)
+    }
+
+    /**
+     * 硬解不行了：记一笔、拉黑这个解码器，然后用软解把同一份内容重播。
+     *
+     * @param hard true = 解码器真的报错/卡死（按 [VideoDecodePolicy.MAX_FAILURES] 累计，
+     *   累计够数就本次运行不再试硬解）；false = 首帧超时（只对当前内容生效，
+     *   换内容会重新给机会，见 [softFailures]）
+     * @return true = 已经重新起播
+     */
+    private fun fallbackToSoftware(reason: String, hard: Boolean = false): Boolean {
+        if (!usingHardware) return false
+        usingHardware = false
+        cancelHardwareWatchdog()
+        cancelHardwareTruthCheck()
+        if (hard) hardFailures++ else softFailures++
+        // 这次没接上的解码器拉黑：下次自动换下一个候选，而不是再撞一次同一面墙
+        val banned = decoderName
+        if (!banned.isNullOrBlank()) bannedCodecs.add(banned)
+        val remaining = VideoDecodePolicy.MAX_FAILURES - hardFailures
+        Log.w(
+            TAG,
+            "硬解失败（$reason）：${banned ?: "?"} 已拉黑。" +
+                "硬失败 $hardFailures 次、超时 $softFailures 次，" +
+                if (remaining > 0) "改用软解重播" else "本次运行不再尝试硬解，改用软解重播",
+        )
+        if (lastRequest == null) return false
+        // 先告诉界面层（它要把起播看门狗重新起算），再去重新打开字节源
+        onMain { listener?.onDecoderFallback(reason) }
+        onWorker { startPlayback(hardware = false) }
+        return true
+    }
+
+    override fun canFallbackToSoftware(): Boolean = usingHardware && lastRequest != null
+
+    override fun retryInSoftware(): Boolean = fallbackToSoftware("界面层判定起播卡死", hard = true)
 
     /**
      * 所有对外回调都必须回到主线程。
@@ -318,7 +948,24 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     private fun handleError(what: Int, extra: Int) {
-        if (liveReconnect && liveUrlProvider?.invoke() != null) {
+        // 解码器报错（不是 I/O）而且正在用硬解 → 先软解重播，别打扰用户。
+        // 判据里的 I/O 例外很重要：SMB 断线也会走到这里，
+        // 那种情况下重播一次只是白等，应该直接交给故障页去重连。
+        if (usingHardware && extra != tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_IO) {
+            if (fallbackToSoftware("解码器报错 what=$what extra=$extra", hard = true)) return
+        }
+        // 「正在播直播」是走这条兜底的前提。
+        //
+        // 只看 liveReconnect 是不够的：界面层换到直播时会把它置 true，
+        // 但**从来没有置回 false**（见 MainActivity.playChannel）。少了 kind 这一半，
+        // 用户「先看直播、再回电视剧」以后，某一集 SMB 读取失败也会被当成直播断流 ——
+        // 于是去重连一个根本没在播的频道地址，该出的故障页永远不出来。
+        val liveUrl = if (kind == PlaybackMode.Kind.LIVE) liveUrlProvider?.invoke() else null
+        if (liveReconnect && liveUrl != null) {
+            // 直播断流由引擎自己一直重连，但**必须让界面层知道**：
+            // 以前这里直接 return，界面上什么都不显示，用户看到的就是
+            // 「换台以后画面冻住、按键有反应、永远不好」（见 Listener.onLiveRetry）
+            onMain { listener?.onLiveRetry(retryCount + 1, liveUrl) }
             scheduleLiveRetry()
             return
         }
@@ -352,6 +999,93 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         player?.videoOutputFramesPerSecond ?: 0f
     }.getOrDefault(0f)
 
+    // ijkplayer 的 ff_ffmsg.h：0=UNKNOWN / 1=AVCODEC(软解) / 2=MEDIACODEC(硬解)
+    override fun decoderInUse(): PlaybackEngine.Decoder = when (runCatching {
+        player?.videoDecoder ?: 0
+    }.getOrDefault(0)) {
+        FFP_PROPV_DECODER_MEDIACODEC -> PlaybackEngine.Decoder.HARDWARE
+        FFP_PROPV_DECODER_AVCODEC -> PlaybackEngine.Decoder.SOFTWARE
+        else -> PlaybackEngine.Decoder.UNKNOWN
+    }
+
+    /**
+     * `getMediaInfo()` 会顺带解析一遍 media meta（几百个字段），
+     * 一秒一次没必要 —— 起播后解码器名不会变，缓存一份就够。
+     *
+     * ⚠️ 但**片源帧率拿不到时不能钉死**：起播后头几秒 meta 还没填全，
+     * 那时缓存下来的 `avg_frame_rate` 是 0，面板上就会一直显示
+     * 「片源 0.0 帧/秒」，而这一行正是判断「是片源本来就只有 25 帧、
+     * 还是播的时候掉了帧」的唯一对照物 —— 实机排查时它长时间是 0，
+     * 害得结论只能走「不知道片源帧率」的兜底分支。所以：
+     * 拿到 0 就过 [MEDIA_INFO_RETRY_MS] 再问一次，直到问出真值。
+     */
+    private var cachedMediaInfo: tv.danmaku.ijk.media.player.MediaInfo? = null
+    private var mediaInfoAt = 0L
+
+    /**
+     * 片源自己的帧率。
+     *
+     * ijkplayer 把 `st->avg_frame_rate` 写进了 media meta（`ijkmeta.c:245`），
+     * Java 侧从 `IjkStreamMeta.mFpsNum/mFpsDen` 读出来即可。
+     * `fps_num` 为 0 时退回 `tbr_num`（有些流只报 tbr）；还是不行就返回 0，
+     * 调用方**不能**把它当「0 帧」，要当「不知道」。
+     */
+    private fun sourceFps(info: tv.danmaku.ijk.media.player.MediaInfo?): Float {
+        val s = runCatching { info?.mMeta?.mVideoStream }.getOrNull() ?: return 0f
+        val fps = ratio(s.mFpsNum, s.mFpsDen)
+        if (fps > 0f) return fps
+        return ratio(s.mTbrNum, s.mTbrDen)
+    }
+
+    private fun ratio(num: Int, den: Int): Float =
+        if (num > 0 && den > 0) num.toFloat() / den else 0f
+
+    override fun diag(): PlaybackEngine.Diag {
+        val p = player
+        val now = System.currentTimeMillis()
+        val stale = cachedMediaInfo == null ||
+            (sourceFps(cachedMediaInfo) <= 0f && now - mediaInfoAt > MEDIA_INFO_RETRY_MS)
+        val info = if (stale) {
+            runCatching { p?.mediaInfo }.getOrNull()?.also {
+                cachedMediaInfo = it
+                mediaInfoAt = now
+            } ?: cachedMediaInfo
+        } else {
+            cachedMediaInfo
+        }
+        return PlaybackEngine.Diag(
+            decoder = decoderInUse(),
+            decoderName = decoderName,
+            videoModule = info?.mVideoDecoder,
+            // ijkplayer 拼的是 "模块, 实现名"，逗号后面那个空格没去掉，这里自己 trim
+            videoImpl = info?.mVideoDecoderImpl?.trim()?.takeIf { it.isNotEmpty() },
+            audioCodec = listOfNotNull(info?.mAudioDecoder?.trim(), info?.mAudioDecoderImpl?.trim())
+                .filter { it.isNotEmpty() }
+                .joinToString(" "),
+            videoWidth = runCatching { p?.videoWidth ?: 0 }.getOrDefault(0),
+            videoHeight = runCatching { p?.videoHeight ?: 0 }.getOrDefault(0),
+            sourceFps = sourceFps(info),
+            decodeFps = finite(runCatching { p?.videoDecodeFramesPerSecond ?: 0f }.getOrDefault(0f)),
+            outputFps = finite(outputFps()),
+            dropFps = finite(runCatching { p?.dropFrameRate ?: 0f }.getOrDefault(0f)),
+            cachedMs = runCatching { p?.videoCachedDuration ?: 0L }.getOrDefault(0L),
+            cachedBytes = runCatching { p?.videoCachedBytes ?: 0L }.getOrDefault(0L),
+            trafficBytes = runCatching { p?.trafficStatisticByteCount ?: 0L }.getOrDefault(0L),
+            bitRateBps = runCatching { p?.bitRate ?: 0L }.getOrDefault(0L),
+            requestedHardware = hardwareRequested,
+            codecOffered = decoderPath == DecoderPath.MEDIACODEC,
+            silentFallbacks = silentFallbacks,
+            bannedCodecs = bannedCodecs.toList(),
+        )
+    }
+
+    /**
+     * 帧率计数器在**第一个采样点**上会给出 `Infinity`（`SDL_SpeedSamplerAdd` 除以 0 间隔），
+     * 面板上就会显示「解码 Infinity 帧/秒」。这里统一当 0 处理（= 还不知道），
+     * 一秒之后自然就有真值了。
+     */
+    private fun finite(v: Float): Float = if (v.isFinite() && v >= 0f) v else 0f
+
     override fun liveness(): PlaybackEngine.Liveness {
         val p = player ?: return PlaybackEngine.Liveness(0, 0, 0, 0f)
         return runCatching {
@@ -371,10 +1105,14 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     override fun pause() {
+        // 暂停期间不该算「硬解卡住」：音频焦点被别的应用抢走也会走到这里
+        cancelHardwareWatchdog()
         runCatching { player?.pause() }
     }
 
     override fun resume() {
+        // 还没出首帧、而且确实在跑硬解，就接着等（重新起算一个完整超时，宁可多等也不要误判）
+        if (!firstFrameFired && usingHardware) armHardwareWatchdog()
         runCatching { player?.start() }
     }
 
@@ -388,6 +1126,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     private fun releaseInternal() {
+        cancelHardwareWatchdog()
+        cancelHardwareTruthCheck()
         val p = player ?: return
         player = null
         runCatching {
@@ -400,7 +1140,27 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     private companion object {
+        const val TAG = "FireflyTV"
+
         /** 底层 I/O 超时（微秒）。见 [newPlayer] 里的说明。 */
         const val IO_TIMEOUT_US = 15_000_000L
+
+        /**
+         * 起播后多久去问「到底建成硬解没有」。
+         *
+         * 取 5 秒：configure + start + 第一帧解码在正常的电视硬解上是毫秒级，
+         * 5 秒足够让 `vdec_type` 定下来；又不至于拖太久才在日志里暴露问题。
+         */
+        const val TRUTH_CHECK_DELAY_MS = 5_000L
+
+        /** 片源帧率还没解析出来时的重问间隔（见 [cachedMediaInfo]）。 */
+        const val MEDIA_INFO_RETRY_MS = 5_000L
+
+        /** 首帧超时最多宽限几次（每次一个完整超时）。见 [hardwareWatchdog]。 */
+        const val WATCHDOG_GRACE = 2
+
+        // ijkplayer `ff_ffmsg.h` 的解码通路常量
+        const val FFP_PROPV_DECODER_AVCODEC = 1
+        const val FFP_PROPV_DECODER_MEDIACODEC = 2
     }
 }

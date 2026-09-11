@@ -75,9 +75,15 @@ class NetworkDiagTest {
         val cfg = com.firefly.tv.core.Config.smb(ctx)
         log("configured=${com.firefly.tv.core.Config.configured(ctx)}")
         log("smb host=[${cfg.host}] share=[${cfg.share}] root=[${cfg.root}] user=[${cfg.user}] passLen=${cfg.pass.length}")
-        log("weather ready=${com.firefly.tv.core.Config.weather(ctx).ready}")
-        val spot = com.firefly.tv.core.Config.spot(ctx)
-        log("spot lib=[${spot.lib}] show=[${spot.show}] ep=${spot.index} posMs=${spot.posMs}")
+        val w = com.firefly.tv.core.Config.weather(ctx)
+        log("weather ready=${w.ready} location=[${w.location}] keyLen=${w.key.length}")
+        val hist = com.firefly.tv.media.WatchHistory.parse(
+            com.firefly.tv.core.Config.watchHistoryText(ctx),
+        )
+        log("观看记录 lastLib=[${hist.lastLib}] 共 ${hist.records.size} 条")
+        for (r in hist.records.values.sortedByDescending { it.at }.take(5)) {
+            log("  记录 《${r.show}》 第 ${r.episode + 1} 集 @${r.posMs}ms")
+        }
         log("channel=${com.firefly.tv.core.Config.channel(ctx)}")
         val cache = com.firefly.tv.core.Config.loadCache(ctx)
         log("scanCache bytes=${cache?.length ?: 0}")

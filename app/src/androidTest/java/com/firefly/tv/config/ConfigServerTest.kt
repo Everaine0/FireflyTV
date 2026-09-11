@@ -70,7 +70,10 @@ class ConfigServerTest {
             assertTrue("配置页缺少标题", ok.body.contains("萤火照夜"))
             assertTrue("配置页缺少保存按钮", ok.body.contains("保存并开始使用"))
             assertTrue("配置页缺少 NAS 地址输入", ok.body.contains("id=\"host\""))
-            assertTrue("配置页缺少天气 Host 输入", ok.body.contains("id=\"whost\""))
+            // 心知只要私钥 + 地点两项（和风那栏专属 Host 已经删掉了）
+            assertTrue("配置页缺少天气私钥输入", ok.body.contains("id=\"wkey\""))
+            assertTrue("配置页缺少天气地点输入", ok.body.contains("id=\"wloc\""))
+            assertTrue("配置页不该再出现和风那栏 Host", !ok.body.contains("id=\"whost\""))
             // 页面脚本从 location.search 读 token 再回填到请求里，
             // 所以这里只要确认「脚本会带上 t 参数」即可
             assertTrue("页面脚本没把 token 带上请求", ok.body.contains("o.set('t', t)"))
@@ -100,14 +103,29 @@ class ConfigServerTest {
                 empty.body.contains("\"weather\":\"没填，已跳过"),
             )
 
-            // 天气只填一半：必须报「要么都填要么都留空」，不能静默通过
+            // 天气只填一半：**地点填了但没填私钥** —— 这半边必须报出来，
+            // 不能因为「地点有默认值」就静默通过。
+            // （心知只有两项，私钥是唯一必填的那项；原来和风是三项全填或全空。）
             val halfWeather = request(
                 "POST", url,
-                mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare", "wkey" to "only-key"),
+                mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare", "wloc" to "北京"),
             )
             assertEquals(200, halfWeather.code)
             assertFalse("不该成功：${halfWeather.body}", halfWeather.body.contains("\"ok\":true"))
-            assertTrue("天气填一半应提示：${halfWeather.body}", halfWeather.body.contains("要么都填"))
+            assertTrue("天气填一半应提示：${halfWeather.body}", halfWeather.body.contains("没填天气私钥"))
+
+            // 地点留空是允许的：会用默认坐标（北京），所以只填私钥不算填错，
+            // 但会真的去打一次接口 —— 假 Key 要能拿到一句人话，而不是空白
+            val fakeKey = request(
+                "POST", url,
+                mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare", "wkey" to "not-a-real-key"),
+            )
+            assertEquals(200, fakeKey.code)
+            assertFalse("不该成功：${fakeKey.body}", fakeKey.body.contains("\"ok\":true"))
+            assertTrue(
+                "假 Key 要给出一句人能看懂的原因：${fakeKey.body}",
+                Regex("\"weather\":\"[^\"]{4,}\"").containsMatchIn(fakeKey.body),
+            )
 
             // SMB 填了但连不上：必须给出一句中文原因，而不是空白
             val partial = request(
@@ -164,7 +182,7 @@ class ConfigServerTest {
                     "share" to "media&more",              // & → %26
                     "user" to "user@domain",              // @ → %40
                     "pass" to "p@ss&word=1",              // 三种特殊字符
-                    "wkey" to "k", "whost" to "h", "wloc" to "101010100",
+                    "wkey" to "k", "wloc" to "<纬度:经度>",
                 ),
             )
             assertEquals(200, res.code)
@@ -190,7 +208,7 @@ class ConfigServerTest {
                 mapOf(
                     "t" to server.token,
                     "host" to "127.0.0.1", "share" to "nosuchshare",
-                    "wkey" to "fake", "whost" to "127.0.0.1", "wloc" to "101010100",
+                    "wkey" to "fake", "wloc" to "<纬度:经度>",
                 ),
             )
             assertEquals(200, res.code)

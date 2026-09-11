@@ -19,11 +19,16 @@ object Config {
     private const val KEY_DOMAIN = "smb_domain"
 
     private const val KEY_W_KEY = "w_key"
-    private const val KEY_W_HOST = "w_host"
+    private const val KEY_W_HOST = "w_host"          // 旧版和风专属 Host，只用于清理
     private const val KEY_W_LOCATION = "w_location"
+    private const val KEY_W_CACHE = "w_cache"
+    private const val KEY_W_CACHE_AT = "w_cache_at"
 
     private const val KEY_CONFIGURED = "configured"
 
+    // 观看记录（每部剧各一条，见 WatchHistory）。
+    // 旧版那份「只有一条全局记忆」的四个键保留着，只为了升级时迁移一次。
+    private const val KEY_HISTORY = "watch_history"
     private const val KEY_LAST_LIB = "last_lib"
     private const val KEY_LAST_SHOW = "last_show"
     private const val KEY_LAST_EP = "last_ep"
@@ -76,22 +81,32 @@ object Config {
             .apply()
     }
 
-    data class Weather(val key: String, val host: String, val location: String) {
-        val ready: Boolean get() = key.isNotBlank() && host.isNotBlank() && location.isNotBlank()
+    /**
+     * 心知天气（seniverse）只需要两样：**私钥**和**地点**。
+     *
+     * 原来还要一个「账号专属 Host」（和风 2026 起的规定），换到心知之后
+     * 域名是固定的 `api.seniverse.com`，那一栏就删掉了 —— 少一栏就少一个填错的机会。
+     *
+     * 地点默认给的是**经纬度**而不是城市名：心知的免费套餐里
+     * 「北京」这个名字会回 `AP010006 没有权限访问这个地点`，
+     * 而 `<纬度:经度>` 能查到，返回的正是「北京,北京,内蒙古,中国」。
+     * 也就是说坐标反而比名字更准、权限也更宽。
+     */
+    data class Weather(val key: String, val location: String) {
+        val ready: Boolean get() = key.isNotBlank() && location.isNotBlank()
 
-        /** 和风自 2026 起每账号专属 Host，用户可能连 https:// 一起粘进来。 */
-        fun normalized(): Weather = Weather(
-            key.trim(),
-            host.trim().removePrefix("https://").removePrefix("http://").trim('/'),
-            location.trim(),
-        )
+        fun normalized(): Weather = Weather(key.trim(), location.trim().ifBlank { DEFAULT_LOCATION })
+
+        companion object {
+            /** 北京市北京市区（接口解析为「北京」）。 */
+            const val DEFAULT_LOCATION = "<纬度:经度>"
+        }
     }
 
     fun weather(ctx: Context): Weather {
         val p = sp(ctx)
         return Weather(
             p.getString(KEY_W_KEY, "").orEmpty(),
-            p.getString(KEY_W_HOST, "").orEmpty(),
             p.getString(KEY_W_LOCATION, "").orEmpty(),
         )
     }
@@ -100,9 +115,22 @@ object Config {
         val n = w.normalized()
         sp(ctx).edit()
             .putString(KEY_W_KEY, n.key)
-            .putString(KEY_W_HOST, n.host)
             .putString(KEY_W_LOCATION, n.location)
+            // 和风那栏留着没用，顺手清掉，免得以后有人以为它还在生效
+            .remove(KEY_W_HOST)
             .apply()
+    }
+
+    /** 天气结果的落盘缓存：重启电视不该再打一次接口（见 WeatherClient 的频率说明）。 */
+    fun weatherCache(ctx: Context): Pair<Long, String>? {
+        val p = sp(ctx)
+        val at = p.getLong(KEY_W_CACHE_AT, 0L)
+        val text = p.getString(KEY_W_CACHE, null) ?: return null
+        return if (at <= 0L || text.isBlank()) null else at to text
+    }
+
+    fun saveWeatherCache(ctx: Context, at: Long, text: String) {
+        sp(ctx).edit().putString(KEY_W_CACHE, text).putLong(KEY_W_CACHE_AT, at).apply()
     }
 
     fun configured(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_CONFIGURED, false)
@@ -111,32 +139,39 @@ object Config {
         sp(ctx).edit().putBoolean(KEY_CONFIGURED, v).apply()
     }
 
-    /** 续播位置：库 + 剧 + 集序号 + 精确进度。 */
-    class Spot(val lib: String, val show: String, val index: Int, val posMs: Long)
+    // ---- 观看记录 ----
+    //
+    // 存成一个整体（`WatchHistory.serialize` 的文本），而不是一堆散键：
+    //  - 写一次是原子的，老人直接拔电源也不会只剩半条记录；
+    //  - 解析逻辑能单独测（见 WatchHistoryTest）。
+    //
+    // 5 秒写一次，整个文件才十几 KB，代价可以忽略。
 
-    fun spot(ctx: Context): Spot {
+    fun watchHistoryText(ctx: Context): String? = sp(ctx).getString(KEY_HISTORY, null)
+
+    fun saveWatchHistoryText(ctx: Context, text: String) {
+        sp(ctx).edit().putString(KEY_HISTORY, text).apply()
+    }
+
+    /**
+     * 旧版那条「只有一份」的续播记忆，读过一次就清掉（升级时迁移用）。
+     *
+     * @return 库/剧/集/进度；没存过就返回 null
+     */
+    fun takeLegacySpot(ctx: Context): LegacySpot? {
         val p = sp(ctx)
-        return Spot(
-            p.getString(KEY_LAST_LIB, "").orEmpty(),
-            p.getString(KEY_LAST_SHOW, "").orEmpty(),
-            p.getInt(KEY_LAST_EP, 0),
-            p.getLong(KEY_LAST_POS, 0L),
-        )
-    }
-
-    fun saveSpot(ctx: Context, lib: String, show: String, index: Int, posMs: Long) {
-        sp(ctx).edit()
-            .putString(KEY_LAST_LIB, lib)
-            .putString(KEY_LAST_SHOW, show)
-            .putInt(KEY_LAST_EP, index)
-            .putLong(KEY_LAST_POS, posMs)
+        val lib = p.getString(KEY_LAST_LIB, "").orEmpty()
+        val show = p.getString(KEY_LAST_SHOW, "").orEmpty()
+        val ep = p.getInt(KEY_LAST_EP, 0)
+        val pos = p.getLong(KEY_LAST_POS, 0L)
+        p.edit()
+            .remove(KEY_LAST_LIB).remove(KEY_LAST_SHOW)
+            .remove(KEY_LAST_EP).remove(KEY_LAST_POS)
             .apply()
+        return if (show.isBlank()) null else LegacySpot(lib, show, ep, pos)
     }
 
-    /** 5 秒防抖写盘时只更新进度，不动库/剧/集。 */
-    fun savePosition(ctx: Context, posMs: Long) {
-        sp(ctx).edit().putLong(KEY_LAST_POS, posMs).apply()
-    }
+    class LegacySpot(val lib: String, val show: String, val index: Int, val posMs: Long)
 
     fun channel(ctx: Context): Int = sp(ctx).getInt(KEY_LAST_CH, 0)
 

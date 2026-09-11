@@ -2,6 +2,7 @@ package com.firefly.tv.media
 
 import com.firefly.tv.core.Config
 import com.firefly.tv.core.NaturalOrder
+import com.firefly.tv.smb.SmbClient
 import com.firefly.tv.smb.SmbStore
 
 /**
@@ -11,7 +12,8 @@ import com.firefly.tv.smb.SmbStore
  * ```
  * \\NAS\media\
  * ├── 电视剧\            ← 视频库：库/剧名/剧集文件
- * ├── 电影\              ← 视频库
+ * │   └── 水浒传\        → 水浒传01.mkv ...
+ * ├── 电影\              ← 视频库，也可以是**平铺**的：库/电影.mp4（单集）
  * └── 直播\              ← 含 .m3u 即自动识别为 IPTV 库
  * ```
  */
@@ -105,15 +107,43 @@ object Scanner {
         probeNamesByContent(cfg, dir, names).isNotEmpty()
 
     /**
-     * 视频库顶层 = 剧列表（每个子文件夹一部剧）。[LibraryCache] 命中时由调用方直接用缓存，
+     * 视频库顶层 = 剧列表。[LibraryCache] 命中时由调用方直接用缓存，
      * 走不到这里 —— 保留它是为了「后台刷新」和首次扫描。
+     *
+     * 两种东西都算「一部剧」：
+     *  - 子文件夹（库/剧名/剧集文件，电视剧那种常见结构）
+     *  - **散装视频文件**（库/电影.mp4），算单集
+     *
+     * 老版本只认子文件夹，于是「电影」这种平铺的库被判成**空库**，
+     * 界面上就是「这个库打不开，唰地跳过去」（实机反馈）。
      */
-    fun shows(cfg: Config.Smb, lib: Library.Video): List<String> =
-        SmbStore.with(cfg) { it.list(lib.name) }
-            .asSequence()
-            .filter { it.isDir }
+    fun shows(cfg: Config.Smb, lib: Library.Video): List<String> {
+        val entries = SmbStore.with(cfg) { it.list(lib.name) }
+        val named = showNames(entries)
+        if (named.isNotEmpty()) return named
+        // 一个认识的都没有：后缀可能整批不可信（实测整季 .mp4 实为 MPEG-TS），按内容确认
+        return probeNamesByContent(cfg, lib.name, looseNames(entries))
+    }
+
+    /**
+     * 纯函数部分：目录项 → 剧名列表（子文件夹 + 散装视频文件，自然排序）。
+     *
+     * 抽出来是为了能单测 —— 这段的 bug 表现是「整个库不见了」，
+     * 而它只在有 NAS 的时候才跑得到。
+     */
+    fun showNames(entries: List<SmbClient.Entry>): List<String> =
+        entries.asSequence()
+            .filter { it.isDir || MediaExt.isVideo(it.name) }
             .map { it.name }
             .sortedWith(NaturalOrder)
+            .take(MAX_ENTRIES)
+            .toList()
+
+    /** 顶层的散装文件（.m3u 不算 —— 那是直播库的标记）。 */
+    private fun looseNames(entries: List<SmbClient.Entry>): List<String> =
+        entries.asSequence()
+            .filter { !it.isDir && !MediaExt.isM3u(it.name) }
+            .map { it.name }
             .take(MAX_ENTRIES)
             .toList()
 
@@ -124,16 +154,27 @@ object Scanner {
     class Episodes(val names: List<String>, val byContent: Boolean)
 
     /**
-     * 读某部剧的集数。两级结构：
+     * 读某部剧的集数。三种结构：
      *  - 库/剧名/剧集文件（常见）
      *  - 库/剧名/季/剧集文件（多季，取"第 1 季"或第一层子目录）
+     *  - 库/剧名（「剧名」本身就是一个散装视频文件）→ 单集
      */
     fun episodes(cfg: Config.Smb, lib: Library.Video, show: String): List<String> =
         episodesDetailed(cfg, lib, show).names
 
     fun episodesDetailed(cfg: Config.Smb, lib: Library.Video, show: String): Episodes {
+        // 散装文件：这部剧就是它自己（单集）。**不能**去列它 —— 列一个文件路径必然失败
+        if (MediaExt.isVideo(show)) return Episodes(listOf(show), byContent = false)
+
         val base = "${lib.name}/$show"
-        val entries = SmbStore.with(cfg) { it.list(base) }
+        val entries = try {
+            SmbStore.with(cfg) { it.list(base) }
+        } catch (t: Throwable) {
+            // 后缀不认识、靠内容才认出来的那种散装文件：列目录失败是**预期**的，不是故障。
+            // 先用内容确认一下它真是视频再下结论，免得把网络抖动当成「这是个文件」。
+            if (isVideoByContent(cfg, base)) return Episodes(listOf(show), byContent = true)
+            throw t
+        }
         val direct = entries.filter { !it.isDir && MediaExt.isVideo(it.name) }
             .map { it.name }
             .sortedWith(NaturalOrder)
@@ -156,12 +197,26 @@ object Scanner {
         }
 
         // 后缀一个都不认识：按内容挑出实际是媒体的那些文件
+        // （先确认一下「这部剧」本身会不会就是个文件 —— 见上面对 list 失败的说明；
+        //  smbj 对文件路径既可能抛错、也可能回空列表，两种都得兜住）
+        if (entries.isEmpty() && isVideoByContent(cfg, base)) return Episodes(listOf(show), byContent = true)
         val found = probeNamesByContent(cfg, base, entries.filter { !it.isDir && !MediaExt.isM3u(it.name) }.map { it.name })
         return Episodes(found, byContent = true)
     }
 
     /** 剧集文件的完整相对路径（相对库根）。 */
-    fun episodePath(lib: Library.Video, show: String, episode: String): String = "${lib.name}/$show/$episode"
+    fun episodePath(lib: Library.Video, show: String, episode: String): String =
+        // 散装文件那一档：集名就是剧名，路径不再多一层（[episodesDetailed] 的约定）
+        if (isLooseShow(show, episode)) "${lib.name}/$show" else "${lib.name}/$show/$episode"
+
+    /**
+     * 这部剧是「散装文件」还是文件夹。
+     *
+     * 判据是「集名 == 剧名」—— 只有散装那一档会这样（见 [episodesDetailed]）；
+     * 文件夹里的集名带后缀，正常不会跟剧名目录撞上。
+     */
+    fun isLooseShow(show: String, episode: String): Boolean =
+        MediaExt.isVideo(show) || episode == show
 
     // ---- 按内容探测 ----
 

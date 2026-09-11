@@ -277,4 +277,26 @@ class MoovRelocationRealLayoutTest {
         assertEquals("应该只返回剩下那 10 字节", 10, n)
         assertArrayEquals(view.copyOfRange(view.size - 10, view.size), buf.copyOfRange(0, 10))
     }
+    /**
+     * 读路径计数要能反映「读放大」。
+     *
+     * 这是为下一轮实机排查准备的尺子：非 faststart 的片源要靠 [MoovRelocatingSource]
+     * 搬 moov，现场只量到「进程 CPU 从 0.45 核涨到 0.8 核」这种噪声很大的间接证据。
+     * 有了这几个计数，下次直接对比同样播 30 秒时「搬过 moov 的文件多发了多少次读、
+     * 平均每次读多大」就能定性 —— 平均读长度明显变小才说明上层在按小块反复读。
+     */
+    @Test
+    fun `读路径计数能反映出读放大`() {
+        ReadStats.reset()
+        val data = realLayout(mdatSize = 4096, moovBytes = moovWithStco(listOf(64, 2048), padStbl = 32))
+        val wrapped = relocate(data)!!
+        val buf = ByteArray(64)
+        wrapped.read(0, buf, 0, 64)
+
+        assertEquals(1L, ReadStats.relocatedOpens)
+        assertTrue("读过至少一次", ReadStats.readCalls >= 1)
+        assertTrue("字节数要大于 0", ReadStats.readBytes > 0)
+        assertTrue("平均读长度要大于 0", ReadStats.avgBytes() > 0)
+    }
+
 }

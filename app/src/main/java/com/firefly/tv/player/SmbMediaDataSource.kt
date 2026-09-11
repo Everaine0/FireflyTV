@@ -34,7 +34,18 @@ class SmbMediaDataSource(underlying: RandomAccessSource) : IMediaDataSource {
     override fun readAt(position: Long, buf: ByteArray, offset: Int, len: Int): Int {
         if (closed) return -1
         val total = source.size
-        if (len <= 0 || position < 0 || position >= total) return -1
+        if (position < 0 || len < 0) return -1
+
+        // ⚠️ 零长度读是 ijkplayer 的 **seek**，绝不能返回负数。
+        //
+        // 依据 `ijkmedia/ijkplayer/ijkavformat/ijkmediadatasource.c` 的 `ijkmds_seek`：
+        // 它把 seek 实现成 `readAt(newPos, jbuffer, 0, 0)`，然后
+        //   `else if (ret < 0) return AVERROR_EOF;`
+        // 也就是说返回 -1 会让**每一次 avio_seek 都失败**。后果实测：
+        // 解复用器满屏 `stream 0/1, offset 0x...: partial file`（一次播放 4418 条），
+        // mov 只能退化成顺序读 —— 1 GB 的 4K 片源慢到没法看，拖进度也永远失灵。
+        if (len == 0) return if (position <= total) 0 else -1
+        if (position >= total) return -1
 
         var written = 0
         while (written < len) {

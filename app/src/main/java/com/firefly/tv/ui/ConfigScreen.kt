@@ -2,7 +2,6 @@ package com.firefly.tv.ui
 
 import android.content.Context
 import android.graphics.Color
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.FrameLayout
@@ -21,6 +20,8 @@ import com.firefly.tv.config.Qr
  * 被切掉等于彻底没法配置。
  */
 class ConfigScreen(context: Context) : FrameLayout(context) {
+
+    private val ui = Ui(context)
 
     private val qrView = ImageView(context)
     private val titleView = text(30f, Color.WHITE)
@@ -100,12 +101,12 @@ class ConfigScreen(context: Context) : FrameLayout(context) {
     }
 
     private fun text(sizeSp: Float, color: Int) = TextView(context).apply {
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
+        ui.text(this, sizeSp)
         setTextColor(color)
         includeFontPadding = false
     }
 
-    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+    private fun dp(v: Int): Int = ui.px(v)
 
     private fun wrap(top: Int = 0) = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.WRAP_CONTENT,

@@ -2,6 +2,11 @@
 # 用 ** 是为了连 app/libs/stock-aar/ 这种子目录里的也一起排除
 app/libs/**/*.aar
 
+# scripts/swap-ffmpeg-so.sh 换 .so 前会自动留一份 .aar.bak 备份。
+# ⚠️ 上面那条通配符匹配不到 `.aar.bak`（结尾不是 .aar），少了这行就会有一个
+# 17MB 的备份文件被误提交。
+app/libs/**/*.bak
+
 # 自己编译 ijkplayer 内核时的产物/中间产物（体积大、可重编，见 scripts/build-ijkplayer.sh）
 build-out/
 

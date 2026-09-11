@@ -2,6 +2,7 @@ package com.firefly.tv.ui
 
 import com.firefly.tv.media.Library
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -107,35 +108,142 @@ class NavigatorTest {
         assertEquals(0, Navigator.horizontal(0, 0, +1))
     }
 
-    // ---- 切库时的起播点 ----
+    // ---- 换剧时的续播点 ----
 
+    /**
+     * 用户实测的问题：「**换到别的剧再换回来，只能从头看**」。
+     *
+     * 原来是写死的 `PlayShow(next, 0, 0L)`。现在按「库 + 剧」查记录：
+     * 看过的剧回到上次那一集那一分钟，没看过的（或看得太少）还是第 1 集开头。
+     */
     @Test
-    fun `切回上次看的库才认那份记忆`() {
-        val s = Navigator.startPoint("电视剧", "电视剧", "娘道", 5, 120_000L)
-        assertEquals("娘道", s.show)
-        assertEquals(5, s.episode)
-        assertEquals(120_000L, s.positionMs)
+    fun `换到看过的剧会回到上次那一集那一分钟`() {
+        val lib = Library.Video("电视剧")
+        val shows = listOf("娘道", "大宅门", "猫和老鼠")
+        val action = Navigator.vertical(
+            lib = lib,
+            shows = shows,
+            channels = emptyList(),
+            current = Navigator.Current.Show("娘道"),
+            delta = +1,
+            resume = { if (it == "大宅门") Navigator.Resume(2, 615_000L) else Navigator.Resume.FIRST },
+        ) as Navigator.Action.PlayShow
+        assertEquals(1, action.showIndex)
+        assertEquals(2, action.episodeIndex)
+        assertEquals(615_000L, action.startMs)
     }
 
     @Test
-    fun `换到别的库一律从第一部第一集开始`() {
-        // 记忆里是 IPTV 那个库，现在切到电视剧库 —— 拿「娘道」去 IPTV 里找就是串库
-        val s = Navigator.startPoint("IPTV", "电视剧", "娘道", 5, 120_000L)
-        assertEquals("", s.show)
-        assertEquals(0, s.episode)
-        assertEquals(0L, s.positionMs)
+    fun `换到没看过的剧还是从第一集开头开始`() {
+        val action = Navigator.vertical(
+            lib = Library.Video("电视剧"),
+            shows = listOf("娘道", "大宅门"),
+            channels = emptyList(),
+            current = Navigator.Current.Show("娘道"),
+            delta = +1,
+        ) as Navigator.Action.PlayShow
+        assertEquals(0, action.episodeIndex)
+        assertEquals(0L, action.startMs)
     }
 
     @Test
-    fun `从没看过任何东西时也是从第一部开始`() {
-        val s = Navigator.startPoint("", "IPTV", "", 0, 0L)
-        assertEquals("", s.show)
-        assertEquals(0L, s.positionMs)
+    fun `续播查询给的是被换到的那部剧`() {
+        // 传错剧名就等于「拿 A 剧的进度去播 B 剧」，所以这里把入参钉死
+        val asked = ArrayList<String>()
+        Navigator.vertical(
+            lib = Library.Video("电视剧"),
+            shows = listOf("娘道", "大宅门", "猫和老鼠"),
+            channels = emptyList(),
+            current = Navigator.Current.Show("娘道"),
+            delta = -1, // 从第 0 部往回绕 → 最后一部
+            resume = { asked += it; Navigator.Resume.FIRST },
+        )
+        assertEquals(listOf("猫和老鼠"), asked)
     }
 
     @Test
-    fun `脏进度会被夹掉`() {
-        val s = Navigator.startPoint("电视剧", "电视剧", "娘道", -3, -1L)
-        assertEquals(0L, s.positionMs)
+    fun `直播换台不受续播影响`() {
+        val action = Navigator.vertical(
+            lib = Library.Live("IPTV", "央视.m3u"),
+            shows = emptyList(),
+            channels = listOf(
+                Library.Channel("CCTV1", "http://a"),
+                Library.Channel("CCTV3", "http://b"),
+            ),
+            current = Navigator.Current.Channel("CCTV1"),
+            delta = +1,
+            resume = { error("直播不该走这部剧续播的查询") },
+        ) as Navigator.Action.TuneChannel
+        assertEquals(1, action.channelIndex)
+    }
+
+    @Test
+    fun `直播间里上下键不会去查剧的记录`() {
+        // current 是频道、shows 是空 —— 任何一步走错都会变成「按上键跳台」
+        val action = Navigator.vertical(
+            lib = Library.Live("IPTV", "央视.m3u"),
+            shows = emptyList(),
+            channels = listOf(Library.Channel("CCTV1", "http://a")),
+            current = Navigator.Current.None,
+            delta = +1,
+        )
+        assertTrue(action is Navigator.Action.TuneChannel)
+    }
+
+    // ---- 空库跳过 ----
+
+    @Test
+    fun `空库跳过必须封顶`() {
+        // 实机反馈「这个媒体库打不开，会快速跳过」：平铺的库被判成空库以后，
+        // 跳过没有上限 —— 转完一圈接着转，屏幕上就是唰唰唰跳个不停，也不说为什么。
+        assertFalse(Navigator.skipExhausted(skipped = 0, libraryCount = 3))
+        assertFalse(Navigator.skipExhausted(skipped = 2, libraryCount = 3))
+        assertTrue("转完一圈就该停", Navigator.skipExhausted(skipped = 3, libraryCount = 3))
+        assertTrue("越过一圈更不能继续", Navigator.skipExhausted(skipped = 4, libraryCount = 3))
+    }
+
+    @Test
+    fun `一个库都没有时跳过立即算穷尽`() {
+        // 否则「没有库」和「还在跳」会互相绕开，兜底那条路永远走不到
+        assertTrue(Navigator.skipExhausted(skipped = 0, libraryCount = 0))
+    }
+
+    // ---- 库列表刷新后的重新锚定 ----
+
+    /**
+     * 这一组对应实机复现的实验：缓存里是「IPTV / 测试 / _probe2 / 电视剧」四个库
+     * （_probe2 后来在 NAS 上删掉了），冷启动先按缓存放《娘道》，后台扫完把列表换成三个。
+     * 不重新锚定的话，旧下标 3 在这张表里已经越界：**↓ 毫无反应、→ 跳到「测试」**。
+     */
+    @Test
+    fun `列表少了前面的库时当前库按名字找回来`() {
+        val cached = listOf(
+            Library.Video("IPTV"), Library.Video("测试"), Library.Video("_probe2"), Library.Video("电视剧"),
+        )
+        val fresh = listOf(Library.Video("IPTV"), Library.Video("测试"), Library.Video("电视剧"))
+        val wasOn = cached[3].name // 正在播《娘道》= 电视剧
+        assertEquals(2, Navigator.libraryIndexAfterRefresh(fresh, wasOn))
+        // 锚对了以后按键语义才对：→ 从「电视剧」到下一个库（IPTV）
+        assertEquals("IPTV", fresh[Navigator.horizontal(2, fresh.size, +1)].name)
+    }
+
+    @Test
+    fun `列表多出前面的库时同样按名字锚定`() {
+        val fresh = listOf(Library.Video("IPTV"), Library.Video("测试"), Library.Video("电视剧"))
+        // 用户刚在 NAS 上加了「测试」：旧列表里「电视剧」是 1，新列表里是 2
+        assertEquals(2, Navigator.libraryIndexAfterRefresh(fresh, "电视剧"))
+    }
+
+    @Test
+    fun `当前库在 NAS 上被删了就退回第一个库`() {
+        val fresh = listOf(Library.Video("IPTV"), Library.Video("测试"))
+        assertEquals(0, Navigator.libraryIndexAfterRefresh(fresh, "已经删掉的库"))
+    }
+
+    @Test
+    fun `还没播过任何库时从头开始`() {
+        val fresh = listOf(Library.Video("IPTV"), Library.Video("测试"))
+        assertEquals(0, Navigator.libraryIndexAfterRefresh(fresh, null))
+        assertEquals(0, Navigator.libraryIndexAfterRefresh(fresh, ""))
     }
 }

@@ -48,6 +48,29 @@ import android.util.Log
  * `stco` 里的偏移是 0 或很小，改不改都"看起来对"。
  * `MoovRelocationRealLayoutTest` 现在会用带真实量级偏移的布局把它钉住。
  */
+/**
+ * 读路径的计数（远程诊断用）。
+ *
+ * 为什么需要它：实机上非 faststart 的片源（moov 在文件尾）看起来更吃力，
+ * 但量到的只有「进程 CPU 从 0.45 核涨到 0.8 核」这种噪声很大的间接证据。
+ * 有了这几个数，下一次直接对比「同样播 30 秒、搬过 moov 的文件多发了多少次读请求、
+ * 平均每次读多大」就能定性 —— 平均读长度明显变小 = 上层在按小块反复读，
+ * 那才是能改的东西。
+ */
+object ReadStats {
+    @Volatile var relocatedOpens: Long = 0
+    @Volatile var readCalls: Long = 0
+    @Volatile var readBytes: Long = 0
+    @Volatile var segmentCrossings: Long = 0
+
+    fun reset() {
+        relocatedOpens = 0; readCalls = 0; readBytes = 0; segmentCrossings = 0
+    }
+
+    /** 平均每次读多少字节（0 = 还没读过）。 */
+    fun avgBytes(): Long = if (readCalls > 0) readBytes / readCalls else 0
+}
+
 class MoovRelocatingSource private constructor(
     private val source: RandomAccessSource,
     private val segments: List<Segment>,
@@ -107,6 +130,7 @@ class MoovRelocatingSource private constructor(
     override fun read(offset: Long, buf: ByteArray, bufOffset: Int, len: Int): Int {
         if (offset < 0 || offset >= size) return -1
 
+        ReadStats.readCalls++
         var done = 0
         var pos = offset
         while (done < len && pos < size) {
@@ -119,6 +143,7 @@ class MoovRelocatingSource private constructor(
                 }
             }
             if (seg == null) break
+            if (done > 0) ReadStats.segmentCrossings++
 
             val inSeg = pos - seg.virtualStart
             val n = minOf((len - done).toLong(), seg.length - inSeg).toInt()
@@ -148,6 +173,7 @@ class MoovRelocatingSource private constructor(
             done += got
             pos += got
         }
+        ReadStats.readBytes += done
         return if (done == 0) -1 else done
     }
 
@@ -187,6 +213,11 @@ class MoovRelocatingSource private constructor(
 
     companion object {
         private const val TAG = "FireflyMoov"
+
+        /** 需要搬 moov 时才会被调用（本来就在头部的文件原样返回，不计入）。 */
+        internal fun noteRelocated() {
+            ReadStats.relocatedOpens++
+        }
 
         private const val MAX_HEADER_BYTES = 32L * 1024 * 1024 // 只扫前 32MB 的 box 头
 
@@ -235,6 +266,7 @@ class MoovRelocatingSource private constructor(
             }
 
             Log.i(TAG, "moov 在 mdat 之后（$moov），移到头部再播")
+            noteRelocated()
 
             // 虚拟顺序：ftyp, moov, 其余按物理顺序
             val ordered = ArrayList<Atom>(atoms.size + 2)
@@ -279,6 +311,16 @@ class MoovRelocatingSource private constructor(
         /** 单个偏移项的最大增量，超过就认为是解析错了，不要冒险改写。 */
         private const val MAX_PATCH_OFFSET = 1L shl 40 // 1 TB
 
+        /**
+         * `stco` / `co64` 的头部长度：`size(4) + type(4) + version/flags(4) + entry_count(4)`。
+         *
+         * 偏移项**从第 16 字节开始**，`entry_count` 在第 12 字节。
+         */
+        private const val CHUNK_TABLE_HEADER = 16
+
+        /** 表头里 `entry_count` 的位置。 */
+        private const val CHUNK_COUNT_OFFSET = 12
+
         /** 在已缓存的 moov 上改写偏移。返回改写的项数；0 表示没找到表。 */
         private fun patchChunkOffsets(moov: ByteArray, delta: Long): Int {
             var patched = 0
@@ -291,14 +333,39 @@ class MoovRelocatingSource private constructor(
             return patched
         }
 
+        /**
+         * 改 32 位偏移表。
+         *
+         * ```
+         * [ size 4 ][ type 4 ][ version+flags 4 ][ entry_count 4 ][ 偏移 × N ]
+         *   off       off+4      off+8             off+12           off+16
+         * ```
+         *
+         * ## ⚠️ 这里曾经少算一个字段，后果是「两部 MP4 有画面没声音」
+         *
+         * 早先的实现把 `entry_count` 当成在 `off+8`、偏移项当成从 `off+8` 开始
+         * （等于把 `type` 那 4 个字节漏掉了）。于是：
+         *  - `version/flags` 被当成第一条偏移改掉；
+         *  - **`entry_count` 被改成 `N + delta`** —— 实测《大宅门》里
+         *    `70505 + 2535446 = 2605951`；
+         *  - 真正的 N 条偏移其实**都改对了**（只是整体被挪后 2 个位置）。
+         *
+         * 于是解复用器读到 260 万条偏移、越界 10,141,784 字节，日志里是
+         * `overread end of atom 'stco' by 10141784 bytes` + `wrong sample count`，
+         * 解析位置整个错位 —— **音轨当场废掉（解出来只剩视频一条轨）**，
+         * 表现就是「画面有、声音没有」，而视频因为 `stco` 恰好是该 trak 的最后一个
+         * box，反而侥幸能放。
+         *
+         * 为什么以前没被发现：`已改写 141014 个 chunk 偏移项` 这个数字看着很漂亮
+         * （真实值应是 141010 = 70505 × 2），而且「按偏移读到的字节是不是样本数据」
+         * 这类测试只验证了**偏移项**被改对，验证不到**表头字段被改坏**。
+         */
         private fun patchStco(b: ByteArray, off: Int, size: Int, delta: Long): Int {
-            // 4 字节 version/flags + 4 字节 entry_count，之后是 N 个 32 位偏移
-            val countOff = off + 4 + 4
-            if (size < 16 || countOff + 4 > b.size) return 0
-            val n = readUInt32(b, countOff - 4).toInt()
+            if (size < CHUNK_TABLE_HEADER) return 0
+            val n = readUInt32(b, off + CHUNK_COUNT_OFFSET).toInt()
             var done = 0
             for (i in 0 until n) {
-                val p = countOff + 4 * i
+                val p = off + CHUNK_TABLE_HEADER + 4 * i
                 if (p + 4 > off + size || p + 4 > b.size) break
                 val old = readUInt32(b, p)
                 val nv = old + delta
@@ -309,14 +376,13 @@ class MoovRelocatingSource private constructor(
             return done
         }
 
+        /** 改 64 位偏移表；表头布局与 [patchStco] 相同，区别只是每项 8 字节。 */
         private fun patchCo64(b: ByteArray, off: Int, size: Int, delta: Long): Int {
-            // 4 字节 version/flags + 4 字节 entry_count，之后是 N 个 64 位偏移
-            val countOff = off + 4 + 4
-            if (size < 20 || countOff + 4 > b.size) return 0
-            val n = readUInt32(b, countOff - 4).toInt()
+            if (size < CHUNK_TABLE_HEADER) return 0
+            val n = readUInt32(b, off + CHUNK_COUNT_OFFSET).toInt()
             var done = 0
             for (i in 0 until n) {
-                val p = countOff + 8 * i
+                val p = off + CHUNK_TABLE_HEADER + 8 * i
                 if (p + 8 > off + size || p + 8 > b.size) break
                 val old = readUInt64(b, p)
                 val nv = old + delta

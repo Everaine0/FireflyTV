@@ -38,6 +38,8 @@ android {
         listOf(
             "ff.smb.host", "ff.smb.share", "ff.smb.user",
             "ff.smb.pass", "ff.smb.domain", "ff.smb.root",
+            // 天气私钥是临时的、以后可能换，所以同样不写进仓库
+            "ff.weather.key", "ff.weather.location",
         ).forEach { key ->
             localSecrets[key]?.let { testInstrumentationRunnerArguments[key] = it }
         }
@@ -70,7 +72,7 @@ android {
     }
 
     buildFeatures {
-        buildConfig = false
+        buildConfig = true
         viewBinding = false
     }
 
@@ -113,6 +115,10 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
 
     testImplementation("junit:junit:4.13.2")
+    // 注意：**不要**指望给单测加一个真的 org.json。
+    // testOptions 里开了 returnDefaultValues，AGP 的 mockable-android.jar 会排在
+    // 依赖前面，`JSONObject.optString()` 照样返回 null（实测过）。
+    // 所以跟 JSON 有关的断言都放在 androidTest（见 WeatherClientParseTest）。
 
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test:runner:1.5.2")
