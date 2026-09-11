@@ -1268,9 +1268,11 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 
 | 项 | 值 |
 | :--- | :--- |
-| 构建 | 联网机器：`.\gradlew assembleDebug`；**本机：`.\build.ps1`**（本机访问不到 services.gradle.org，脚本直接用缓存里的 Gradle 8.11.1） |
+| 构建 | 联网机器：`.\gradlew assembleDebug`；**本机：`.\build.ps1`**（本机访问不到 services.gradle.org，脚本直接用缓存里的 Gradle 8.11.1）。WSL 里改代码、Windows 里构建时用 `scripts/win-build.sh`（**连 build.gradle.kts / proguard / AAR 一起同步**，只镜像 app/src 会「改了构建脚本却不生效」） |
 | 环境 | SDK `<Android SDK>`，JDK 17，Gradle 8.11.1（均已就绪） |
 | **ABI** | 必须含 `armeabi-v7a` + `arm64-v8a`（电视）+ **`x86`**（模拟器，缺了会直接崩） |
+| 正式包 | `.\build.ps1 assembleRelease` → `app-release.apk`（~25MB，debug 包 ~30MB）：R8 压缩 + 资源裁剪 + 去掉 `v/d/i` 日志（规则见 `app/proguard-rules.pro`）。**签名复用 debug keystore**，否则装不上电视上现有的包（换签名 = `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，卸载会清配置） |
+| R8 两个坑 | ①`net.engio.mbassy` 被写成 `net.engio.mbassador`（keep 规则等于没写，debug 包不压缩所以一直没症状）；②`javax.el.**` / `org.ietf.jgss.**` 是 Java SE 专有依赖，必须 `-dontwarn`，否则 R8 直接失败。**开 R8 的价值一半在这里** —— 它把「装上能开、一连 NAS 就崩」这类问题提到了构建期 |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
 | 测试 | `.\build.ps1 testDebugUnitTest`（**219 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |

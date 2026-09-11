@@ -624,21 +624,38 @@ r=电视剧|猫和老鼠 50周年珍藏版 157集|0|24940|1789134743020
 
 ```powershell
 # 本机（访问不到 services.gradle.org，脚本直接用缓存的 Gradle 8.11.1）
-.\build.ps1                      # 打 debug APK
-.\build.ps1 testDebugUnitTest    # 单元测试（195 项：农历/节气/缓存/导航/按键反馈/格式判定/解码策略/渲染通路/moov 改写/数据源约定/观看记录/天气策略/界面缩放/选码与 10bit 防线/帧率归因）
-.\build.ps1 connectedDebugAndroidTest   # 插桩测试（58 项：播放桥接/硬解通路/解码真值/编解码能力探测/轨道探针/配置页/真 NAS 联调/格式实测/SMB 吞吐/直播失败可见性/天气解析）
+.\build.ps1                      # 打 debug APK（模拟器用）
+.\build.ps1 assembleRelease      # 打正式包（电视用）
+.\build.ps1 testDebugUnitTest    # 单元测试（219 项：农历/节气/缓存/导航/按键反馈/格式判定/解码策略/渲染通路/moov 改写/数据源约定/观看记录/天气策略/界面缩放/选码与 10bit 防线/帧率归因/媒体库结构）
+.\build.ps1 connectedDebugAndroidTest   # 插桩测试（60 项：播放桥接/硬解通路/解码真值/编解码能力探测/轨道探针/配置页/真 NAS 联调/格式实测/SMB 吞吐/直播失败可见性/天气解析）
 ```
 
 联网机器上标准的 `.\gradlew assembleDebug` 同样可用。
 
 首次构建前需要补齐 `app/libs/` 下的 ijkplayer AAR —— 见 [`app/libs/README.md`](app/libs/README.md)。
 
-产物：
+产物（`release` 与 `debug` **同一个签名**，所以正式包能直接覆盖装在电视上的 debug 包，
+不必卸载、配置和观看记录都不会丢）：
 
-| 命令 | 产物 |
-| :--- | :--- |
-| `.\build.ps1` | `app\build\outputs\apk\debug\app-debug.apk` |
-| `.\build.ps1 assembleRelease` | `app\build\outputs\apk\release\app-release-unsigned.apk`（装机前需签名） |
+| 命令 | 产物 | 体积 |
+| :--- | :--- | :--- |
+| `.\build.ps1` | `app\build\outputs\apk\debug\app-debug.apk` | ~30 MB（三个 ABI 全带，模拟器 x86 能用） |
+| `.\build.ps1 assembleRelease` | `app\build\outputs\apk\release\app-release.apk` | ~25 MB（R8 压缩 + 资源裁剪） |
+
+**正式包做了什么**（`app/build.gradle.kts` + `app/proguard-rules.pro`）：
+
+- R8 压缩 + 摇树 + 资源裁剪；`v/d/i` 三档日志在正式包里被去掉（`w/e` 保留）；
+- 签名复用 debug keystore：电视上装的就是 debug 包，换签名会以
+  `INSTALL_FAILED_UPDATE_INCOMPATIBLE` 失败，而卸载会连配置一起清掉。
+  要换成真正的发布签名，在 `local.properties` 里加 `ff.keystore.*` 四项即可
+  （模板见 `local.properties.example`）；
+- 三个 ABI 都留在包里 = 同一个 APK 电视和模拟器都能装。只想给电视发小包的话，
+  把 `x86` 从 `abiFilters` 去掉可以再减 ~17 MB。
+
+> ⚠️ 这台机器是「WSL 里编辑、Windows 里构建」两头一套源码（Windows 侧 `<Windows 源码树>
+> 用 `scripts/win-build.sh` 构建 —— 它会连 `app/build.gradle.kts`、`proguard-rules.pro`、
+> ijkplayer AAR 一起同步过去。以前只同步 `app/src`，于是「改了构建脚本却不生效」，
+> 白忙过一轮。
 
 ## 测试与联调
 

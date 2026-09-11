@@ -45,7 +45,9 @@ android {
         }
 
         ndk {
-            // 电视 armeabi-v7a / arm64-v8a；模拟器 x86（缺了会直接崩）
+            // 电视 armeabi-v7a / arm64-v8a；模拟器 x86（缺了会直接崩）。
+            // 三个 ABI 都留在包里 = 同一个 APK 电视和模拟器都能装（正式包 ~28MB，
+            // 其中 native 库占 24MB）。只想给电视发小包的话，把 x86 去掉即可减 17MB。
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86")
         }
     }
@@ -55,8 +57,20 @@ android {
             isMinifyEnabled = false
         }
         release {
-            isMinifyEnabled = false
+            // 正式包：压缩 + 摇树 + 去掉资源里没人引用的东西。
+            // 规则见 proguard-rules.pro（ijkplayer 的 JNI 回调、smbj/bcprov 的反射、
+            // zxing 都要 keep，否则是「装上能开、一播就崩」那类最难查的问题）。
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+
+            // ⚠️ 正式包**复用 debug 签名**，这是有意的：
+            // 电视上现在装的就是 debug 包，签名不同会直接装不上去（INSTALL_FAILED_UPDATE_INCOMPATIBLE），
+            // 而卸载会把配置和观看记录一起清掉 —— 用户得重新扫码填一遍 NAS。
+            // 将来要换成真正的发布签名，就在 local.properties 里加
+            //   ff.keystore.path / ff.keystore.pass / ff.keystore.alias / ff.keystore.keypass
+            // 然后把这一行改成用它（模板见 local.properties.example）。
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
