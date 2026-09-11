@@ -77,17 +77,21 @@ class ConfigServerTest {
             // 页面脚本从 location.search 读 token 再回填到请求里，
             // 所以这里只要确认「脚本会带上 t 参数」即可
             assertTrue("页面脚本没把 token 带上请求", ok.body.contains("o.set('t', t)"))
+            // 「先测试一下」按钮已按要求去掉：保存那条路本来就会逐项实测，
+            // 页面上少一个入口就少一处要维护的东西。
+            assertFalse("配置页不该再出现「先测试一下」按钮", ok.body.contains("btnTest"))
+            assertFalse("配置页不该再出现「先测试一下」文案", ok.body.contains("先测试一下"))
         } finally {
             server.stop()
         }
     }
 
     @Test
-    fun 测试接口会逐项报错而不是笼统失败() {
+    fun 保存接口会逐项报错而不是笼统失败() {
         val server = ConfigServer(context) {}
         assertTrue(server.start())
         try {
-            val url = "http://127.0.0.1:${server.port}/api/test?t=${server.token}"
+            val url = "http://127.0.0.1:${server.port}/api/save?t=${server.token}"
 
             // 全部留空：SMB 是必填，必须给出原因；天气可选，留空算通过
             val empty = request("POST", url, mapOf("t" to server.token))
@@ -148,7 +152,7 @@ class ConfigServerTest {
         val server = ConfigServer(context) {}
         assertTrue(server.start())
         try {
-            val url = "http://127.0.0.1:${server.port}/api/test?t=${server.token}"
+            val url = "http://127.0.0.1:${server.port}/api/save?t=${server.token}"
             // 天气三项全空 + SMB 填了但连不上：整体仍失败（SMB 是必填），
             // 但天气那一项不能算失败，否则没 Key 的人过不了配置页。
             // 措辞必须是「跳过」而不是「连接成功」—— 跳过不等于通过。
@@ -171,7 +175,7 @@ class ConfigServerTest {
         val server = ConfigServer(context) {}
         assertTrue(server.start())
         try {
-            val url = "http://127.0.0.1:${server.port}/api/test?t=${server.token}"
+            val url = "http://127.0.0.1:${server.port}/api/save?t=${server.token}"
             // 密码/地址里常见的特殊字符必须能正确解码；
             // 如果服务端只读 query 不读 body，这里就会退化成「请填写 NAS 地址」
             val res = request(

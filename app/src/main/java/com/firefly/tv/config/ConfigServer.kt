@@ -135,8 +135,6 @@ class ConfigServer(
             method == "GET" && (route == "/" || route == "/index.html") ->
                 respond(out, 200, "text/html; charset=utf-8", page())
 
-            method == "POST" && route == "/api/test" -> respondJson(out, testAll(params))
-
             method == "POST" && route == "/api/save" -> respondJson(out, save(params))
 
             else -> respond(out, 404, "text/plain; charset=utf-8", "not found")
@@ -144,14 +142,15 @@ class ConfigServer(
     }
 
     /**
-     * 逐项实测。SMB 是必填项，天气是可选项（DESIGN §2）。
+     * 保存前逐项实测。SMB 是必填项，天气是可选项（DESIGN §2）。
      *
      * 天气做成可选的原因：老人看电视不依赖天气，而和风要单独申请 Key。
      * 为了填天气而卡住「连 NAS 看电视」是反的。留空就跳过，填了就必须测通。
      * 返回 JSON：{"ok":bool,"smb":"...","weather":"..."}，成功项文案为「连接成功」。
+     *
+     * 页面上原来还有一个「先测试一下」按钮走 `/api/test`（只检查不保存），
+     * 已按用户要求去掉：保存这条路本来就会实测，多一个按钮只是多一处要维护的入口。
      */
-    private fun testAll(p: Map<String, String>): String = result(testSmb(p), testWeather(p))
-
     private fun save(p: Map<String, String>): String {
         val smbMsg = testSmb(p)
         val wMsg = testWeather(p)
@@ -348,7 +347,6 @@ class ConfigServer(
   button { width:100%; padding:16px; font-size:18px; font-weight:600; border:0;
            border-radius:12px; background:var(--accent); color:#241a05; margin-top:20px; }
   button:disabled { opacity:.5; }
-  button.test { background:#3a322c; color:var(--fg); margin-top:22px; }
   .msg { margin-top:16px; padding:13px 14px; border-radius:10px; font-size:15px; display:none; white-space:pre-line; }
   .msg.err { display:block; background:#3a1f1c; color:var(--err); }
   .msg.ok  { display:block; background:#1e3320; color:var(--ok); }
@@ -430,7 +428,6 @@ class ConfigServer(
     也可以填城市名（如「北京」）；有些地名套餐里没权限，这时改用坐标一定行</div>
 </section>
 
-<button class="test" id="btnTest" type="button">先测试一下</button>
 <button id="btnSave" type="button"><span id="spin"></span>保存并开始使用</button>
 <div id="bar"></div>
 <div class="msg" id="msg"></div>
@@ -484,10 +481,6 @@ function busy(on) {
   bar.style.display = on ? 'block' : 'none';
 }
 
-// 「先测试一下」只检查，不会保存、也不会开始播放 —— 文案必须说清楚，
-// 否则用户以为已经生效，看着电视还停在二维码页会一头雾水。
-document.getElementById('btnTest').onclick = e =>
-  call('/api/test', e.target, '检查通过。确认没问题后，请点下面的「保存并开始使用」。');
 document.getElementById('btnSave').onclick = async e => {
   busy(true);
   msg.className = 'msg';
@@ -495,7 +488,6 @@ document.getElementById('btnSave').onclick = async e => {
   busy(false);
   if (ok) {
     document.getElementById('btnSave').disabled = true;
-    document.getElementById('btnTest').disabled = true;
   }
 };
 </script>

@@ -2,8 +2,6 @@ package com.firefly.tv.ui
 
 import android.content.Intent
 import android.graphics.Color
-import android.graphics.PixelFormat
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
@@ -17,12 +15,9 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.appcompat.app.AppCompatActivity
-import com.firefly.tv.BuildConfig
 import com.firefly.tv.config.ConfigServer
 import com.firefly.tv.core.Config
 import com.firefly.tv.core.Lunar
-import com.firefly.tv.diag.DiagHub
-import com.firefly.tv.diag.Knobs
 import com.firefly.tv.media.AudioSupport
 import com.firefly.tv.media.Library
 import com.firefly.tv.media.LibraryCache
@@ -98,7 +93,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 所以临时打开的文件要记在这儿，重播时优先认它；一旦走正常导航
      * （[playEpisode] / [playChannel]）就清掉，不干扰老人正常看电视。
      */
-    private var adHocPath: String? = null
 
     /** 当前在播什么。按**库类型**判断，不看名字 —— 否则直播和剧集的状态会串味。 */
     private fun contentKind(): AudioFocusPolicy.Content = when (libraries.getOrNull(libIndex)) {
@@ -216,10 +210,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 上次的天气先顶上，过期了在浮层里再联网刷（省心知那边的调用次数）
         restoreWeatherCache()
 
-        // 远程诊断通道：电视上只有画面、没有 adb，这是这一轮排查唯一的「仪表盘」。
-        // 只在 debug 构建开（见 diagControl）；面板上的「远程」那一行会显示它的地址。
-        if (EXPERIMENTS) DiagHub.start(this, diagControl)
-
         // 缓存读盘放在 IO 线程，别在主线程碰 SharedPreferences
         ioHandler.post {
             cache = readCache()
@@ -240,10 +230,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         surfaceView = SurfaceView(this)
-        // 格式 / 层级 / 固定尺寸只有**建面之前**设才有意义，所以在这里就按旋钮落一次。
-        // 老代码在这里写死 `setFormat(PixelFormat.RGBA_8888)`（抄来的），而带 alpha 的
-        // 格式提示有可能把视频层挤出硬件叠加通路 —— 默认改成不设格式提示（见 [applySurfaceKnobs]）。
-        applySurfaceKnobs()
+        // 这里**故意什么都不设**：格式 / 层级 / 固定尺寸都保持 SurfaceView 的默认值。
+        // 老代码写死过 `setFormat(PixelFormat.RGBA_8888)`（抄来的），而带 alpha 的格式提示
+        // 会把这一层变成非不透明层、逼 SurfaceFlinger 多合成一次 —— 实测这条路没有任何好处。
+        // （四种格式提示 / 三种层级 / 固定 1080p 面都量过，送显帧率与默认值没有差别。）
         surfaceView.holder.addCallback(this@MainActivity)
         root.addView(surfaceView, matchParent())
 
@@ -293,88 +283,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         // 尺寸变化由 SurfaceView 自己处理，播放器只认 surface 对象。
-        // 但要**记一笔**：解码器把面重配成 4K 时会再回调一次，这条历史是
-        // 「视频层到底在搬 1080p 还是 4K」的直接证据（见 surfaceChanges）。
-        surfaceChanges += "${System.currentTimeMillis() % 100000}ms:${width}×${height}@$format"
-        if (surfaceChanges.size > 6) surfaceChanges.removeAt(0)
+        // 解码器把面重配成 4K 时会再回调一次，日志里能看出来（排查 4K 时用过）。
         Log.i(TAG, "Surface 变化：${width}×${height} format=$format")
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         surfaceReady = false
         engine.detachSurface()
-    }
-
-    /**
-     * 按旋钮设置**视频层**：格式提示 / 前后层级 / 固定尺寸 / 窗口底色（见 [Knobs]）。
-     *
-     * 这四个变量都必须**在建面之前**设，所以只在两处调用：`buildViews()`（首次建面之前）
-     * 和 [applyKnobs]（先销毁再重建）。
-     *
-     * 为什么要做成旋钮：电视上 4K **HEVC** 只有 18 帧，而当时以为是像素率卡在
-     * 150~200 Mpx/秒 —— GPU 合成 / 视频层被窗口拖住 / 显示通路搬不动 4K，
-     * 这三种解释各对应一个开关，只有**一项一项换、一项一项量**才能分清，
-     * 而这些开关全都是「建面前的一锤子买卖」，改一个就要重播一次。
-     *
-     * （2026-09-12 实机结论：这些开关全部无效，但原因不是「4K 显示通路吃不下」——
-     *  4K **H.264** 在同一台机器上送显中位 50.0 帧/秒。真正封顶的是 HEVC 解码块，
-     *  见 [com.firefly.tv.player.PlaybackVerdict.HEVC_DECODE_MPX]。）
-     */
-    private fun applySurfaceKnobs() {
-        val holder = surfaceView.holder
-        // 1) 格式提示。`unknown` = 连 setFormat 都不调，交给 SurfaceView 的默认值
-        runCatching {
-            if (Knobs.needsSetFormat(this)) {
-                holder.setFormat(Knobs.surfaceFormat(this) ?: PixelFormat.OPAQUE)
-            }
-        }
-        // 2) 层级：top = 视频层浮在窗口之上（窗口就不用再合成到视频上）；media = 浮在窗口但低于顶层
-        runCatching {
-            when (Knobs.zOrder(this)) {
-                "top" -> {
-                    surfaceView.setZOrderMediaOverlay(false)
-                    surfaceView.setZOrderOnTop(true)
-                }
-
-                "media" -> {
-                    surfaceView.setZOrderOnTop(false)
-                    surfaceView.setZOrderMediaOverlay(true)
-                }
-
-                else -> {
-                    surfaceView.setZOrderOnTop(false)
-                    surfaceView.setZOrderMediaOverlay(false)
-                }
-            }
-        }
-        // 3) 固定尺寸：这是「让解码器别吐 4K、直接吐 1080p」的赌注。
-        //    MediaCodec 的输出缓冲尺寸通常是按**片源**定的（ACodec 自己 set_buffers_dimensions），
-        //    所以这一条大概率无效 —— 但代价只有一行，量一次就能确认。
-        runCatching {
-            when (Knobs.fixedSize(this)) {
-                "hd1080" -> holder.setFixedSize(1920, 1080)
-                "screen" -> {
-                    @Suppress("DEPRECATION")
-                    val d = windowManager.defaultDisplay
-                    holder.setFixedSize(d.width, d.height)
-                }
-
-                else -> holder.setSizeFromLayout()
-            }
-        }
-        // 4) 窗口底色：透明的话 SurfaceFlinger 理论上可以少合成一层
-        runCatching {
-            window.setBackgroundDrawable(
-                android.graphics.drawable.ColorDrawable(
-                    if (Knobs.transparentWindow(this)) Color.TRANSPARENT else Color.BLACK,
-                ),
-            )
-        }
-        Log.i(
-            TAG,
-            "视频层：格式=${Knobs.get(this, Knobs.K_FORMAT)} 层级=${Knobs.zOrder(this)} " +
-                "固定=${Knobs.fixedSize(this)} 窗口底=${Knobs.get(this, Knobs.K_WINDOW_BG)}",
-        )
     }
 
     /** Surface 现在到底能不能用（按对象问，不靠标志位猜）。 */
@@ -611,30 +526,24 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private var lastDiagKeyAt = 0L
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        // 诊断页：**双击**遥控器上的「设置 / 信息」键打开；打开以后同一颗键**单击**就切换实验。
+        // 诊断页：**双击**遥控器上的「设置 / 信息」键打开，**OK 键关闭**。
         //
         // 为什么是双击不是单击：用户实测这台电视的「信息」键其实就是**设置键**，
         // 单击就弹一屏字太重（也容易和别的功能撞车）。双击误触概率极低，
-        // 而且不用记组合键；打开之后 **OK 键关闭**。
+        // 而且不用记组合键。
         //
-        // 又为什么用同一颗键切换实验：用户的遥控器**没有数字键**（老人机遥控器的常态），
-        // 所以「打开用双击、打开后单击切换」是这台遥控器上唯一可行的两档操作。
+        // （清理版说明：这里原来还有「打开面板后单击切实验方案」，
+        //   那是配合远程诊断口的实验台；实验台已移除，见 README「诊断页」一节。）
         when (event.keyCode) {
             KeyEvent.KEYCODE_INFO, KeyEvent.KEYCODE_MENU, KEYCODE_SETTINGS -> {
                 if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
-                    if (diagScreen.visibility == View.VISIBLE && EXPERIMENTS) {
-                        // 面板开着：单击 = 切到下一个实验方案（会重播）
+                    val now = System.currentTimeMillis()
+                    if (now - lastDiagKeyAt <= DIAG_DOUBLE_CLICK_MS) {
                         lastDiagKeyAt = 0L
-                        applyPreset((experimentIndex + 1) % Knobs.PRESETS.size)
+                        toggleDiag()
                     } else {
-                        val now = System.currentTimeMillis()
-                        if (now - lastDiagKeyAt <= DIAG_DOUBLE_CLICK_MS) {
-                            lastDiagKeyAt = 0L
-                            toggleDiag()
-                        } else {
-                            lastDiagKeyAt = now
-                            Log.i(TAG, "收到设置/信息键（keyCode=${event.keyCode}），再按一次开诊断页")
-                        }
+                        lastDiagKeyAt = now
+                        Log.i(TAG, "收到设置/信息键（keyCode=${event.keyCode}），再按一次开诊断页")
                     }
                 }
                 return true
@@ -666,78 +575,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             return
         }
         toggleOverlay()
-    }
-
-    // ---- 实验旋钮（远程可调；见 com.firefly.tv.diag.Knobs / DiagHub）----
-    //
-    // 现场问题（长虹 43Q3T：3840×2160@25 的《大宅门》只有送显 18.2 帧）需要
-    // 「换一个变量、量一次数字」，而电视在用户家里，我没有 adb。
-    // 所以做了一条局域网 HTTP 通道（DiagHub），变量做成了运行时可写的旋钮：
-    // 我在这边改、电视那边当场重播，用户在电视前看画面就行。
-    // 面板上单击「设置键」= 按顺序换预设方案，和 HTTP 上 `GET /preset?n=N` 等价。
-
-    /** 当前方案（预设）序号；-1 = 当前旋钮组合不对应任何一档预设（被单独改过）。 */
-    private var experimentIndex = 0
-
-    /**
-     * 把旋钮落到实际的地方，然后（可选）重播。
-     *
-     * 分两类：
-     *  - **建面前的一锤子买卖**（[applySurfaceKnobs]）：格式/层级/固定尺寸/窗口底色；
-     *  - **起播前才读的选项**：ijkplayer 的 `setOption` 只在下一次 `newPlayer()` 时读，
-     *    所以只要重播就自然生效，这里不用管。
-     *
-     * Surface 的重建用「先 INVISIBLE 再 VISIBLE」来触发（`surfaceDestroyed` → 重新
-     * `surfaceCreated`）。不这么做的话 `setFormat` 对已经建好的面毫无作用，
-     * 量出来的数字其实还是上一档的 —— 那种「改了没反应」最容易把人带偏。
-     */
-    private fun applyKnobs(replay: Boolean, resumeMs: Long? = null) {
-        val pos = resumeMs ?: engine.positionMs()
-        DiagHub.log("应用旋钮：${Knobs.nonDefault(this).joinToString(" ") { "${it.first}=${it.second}" }.ifEmpty { "（全默认）" }}")
-        rebuildSurfaceView()
-        if (!replay) return
-        replayCurrent(pos)
-    }
-
-    /**
-     * 把 SurfaceView 整个换一只新的。
-     *
-     * 为什么要「整个换」而不是改属性 + INVISIBLE/VISIBLE：[applySurfaceKnobs] 里那几项
-     * （`setFormat` / `setZOrderOnTop` / `setZOrderMediaOverlay` / `setFixedSize`）
-     * **按文档都只能在建面之前设**。面已经存在时再调，轻则被忽略、重则抛异常，
-     * 而表现是一样的：**改了没反应**。第一轮实机扫档时「视频层层级」两档量出来
-     * 和默认一模一样，我现在不能确定那是「层级真的不影响」还是「压根没生效」——
-     * 所以宁可换一只新 View，把「建面之前」这件事做实。
-     *
-     * 顺序很关键：先摘下来（触发 surfaceDestroyed → 引擎解绑），
-     * 新建一只、**先设旋钮**、再挂回调、最后按原位置放回去（触发 surfaceCreated → 重新起播）。
-     * 起播请求在面还没建好时会走 [pendingEpisode] 排队，这正是已有机制。
-     */
-    private fun rebuildSurfaceView() {
-        val parent = surfaceView.parent as? ViewGroup
-        if (parent == null) {
-            // 还没挂上去（buildViews 阶段）：直接设就行
-            runCatching { applySurfaceKnobs() }
-            return
-        }
-        val index = parent.indexOfChild(surfaceView)
-        val lp = surfaceView.layoutParams
-        parent.removeView(surfaceView)
-        surfaceView = SurfaceView(this)
-        runCatching { applySurfaceKnobs() }
-        surfaceView.holder.addCallback(this)
-        parent.addView(surfaceView, index, lp)
-    }
-
-    /** 切到第 [index] 个预设方案并重播。返回一句给人看的结果。 */
-    private fun applyPreset(index: Int, replay: Boolean = true): String {
-        val i = Knobs.applyPreset(this, index)
-        experimentIndex = i
-        val label = Knobs.PRESETS[i].label
-        Log.i(TAG, "实验方案 ${i + 1}/${Knobs.PRESETS.size}：$label")
-        applyKnobs(replay = replay)
-        DiagHub.boostNow()
-        return "${i + 1}/${Knobs.PRESETS.size} $label"
     }
 
     private inline fun consume(event: KeyEvent, action: () -> Unit): Boolean {
@@ -1292,7 +1129,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private fun playEpisode(startMs: Long) {
         val lib = libraries.getOrNull(libIndex) as? Library.Video ?: return
-        adHocPath = null // 走正常导航了，临时点名的文件作废
         val ep = episodes.getOrNull(episodeIndex) ?: return
         // 真有东西要播了：把「连续空剧」的计数清掉（它只用来给自动换剧封顶）
         emptyShowStreak = 0
@@ -1446,9 +1282,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun playChannel() {
         val ch = channels.getOrNull(channelIndex) ?: return
         currentTitle = ch.name
-        // 换台就是走正常导航了：诊断页那行「临时文件」得跟着作废，
-        // 否则会挂着上一次 `open` 打开的测试片路径（实机看到过 live+file 这种四不像状态）
-        adHocPath = null
         announce(ch.name) // 立刻出频道名，换台不能看起来没反应
         // 上一个频道留下的「信号中断」提示要马上撤掉，否则换到好频道也还挂着那句话
         showFault(null)
@@ -1496,9 +1329,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         renderHud()
         // 进诊断页时把起点归零，否则第一次读到的「读取速率」是上一段时间的平均值
         lastDiagTraffic = -1L
-        // 当前方案（旋钮组合）同步成真值：进程重启后引擎侧会回到默认值，
-        // 而面板要显示的是「现在跑的是哪一档」，不是「上次按到过哪一档」
-        if (EXPERIMENTS) experimentIndex = Knobs.presetIndex(this).coerceAtLeast(0)
         renderDiag()
         diagScreen.visibility = View.VISIBLE
         main.removeCallbacks(diagTick)
@@ -1643,28 +1473,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             )
         }
 
-        // 9) 实验方案：单击「设置键」当场切换（会重播）。
-        //    组合对不上任何一档预设时，直接把非默认的旋钮列出来 ——
-        //    否则「远程改了单个旋钮」之后面板会显示成上一档，看的人会被误导。
-        if (EXPERIMENTS) {
-            val pi = Knobs.presetIndex(this)
-            val label = if (pi >= 0) {
-                "${pi + 1}/${Knobs.PRESETS.size} ${Knobs.PRESETS[pi].label}"
-            } else {
-                // 自定义组合：只列前两项 —— 多了会把这一行撑成三行、把面板顶出屏幕
-                val nd = Knobs.nonDefault(this)
-                "自定义 " + nd.take(2).joinToString(" ") { "${it.first}=${it.second}" } +
-                    if (nd.size > 2) " 等${nd.size}项" else ""
-            }
-            lines += DiagScreen.Line("实验", "$label（设置键切换，会重播）", warn = pi != 0)
-        }
-
-        // 10) 远程诊断地址：用户要把它念给我（没网时说明白是「没有网络」而不是空白）
-        if (EXPERIMENTS) {
-            lines += DiagScreen.Line("远程", DiagHub.url ?: "没有网络，开不了远程诊断")
-        }
-
-        // 11) 正在播什么（用户报问题时对着这一行说就够了）
+        // 9) 正在播什么（用户报问题时对着这一行说就够了）
         lines += DiagScreen.Line("内容", currentTitle.ifBlank { "—" })
 
         return lines
@@ -1673,219 +1482,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun renderDiag() {
         diagScreen.show("播放诊断", diagRows(), "OK 键关闭（30 秒后自动关闭）")
     }
-
-    // ---- 远程诊断（局域网 HTTP；见 com.firefly.tv.diag.DiagHub）----
-    //
-    // 用户提的办法（原话）：「你可以从这个接口看到你想要的数据并进行简单操作」。
-    // 电视上只有画面、没有 adb，而这次要查的恰恰是「换一个变量、量一次数字」，
-    // 于是把现场快照 + 几个动作暴露成 HTTP：我在这边读数字/改旋钮，用户在电视前看画面。
-    //
-    // 两个设计约束：
-    //  - **只在 debug 构建里开**（release 不该留一个无鉴权端口）；
-    //  - **面板和接口同一份数据**（都走 [diagRows]），避免「他说 18.2、我看到 25」这种分歧。
-
-    private val diagControl = object : DiagHub.Control {
-
-        override fun state(): DiagHub.Live {
-            val d = engine.diag()
-            val u = ui()
-            val dm = u.metrics
-            val rows = runCatching { diagRows() }.getOrDefault(emptyList())
-            val frame = runCatching { surfaceView.holder.surfaceFrame }.getOrNull()
-            val verdictRow = rows.firstOrNull { it.label == "结论" }
-            return DiagHub.Live(
-                title = currentTitle,
-                kind = engine.kindName().ifEmpty {
-                    if (contentKind() == AudioFocusPolicy.Content.Live) "live" else "on_demand"
-                } + if (adHocPath != null) "+file" else "",
-                libraryName = libraries.getOrNull(libIndex)?.name.orEmpty(),
-                libraryIndex = libIndex,
-                libraries = libraries.map { it.name },
-                showName = showName,
-                showCount = shows.size,
-                episodeCount = episodes.size,
-                fault = runCatching { faultScreen.current() }.getOrDefault(""),
-                positionMs = engine.positionMs(),
-                durationMs = engine.durationMs(),
-                screenW = dm.widthPixels,
-                screenH = dm.heightPixels,
-                dpi = dm.densityDpi,
-                density = dm.density,
-                refreshHz = refreshRateHz(),
-                uiScale = u.scale,
-                surfaceW = surfaceView.width,
-                surfaceH = surfaceView.height,
-                // SurfaceHolder 报的**面**尺寸：如果解码器把面重配成了 4K，这里会跟着变
-                surfaceFrame = if (frame != null) "${frame.width()}×${frame.height()}" else "",
-                surfaceFormat = Knobs.get(this@MainActivity, Knobs.K_FORMAT),
-                surfaceZOrder = Knobs.zOrder(this@MainActivity),
-                surfaceFixed = Knobs.fixedSize(this@MainActivity),
-                videoW = d.videoWidth,
-                videoH = d.videoHeight,
-                sourceFps = d.sourceFps,
-                decodeFps = d.decodeFps,
-                presentFps = d.outputFps,
-                dropRatio = d.dropFps,
-                cachedMs = d.cachedMs,
-                cachedBytes = d.cachedBytes,
-                trafficBytes = d.trafficBytes,
-                bitRateBps = d.bitRateBps,
-                decoder = when (d.decoder) {
-                    PlaybackEngine.Decoder.HARDWARE -> "hardware"
-                    PlaybackEngine.Decoder.SOFTWARE -> "software"
-                    PlaybackEngine.Decoder.UNKNOWN -> "unknown"
-                },
-                decoderName = d.decoderName,
-                videoModule = d.videoModule,
-                videoImpl = d.videoImpl,
-                audioCodec = d.audioCodec,
-                audioStarted = audioStarted,
-                requestedHardware = d.requestedHardware,
-                codecOffered = d.codecOffered,
-                silentFallbacks = d.silentFallbacks,
-                banned = d.bannedCodecs,
-                prepared = prepared,
-                panelVisible = diagScreen.visibility == View.VISIBLE,
-                verdict = verdictRow?.value.orEmpty(),
-                verdictProblem = verdictRow?.warn == true,
-                panelRows = rows.map { DiagHub.Row(it.label, it.value) },
-                extra = extraRows(),
-            )
-        }
-
-        override fun act(a: DiagHub.Act): String = when (a.name) {
-            // 方案号从 1 开始（面板上写的就是「3/12」），0/缺省 = 下一档
-            "preset" -> {
-                val n = a.int("n", 0)
-                applyPreset(if (n <= 0) (experimentIndex + 1) % Knobs.PRESETS.size else n - 1)
-            }
-
-            "preset_next" -> applyPreset((experimentIndex + 1) % Knobs.PRESETS.size)
-
-            // 旋钮已经在 DiagHub 里写进 prefs 了，这里只管「重新建面 + 重播」让它生效
-            "set", "reset" -> {
-                applyKnobs(replay = a.bool("replay", true))
-                "旋钮已生效" + if (a.bool("replay", true)) "，正在重播" else ""
-            }
-
-            "replay" -> {
-                applyKnobs(replay = true, resumeMs = a.long("ms", -1L).takeIf { it >= 0 })
-                "已重播"
-            }
-
-            "pause" -> {
-                engine.pause()
-                "已暂停"
-            }
-
-            "resume" -> {
-                engine.resume()
-                "已继续"
-            }
-
-            "seek" -> {
-                val d = a.long("d", Long.MIN_VALUE)
-                val ms = if (d != Long.MIN_VALUE) engine.positionMs() + d else a.long("ms", 0L)
-                engine.seekTo(ms)
-                "已跳到 $ms 毫秒"
-            }
-
-            // 直接开一个 NAS 上的文件：让我能换片源对比（例如找一份 1080p 的《大宅门》）
-            "open" -> {
-                val path = a.str("path")
-                if (path.isBlank()) {
-                    "要给 path（相对共享根目录，例如 电视剧/大宅门/01.mkv）"
-                } else {
-                    adHocPath = path
-                    currentTitle = a.str("title", path.substringAfterLast('/'))
-                    playEpisodeNow(path, a.long("ms", 0L))
-                    "正在打开 $path"
-                }
-            }
-
-            "panel" -> {
-                if (a.bool("on", true)) {
-                    if (diagScreen.visibility != View.VISIBLE) toggleDiag()
-                } else {
-                    hideDiag()
-                }
-                "面板" + if (diagScreen.visibility == View.VISIBLE) "已打开" else "已关闭"
-            }
-
-            "key" -> when (a.str("n").lowercase()) {
-                "ok", "center", "enter" -> {
-                    onOkPressed(); "ok"
-                }
-
-                "left" -> {
-                    switchLibrary(-1); "left"
-                }
-
-                "right" -> {
-                    switchLibrary(+1); "right"
-                }
-
-                "up" -> {
-                    switchShowOrChannel(-1); "up"
-                }
-
-                "down" -> {
-                    switchShowOrChannel(+1); "down"
-                }
-
-                "settings", "menu", "info" -> {
-                    toggleDiag(); "settings"
-                }
-
-                else -> "认不得这个键：${a.str("n")}"
-            }
-
-            "stop" -> {
-                engine.stop()
-                "已停"
-            }
-
-            "state" -> "state 走 /state"
-
-            else -> "认不得这个动作：${a.name}（可用：preset/preset_next/set/reset/replay/pause/resume/seek/open/panel/key/stop）"
-        }
-    }
-
-    /** 远程快照里的「杂项」行：旋钮、面尺寸变化历史、媒体与构建信息。 */
-    private fun extraRows(): List<DiagHub.Row> {
-        val rows = ArrayList<DiagHub.Row>(6)
-        val pi = Knobs.presetIndex(this)
-        rows += DiagHub.Row(
-            "预设",
-            if (pi >= 0) "${pi + 1}/${Knobs.PRESETS.size} ${Knobs.PRESETS[pi].label}" else "自定义",
-        )
-        rows += DiagHub.Row(
-            "非默认旋钮",
-            Knobs.nonDefault(this).joinToString(" ") { "${it.first}=${it.second}" }.ifEmpty { "（无）" },
-        )
-        rows += DiagHub.Row("面尺寸变化", surfaceChanges.joinToString(" ").ifEmpty { "（没报过）" })
-        rows += DiagHub.Row("媒体", "${engine.diag().videoModule ?: "?"} / ${engine.diag().videoImpl ?: "?"}")
-        rows += DiagHub.Row("构建", "debug=${BuildConfig.DEBUG} abi=${Build.SUPPORTED_ABIS.joinToString(",")}")
-        rows += DiagHub.Row("线程提权", if (Knobs.boostThreads(this)) "开" else "关")
-        rows += DiagHub.Row("临时文件", adHocPath ?: "（无，正在播库里的内容）")
-        val io = com.firefly.tv.player.ReadStats
-        rows += DiagHub.Row(
-            "读路径",
-            "moov 搬运 ${io.relocatedOpens} 次 · 搬运路径读 ${io.readCalls} 次 / " +
-                "${io.readBytes / 1024} KB · 平均 ${io.avgBytes()} 字节/次 · 跨段 ${io.segmentCrossings}" +
-                "（平均读长度小 = 上层在按小块反复读，那才是要修的读放大）",
-        )
-        return rows
-    }
-
-    /**
-     * Surface 的尺寸/格式变化历史。
-     *
-     * 这条历史能直接回答一个关键问题：**视频层的缓冲到底是 1080p 还是 4K**。
-     * 解码器把面重配成 4K 时 SurfaceFlinger 会再回调一次 `surfaceChanged`，
-     * 所以「只有 1920×1080」和「先是 1920×1080、后来 3840×2160」是两种完全不同的证据。
-     */
-    private val surfaceChanges = ArrayList<String>(6)
 
     private var lastWeather: WeatherClient.Now? = null
 
@@ -2060,8 +1656,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 拿它去 seek 就是长时间音画不同步 —— 用户实测到的正是这个。
      */
     private fun replayCurrent(resumeMs: Long) {
-        // 远程临时打开的文件优先：切实验档位时不能把被测对象换掉
-        adHocPath?.let { playEpisodeNow(it, resumeMs); return }
         when (libraries.getOrNull(libIndex)) {
             is Library.Video -> if (episodes.isNotEmpty()) playEpisode(resumeMs)
             is Library.Live -> if (channels.isNotEmpty()) playChannel()
@@ -2235,8 +1829,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         runCatching { tts.shutdown() }
         runCatching { abandonAudioFocus() }
         runCatching { closeConfigServer() }
-        // 只解绑界面层；HTTP 服务留着继续跑（Activity 重建后要能接着读数字）
-        runCatching { DiagHub.release(diagControl) }
         configScreen.recycle()
         runCatching { SmbStore.drop() }
         runCatching { io.quitSafely() }
@@ -2247,8 +1839,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         private const val TAG = "FireflyTV"
         private const val TAG_TRACE = "FireflyTrace"
 
-        /** 排查切库/按键问题时改成 true，用 `adb logcat -s FireflyTrace` 看调用链。 */
-        private const val DEBUG_TRACE = true
+        /**
+         * 排查切库/按键问题时改成 true，用 `adb logcat -s FireflyTrace` 看调用链。
+         *
+         * 默认关：电视上没有 adb，开着只会白刷 logcat；[trace] 的调用点全都留着，
+         * 下次排查改这一个常量就够了。
+         */
+        private const val DEBUG_TRACE = false
         private const val OVERLAY_MS = 10_000L
         private const val RETRY_MS = 10_000L
         private const val POSITION_INTERVAL_MS = 5_000L
@@ -2269,14 +1866,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
          * 留 1 秒是给「按得慢的遥控器」余量（实测某些遥控器的按键上报本身就有 300ms 抖动）。
          */
         private const val DIAG_DOUBLE_CLICK_MS = 1000L
-
-        /**
-         * 实验通道开关（诊断页、方案切换、局域网远程诊断都挂在它上面）。
-         *
-         * 绑在 `BuildConfig.DEBUG` 上是有意的：远程诊断那条通道**没有鉴权**
-         * （用户要求「怎么简单怎么来」），不该出现在正式包里。
-         */
-        private val EXPERIMENTS = BuildConfig.DEBUG
 
         /** 部分遥控器的「设置」键报这个 keyCode（不是 KEYCODE_MENU）。 */
         private const val KEYCODE_SETTINGS = 176

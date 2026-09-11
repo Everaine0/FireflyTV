@@ -48,53 +48,38 @@
 硬解静默回落 → 读取跟不上 → 缓存见底 → 送显低于片源 → 解码跟不上。
 每一行都来自播放器真值，不做推算；取不到的（例如某些流没有 `avg_frame_rate`）显示 0 而不是瞎猜。
 
-## 远程诊断口（debug 包；电视在别人家里时用它量数字）
+## 诊断页 = 唯一的排查入口
 
-「4K 送显只有 18 帧」这类问题必须**换一个变量、量一次数字**，而在电视上改一行代码
-要重装一次 APK。所以 debug 包里开了一个**无鉴权**的局域网 HTTP 口（`DiagHub`，端口 **8642**），
-面板上「远程」那一行就是它的地址：
+电视上没有 adb，能拿到的证据只有屏幕。**双击遥控器上的「设置 / 信息」键**打开，
+**OK 键关闭**（30 秒不动自动关）。它就九行，每行都来自播放器真值，不做推算：
 
 ```
-远程    http://192.0.2.34:8642
+屏幕    1920×1080 · dpi 240 · density 1.50 · 缩放 ×1.33 @50.0Hz
+画面    3840×2160 HEVC · 片源 25.0 帧/秒 → 输出 1920×1080
+解码    硬解 OMX.MTK.VIDEO.DECODER.HEVC
+帧率    解码 18.2 · 送显 17.1 · 丢帧 14%
+像素率  送显 141.5 Mpx/秒（片源要 207.4）
+缓冲    41240 毫秒 / 13.9 MB · 读 0.4 MB/秒（要 0.4）
+音频    avcodec ac3 · 已出声
+结论    送显 17.1 帧/秒，低于片源的 25.0 帧/秒：硬解每秒只出 18.2 帧 —— 这是 4K HEVC 片源，
+        而这颗芯片的 HEVC 解码块实测约 150 Mpx/秒封顶（3840×2160 就是 ~18 帧/秒，
+        2960×2160 那一档反而满帧）—— 换 H.264 的 4K 版本，或换 1080p
+内容    大宅门
 ```
 
-| 接口 | 用途 |
-| :--- | :--- |
-| `/state` | 一屏 JSON：屏幕 / 视频层 / 内容 / 解码 / 帧率 / 像素率 / 缓冲 / 音频 / 结论，**外加面板那几行的原文**，以及系统 CPU、温度、核频、DDR 频 |
-| `/series?n=60` | 1 Hz 历史样本，用来算窗口均值 |
-| `/threads` | 逐线程 CPU 与 nice（回答「哪个线程在满 / 有没有被饿死」） |
-| `/knobs`、`/presets` | 列出 18 个旋钮与 12 档预设 |
-| `/preset?n=4` | 切到第 4 档（**会重播**，面板上单击「设置键」是同一件事） |
-| `/set?player.framedrop=0` | 改任意旋钮；只有「建面前的」和「起播前的」那些才需要重播，会自动重播 |
-| `/codecs` | 本机解码器清单 + **声明的最大尺寸**（`max_w/max_h/supports_4k`）+ 是否支持隧道播放（`tunneled`） |
-| `/props?q=` | 系统属性（`getprop` 的替代）：`debug.sf.hw`、`sys.display-size`、`service.adb.tcp.port` 这些不用 adb 也能看到 |
-| `/cmd?a=…` | `ls` / `find` / `open` / `pause` / `resume` / `seek` / `key` / `panel` / `replay` / `stop` |
-| `/log?n=200` | 应用自己的日志 |
-| `/state` 的 `io` 段 | 读路径计数：moov 搬运次数、读请求次数、**平均每次读多少字节**（读放大就看它） |
-| `/state` 的 `library` 段 | 当前库名与下标 + **内存里的库列表**（顺序就是按键取库的顺序）+ 剧数/集数。「按键跑到别的库去了」这类问题看它 |
-| `/state` 的 `fault` 段 | 电视屏幕上此刻显示的故障原文（没显示就是空串）。「它自己跳走了」这类问题靠它取证 |
+- **「画面」那一行必须带编码**：这台电视 4K H.264 能满帧、4K HEVC 只有 ~18 帧/秒，
+  看不出编码就分不清是「片源太重」还是「编码踩坑」（2026-09-12 实机教训）。
+- 「结论」那一行是**算出来的**（`PlaybackVerdict`，判据按优先级：
+  硬解静默回落 → 读取跟不上 → 缓存见底 → 解码低于片源 → 送显跟不上），
+  UHD 片源还会按编码补一句为什么。
+- 出过事才会出现的两行：`兜底`（静默退回软解次数 / 已被禁用的解码器）。
 
-操作端是 `scripts/tvprobe.py`（只用 Python 标准库，WSL / Windows 都能跑）：
+> 排查历史：为了量「4K 到底卡在哪」，这一版之前曾经在 debug 包里开过一个
+> **无鉴权局域网 HTTP 口**（`DiagHub`，8642）+ 18 个运行时旋钮 + 12 档预设
+> （`scripts/tvprobe.py` 是它的操作端）。结论已经拿到（见上面那条与 `docs/DESIGN.md` 风险 24），
+> 这套工装按用户要求**已从主线移除**，完整实现留在 git 分支 **`diag-experiment-snapshot`**，
+> 下次要「换一个变量量一次数字」时直接从那个分支捡回来即可。
 
-```bash
-TV_URL=http://192.0.2.34:8642 python3 scripts/tvprobe.py state
-python3 scripts/tvprobe.py watch 30          # 采 30 秒，打印均值
-python3 scripts/tvprobe.py measure "测试/4k.mp4" "测试/1080p.mp4"   # 逐个片源量一遍（按片名过滤样本）
-python3 scripts/tvprobe.py threads           # 逐线程 CPU
-python3 scripts/tvprobe.py preset 4          # 换第 4 档（会重播）
-python3 scripts/tvprobe.py set player.framedrop=0 player.video-pictq-size=8
-python3 scripts/tvprobe.py sweep --presets 1,3,4,7 --sec 20   # 逐档对照，出表
-python3 scripts/tvprobe.py find 大宅门        # 在 NAS 上找文件（例如找 1080p 版本）
-python3 scripts/tvprobe.py open "电视剧/大宅门/01.mkv"
-python3 scripts/tvprobe.py scan             # 在局域网里自动找电视（不用念 IP），顺便看 5555 有没有网络 adb
-python3 scripts/tvprobe.py props sys.display   # 系统属性（adb getprop 的替代）
-python3 scripts/tvprobe.py codecs             # 解码器能力 + 隧道播放支持
-```
-
-设计取舍：**常开、无 token、只在 debug 包**。用户明确要求「怎么简单怎么来」，
-而这个口不经手任何凭据（NAS 密码在配置页那套里，和它无关）；
-release 包里 `EXPERIMENTS = BuildConfig.DEBUG` 为 false，服务和面板实验行都不存在。
-旋钮值存在独立的 `firefly_diag` prefs 文件里，不会污染 `firefly` 那份配置。
 
 ## NAS 上怎么放（平铺的文件也能播）
 

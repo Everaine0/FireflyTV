@@ -1128,16 +1128,19 @@ H.264 的 4K 跑到 381 Mpx/秒，说明显示通路和 BufferQueue 消费者都
 4. 扫预设：**每档的像素率**。
    - 全都在同一个水平抖、互相没有差别 ⇒ App 侧无解（4K HEVC 就是这样：默认 17.1/17.4、
      深队列 21.2/18.2）；
-   - 某一档明显更高 ⇒ 按那一档定案，删掉实验台（`EXPERIMENTS`/`Knobs`）；
-   - **唯一量到的一次真实收益**：`pictq=8 + framedrop=0` 那档把 4K50 H.264 的丢帧
-     从 9% 压到 **0%**（送显中位不变）—— 留作可选档，不必进默认。
+   - 某一档明显更高 ⇒ 按那一档定案，然后删掉实验台（**已经这么做了**：12 档里没有一档
+     在送显帧率上稳定优于默认）；
+   - **唯一量到的一次差异**：`pictq=8 + framedrop=0` 把 4K50 H.264 的「丢帧比例」
+     从 9% 变成 0% —— 但那只是**停掉跳帧**（迟到帧不再被跳过），送显中位还是 48.5，
+     不是变流畅；它对 4K HEVC 也没有帮助（默认 17.1/17.4，深队列 21.2/18.2）。
+     清理版因此**保留 ijkplayer 默认参数**，只把这次观察记在这里。
 5. `surface.fixed=hd1080` —— **已核实无效，别在它身上花时间**。
    AOSP 5.1 的 `ACodec` 分配输出缓冲时自己调 `native_window_set_buffers_geometry(win, nFrameWidth, nFrameHeight, ...)`
    （用 OMX 输出端口回报的尺寸），而 `Surface::dequeueBuffer` 的取值优先级是
    `reqW = mReqWidth ? mReqWidth : mUserWidth` —— **解码器设的覆盖 app 设的**；
    而且 5.1 的 `SurfaceHolder.setFixedSize()` 走的是 SurfaceView 子窗口 relayout，
-   根本没碰 native window 的 buffer 尺寸 API。所以这一档已经从预设里撤掉了
-   （旋钮还在，只留作现场对照）。
+   根本没碰 native window 的 buffer 尺寸 API。所以这一档从预设里撤掉了，
+   清理版连旋钮一起移除。
 
 #### 还没用、但可能是唯一能绕开合成瓶颈的一招：Tunneled playback（HWC_SIDEBAND）
 
@@ -1270,7 +1273,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | **ABI** | 必须含 `armeabi-v7a` + `arm64-v8a`（电视）+ **`x86`**（模拟器，缺了会直接崩） |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**232 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**58 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**219 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
 | 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
 | 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |

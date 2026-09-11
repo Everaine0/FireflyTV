@@ -7,8 +7,6 @@ import android.os.Looper
 import android.util.Log
 import android.view.Surface
 import com.firefly.tv.core.Config
-import com.firefly.tv.diag.DiagHub
-import com.firefly.tv.diag.Knobs
 import tv.danmaku.ijk.media.player.IjkMediaPlayer
 
 /**
@@ -100,14 +98,6 @@ interface PlaybackEngine {
 
     /** 当前播放类型，用于让实现层挑参数（直播与点播的取舍不同）。 */
     fun setMode(kind: PlaybackMode.Kind)
-
-    /**
-     * 当前**实际**在播的类型（`live` / `on_demand`）。
-     *
-     * 诊断页原先是从界面层的「当前媒体库」推出来的，于是「用远程接口直接打开一个
-     * 文件」时会被报成 `live`（因为那时还停在直播库上）—— 量数据的人一眼看错对象。
-     */
-    fun kindName(): String = ""
 
     /** 直播断流自动重连；[urlProvider] 返回当前频道地址。 */
     fun setLiveReconnect(on: Boolean, urlProvider: (() -> String?)?)
@@ -330,24 +320,21 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     /**
-     * 排查「送显跟不上」用的旋钮。
+     * 起播参数（缓冲、追帧、硬解）都在这里一次性落给 ijkplayer。
      *
-     * 现场数据（长虹 43Q3T，Android 5.1，4K 面板 / 逻辑 1080p@50Hz）：
-     * 只有 **3840×2160** 的《大宅门》掉到 **送显 18.2 帧/秒**（片源 25），
-     * 而 2960×2160 的《猫和老鼠》、1080p50 的《娘道》都正常。
-     * 三个片源需要的像素率分别是 207 / 153 / 103 Mpx/秒，
-     * 而 18.2 帧/秒 × 3840×2160 = **151 Mpx/秒** —— 但用户实测「像素率最高能到 200，
-     * 大部分时间 118~150 徘徊」，所以它**不是一条硬天花板**，更像是有东西在时不时卡住。
-     *
-     * 所以变量全部做成了运行时可写的旋钮（[com.firefly.tv.diag.Knobs]），
-     * 由局域网 HTTP 通道（[com.firefly.tv.diag.DiagHub]）在电视上当场切换、当场重播 ——
-     * 每换一个变量都要「改代码 → 打包 → 装电视」，一轮十几分钟，根本试不动。
+     * 这些值是实测定下来的（长虹 43Q3T / MT5891 / 1080p 面板，2026-09）：
+     * 4K **H.264** 能满帧（3840×2160@50 送显中位 50.0），4K **HEVC** 顶多 ~18 帧/秒
+     * （这颗芯片 HEVC 解码块约 150 Mpx/秒封顶，见 `PlaybackVerdict.HEVC_DECODE_MPX`）。
+     * 当时为了量这件事做过一整套运行时可调旋钮 + 局域网实验台（12 档预设 ×
+     * 格式/层级/队列/丢帧/线程优先级），结论是**这些开关对送显帧率全都没有影响**，
+     * 所以最终版把它们全部移除、只保留实测确认过的这套默认值
+     * （完整实验台保留在 git 分支 `diag-experiment-snapshot`）。
      *
      * ## 为什么这些选项必须在这里读
      *
      * ijkplayer 的 `setOption` **只在 `prepareAsync()` 之前**被读取
-     * （`ff_ffplay.c` 的 `ijkmp_set_option` 写进字典，prepare 时一次性 `av_opt_set_dict`）。
-     * 所以旋钮改动一律靠**重播**生效，不能指望运行中改一下就有效果。
+     * （`ff_ffplay.c` 的 `ijkmp_set_option` 写进字典，prepare 时一次性 `av_opt_set_dict`），
+     * 所以任何参数改动都要靠**重播**生效，不能指望运行中改一下就有效果。
      */
 
     private val main = Handler(Looper.getMainLooper())
@@ -510,9 +497,6 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     override fun setMode(kind: PlaybackMode.Kind) {
         this.kind = kind
     }
-
-    override fun kindName(): String =
-        if (kind == PlaybackMode.Kind.LIVE) "live" else "on_demand"
 
     override fun playSource(source: RandomAccessSource, startMs: Long) =
         playSource({ source }, startMs)
@@ -749,28 +733,6 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
             // 直播用 HTTP/HTTPS：再给一层连接与读取超时
             p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http_persistent", 0L)
             p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 1L)
-        }
-
-        // **最后**再落一遍远程旋钮：它们要能覆盖上面那套默认参数
-        // （上面是「老人用的稳妥值」，旋钮是排查时故意要走极端的值）。
-        // 放在最后还有个实际原因：`max-buffer-size` 这类选项写超上限会让
-        // `av_opt_set_dict` 整体失败，后面的选项全部静默失效 ——
-        // 所以「可能出错的那一条」必须排在最后。
-        val knobOptions = Knobs.options(context)
-        for (o in knobOptions) {
-            val cat = when (o.category) {
-                Knobs.Category.PLAYER -> IjkMediaPlayer.OPT_CATEGORY_PLAYER
-                Knobs.Category.FORMAT -> IjkMediaPlayer.OPT_CATEGORY_FORMAT
-                Knobs.Category.CODEC -> IjkMediaPlayer.OPT_CATEGORY_CODEC
-            }
-            runCatching {
-                // setOption 只有 Long / String 两个重载
-                val v = o.value
-                if (v is Long) p.setOption(cat, o.name, v) else p.setOption(cat, o.name, v.toString())
-            }
-        }
-        if (knobOptions.isNotEmpty()) {
-            DiagHub.log("旋钮选项已交给播放器：${knobOptions.joinToString(" ") { "${it.name}=${it.value}" }}")
         }
 
         player = p
