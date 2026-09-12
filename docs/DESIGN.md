@@ -696,6 +696,78 @@ len > 0 且位置已在末尾 → 返回 -1（这才是 EOF；ijkmds_read 里 0 
 | **CCTV5** | HLS（10 秒 TS 分片） | H.264 1080p25 | **MP2** | ✅ | ✅ | ✅ |
 | CCTV17 等 4 个频道 | UDP 组播 / 直链 mp4 | — | — | ⚠️ | — | — |
 
+#### 直播源换过了：上面那两行 HLS 是**历史记录**，现在是 RTSP 单播
+
+直播源已经从 `http://…/live/cctv1hd.m3u8` 那批 HLS 换成了运营商 IPTV：
+
+- **RTSP 单播** —— `rtsp://192.0.2.21/PLTV/…/…_0.smil`（19 个频道，见 `iptv/运营商-单播.m3u`），
+  服务端先回 `302` 跳到 `192.0.2.x:554` 并带一次性 `online=<unix秒>` 参数；
+- **UDP 组播** —— `udp://239.0.0.x.x:4120`（见 `iptv/运营商-组播.m3u`）。
+
+下面这张表是 2026-09-12 在模拟器上直连真实源重测的（含 `assembleRelease`
+出来的**正式包**，不只是 debug 包）：
+
+| 片源 | 容器/协议 | 视频 | 音频 | 起播 | 画面 | 声音 |
+| :--- | :--- | :--- | :--- | :---: | :---: | :---: |
+| CCTV-1 / CCTV-6 / CCTV-8 / CCTV-11（RTSP 单播） | MPEG-TS over RTSP | H.264 High 1080p25 | AAC-LC 或 MP2 | ✅ | ✅ | ✅ |
+| 其余单播频道（共 19 个） | 同上 | 同上 | 同上 | ✅ | ✅ | ✅ |
+| 组播 `udp://239.0.0.x.x` | MPEG-TS over UDP | — | — | ⚠️ | — | — |
+
+实测数据（CCTV-6，7.66 Mbit/s = 18094 KiB 视频 + 632 KiB 音频 / 20.03 秒）：
+`302` 之后 **约 1.2 秒出首帧**，连续三分钟零错误、零重连。
+「起播」按 `FFP_MSG_VIDEO_RENDERING_START` 判，不看人眼。
+
+组播那行仍然没验：模拟器走 SLIRP NAT，组播本身就不通，得在真机/真网络上测
+——**别把 ⚠️ 当成「已支持」**。
+
+#### RTSP 直播「播不出来 / 播一段就卡住」的两个根因（2026-09-12 修）
+
+用户报的是「iptv 的 cctv6/8 等会出现播放一段卡住」，而同一地址在电脑上
+`ffprobe`/手写 RTSP 握手都正常。根因全在**选项**上，跟源和服务端无关：
+
+| 协议 | `timeout` 的单位 | 该用哪个 | 备注 |
+| :--- | :--- | :--- | :--- |
+| HTTP/HLS | **微秒** | `timeout` | 改动前就对了 |
+| RTSP | **秒** | `stimeout`（微秒） | `timeout` 在 RTSP 里是「等入向连接」的秒数 |
+| UDP 组播 | 秒（且无实质作用） | 都不顶用 | 无连接，只能靠存活看门狗 |
+
+**根因 1：`timeout` 的单位认错。** ffmpeg 3.4 的 RTSP 选项目录原文是
+`timeout` = "maximum timeout **(in seconds)** to wait for incoming connections"、
+`stimeout` = "timeout **(in microseconds)** of socket TCP I/O operations"。
+旧代码给 `timeout` 塞的是 `IO_TIMEOUT_US`(15000000)，被当成 **15000000 秒 ≈ 173 天**；
+而它同时是保活间隔的来源（`rtspdec.c`：`>= rt->timeout / 2` 才发 `GET_PARAMETER`），
+于是保活等于关闭 —— 服务端认为客户端早死了，中途掐流。这就是「播一段就卡住」。
+
+**根因 2：没有 `rtsp_transport`，默认走 UDP。** 这套 IPTV 拒绝 UDP 的 `SETUP`
+（回 `405 Method Not Allowed`），报错链是：
+
+```
+Status 302: Redirecting to rtsp://192.0.2.x:554/…?online=…
+method SETUP failed: 405 Method Not Allowed
+…smil: could not find codec parameters   →   Error (-10000,0)
+```
+
+ffmpeg 3.4 本有一条回退（`rtspdec.c`：`ret == AVERROR(ETIMEDOUT) && !rt->packets`
+→ 打 `"UDP timeout, retrying with TCP"` → `resetup_tcp()`；这句话确实编进了我们的
+内核，`strings libijkffmpeg.so` 搜得到），但在这条通路上触发不了。
+指定 `rtsp_transport=tcp` 直接绕开，换台也不必先白等一次 UDP 超时。
+
+**顺带修的两处：**
+
+- **直播调参按传输协议分开。** 原来只有「直播/点播」一档，注释还写着「直播是 HLS」，
+  于是 RTSP/组播也用 1 MB 探测窗口 + 512 KB 缓冲。这条流实测 7.66 Mbit/s，
+  512 KB 只有 0.5 秒的量，抖一下就断。RTSP/组播改 4 MB / 4 MB，
+  **HLS 那档原值不动**（免得弄坏能播的源）。
+- **新增播放中存活看门狗。** 超时选项只覆盖「socket 报错」和「对端关闭」；
+  连接好着、对端就是不再发数据时**没有任何信号**，画面冻在最后一帧，
+  而界面层那个 25 秒看门狗只管起播（首帧出来就撤了）。判据用**送显帧率**
+  （连续 15 秒贴近 0 就重连），**刻意不用 `Liveness.differsFrom`** ——
+  它拿 `outputFps` 做 `!=` 比较，而那是个速率、卡死时也在 0 附近抖动，
+  「有动静」永远成立，看门狗会一辈子不触发。组播尤其需要它。
+
+回归防线：`PlaybackModeTest` 钉住协议识别、认不出时退回 HTTP 老行为、
+以及各档参数的大小关系（单测 224 项全过）。
+
 #### 「没声音」有两个完全不同的根因，现象一模一样
 
 这一节值钱的地方不是结论，而是**排查过程中踩过的三个假象**。
@@ -817,7 +889,10 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 - **字幕规则**（§5）仍未实现。
 - **`AudioSupport.BUILT_IN` 必须跟着内核一起维护**：换了内核却忘了改这张表，
   就会误报「这台电视不支持」。单元测试会遍历所有编码把两个方向都钉住。
-- 4 个频道是 UDP 组播地址（`udp://239.x.x.x`）或百度网盘直链，无法当作常规直播源验证。
+- **UDP 组播频道（`udp://239.0.0.x.x`）仍未验证**。不是源的问题，是**模拟器**的问题：
+  它走 SLIRP NAT，组播本身就通不出去，所以这条路只能上真机/真网络测。
+  代码侧已按组播的特性给了独立的超时处理与存活看门狗（见上面「两个根因」），
+  但**没有实测背书**，别当成已支持。百度网盘直链那类同理。
 - H.265 4K 在**模拟器**上会把模拟器整个搞崩（软解扛不住），测试里按 500MB 体积阈值跳过；
   真机（armv7/arm64）现在走 MediaCodec 硬解（风险 9），模拟器上仍然是软解 —— 两边行为**故意不同**。
 
