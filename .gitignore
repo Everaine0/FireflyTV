@@ -32,3 +32,7 @@ captures/
 
 # 私密：真 NAS 测试账号等本机配置（模板见 local.properties.example）
 local.properties
+
+# Python 脚本（scripts/*.py）跑起来会留字节码，生成物不入库
+__pycache__/
+*.pyc
