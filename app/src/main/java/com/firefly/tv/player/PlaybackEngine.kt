@@ -359,6 +359,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         if (firstFrameFired) return
         firstFrameFired = true
         cancelHardwareWatchdog()
+        // 首帧出来才开始盯「播放中卡死」：起播阶段由界面层的 25 秒看门狗负责
+        armStallWatchdog()
         onMain { listener?.onFirstFrame() }
     }
 
@@ -524,7 +526,9 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         releaseInternal()
         usingHardware = hardware
         hardwareRequested = hardware
-        val p = newPlayer(hardware)
+        // URL 请求要把地址交给 newPlayer：直播的超时选项跟传输协议绑在一起
+        //（RTSP 的 `timeout` 是秒、还兼作保活间隔，见 newPlayer 里的说明）。
+        val p = newPlayer(hardware, (req as? LastRequest.Url)?.url)
         // Surface 必须在 prepareAsync 之前挂上：MediaCodec 解码器是在准备阶段建的，
         // 那一刻没有 Surface 的话 ijkplayer 会建一个**假的**解码器（收数据、不出画面），
         // 之后再 setSurface 只能靠重新配置解码器补救。正常路径上 Surface 早就有了
@@ -588,7 +592,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         if (on) retryCount = 0
     }
 
-    private fun newPlayer(hardware: Boolean): IjkMediaPlayer {
+    private fun newPlayer(hardware: Boolean, url: String?): IjkMediaPlayer {
         // 每次起播都要重置：这几个标志描述的都是「当前这一次播放」。
         // 不清掉的话第二次起播会永远收不到首帧（被 firstFrameFired 挡住），
         // 解码通路的诊断结论也会停在上一集上。
@@ -599,6 +603,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         watchdogGrace = 0
         cachedMediaInfo = null
         cancelHardwareTruthCheck()
+        // 直播源的传输协议决定超时选项怎么给（单位/语义都不同，见下面 setOption 处）
+        val transport = url?.let { PlaybackMode.Transport.of(it) } ?: PlaybackMode.Transport.HTTP
         val p = IjkMediaPlayer()
         p.setOnPreparedListener(object : tv.danmaku.ijk.media.player.IMediaPlayer.OnPreparedListener {
             override fun onPrepared(mp: tv.danmaku.ijk.media.player.IMediaPlayer) {
@@ -698,8 +704,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
         // 老人用：宁可轻微丢帧也不要黑屏卡住（默认值；下面那批远程旋钮可以覆盖它）
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "framedrop", 1L)
-        // 直播/点播各自一套参数，取舍不同（见 PlaybackMode.tuning）
-        val t = PlaybackMode.tuning(kind)
+        // 直播/点播各自一套参数；直播还要按传输协议再分一档（RTSP/组播不是 HLS）
+        val t = PlaybackMode.tuning(kind, transport)
         val probe = probeOverride
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "packet-buffering", if (t.packetBuffering) 1L else 0L)
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "max-buffer-size", t.maxBufferBytes)
@@ -727,12 +733,49 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         //
         // 给底层 I/O 设上限，超时就会走 onError → 界面重连。
         // 15 秒是权衡：太短会把正常的缓冲抖动误判成断流。
+        //
+        // ⚠️ 但 `timeout` 的单位**随协议而变**，这里必须分开写 —— 见下面那一大段。
         p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rw_timeout", IO_TIMEOUT_US)
-        p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", IO_TIMEOUT_US)
         if (kind == PlaybackMode.Kind.LIVE) {
-            // 直播用 HTTP/HTTPS：再给一层连接与读取超时
-            p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http_persistent", 0L)
-            p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 1L)
+            when (transport) {
+                PlaybackMode.Transport.HTTP -> {
+                    // HLS：HTTP 的 `timeout` 就是微秒，和 rw_timeout 同一个量纲
+                    p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", IO_TIMEOUT_US)
+                    p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "http_persistent", 0L)
+                    p.setOption(IjkMediaPlayer.OPT_CATEGORY_PLAYER, "reconnect", 1L)
+                }
+
+                PlaybackMode.Transport.RTSP -> {
+                    // ## 这两行是「IPTV 直播播不了 / 播一段卡住」的修复点
+                    //
+                    // 1) `rtsp_transport = tcp`
+                    //    ijkplayer 默认走 UDP，而运营商这套 IPTV 拒绝 UDP 的 SETUP
+                    //    （回 `405 Method Not Allowed`）。ffmpeg 3.4 本来有一条
+                    //    「UDP 超时 → 改用 TCP」的回退，实测在这条通路上触发不了，
+                    //    表现是每个频道都在 `could not find codec parameters` 上死掉。
+                    //    直接指定 TCP 就绕开了整条回退路径，换台也不用先白等一次 UDP 超时。
+                    //    （RTSP 服务端基本都支持 TCP 交织传输，代价只是延迟略高一点点。）
+                    p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "rtsp_transport", "tcp")
+                    // 2) 超时用 `stimeout`（**微秒**，给 socket 读写）
+                    //    RTSP 的 `timeout` 单位是**秒**，而且是保活间隔的来源
+                    //    （`rtspdec.c`：`>= rt->timeout / 2` 才发 GET_PARAMETER）。
+                    //    原来这里塞的是 `IO_TIMEOUT_US`，被当成 15000000 秒 ≈ 173 天，
+                    //    等于把保活关掉了 —— 服务端会认为客户端已经死了，中途掐流。
+                    //    所以对 RTSP 绝不能再设 `timeout`，只设 `stimeout`。
+                    p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "stimeout", IO_TIMEOUT_US)
+                }
+
+                PlaybackMode.Transport.UDP -> {
+                    // 组播是**无连接**的：`rw_timeout` 对 UDP 套接字不生效，
+                    // 也没有 RTSP 那种保活。流停了不会自己报错，只能靠引擎的
+                    // 播放中存活看门狗（见 [stallWatchdog]）来发现。
+                    // `timeout` 对 UDP 是「等待入向连接」的秒数，给个有限值即可。
+                    p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", UDP_TIMEOUT_SECONDS)
+                }
+            }
+        } else {
+            // 点播走 SMB，`timeout` 用不上；保留它只为不让老行为变化
+            p.setOption(IjkMediaPlayer.OPT_CATEGORY_FORMAT, "timeout", IO_TIMEOUT_US)
         }
 
         player = p
@@ -946,6 +989,80 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         main.postDelayed(retryRunnable, delay)
     }
 
+    // ---- 播放中存活看门狗（「播一段就卡住」的正解）----
+    //
+    // ## 为什么超时选项救不了这一类故障
+    //
+    // 上面给 socket 设了 `rw_timeout` / `stimeout`，但它们只能覆盖
+    // 「**socket 报错**」和「**对端关闭连接**」这两种情况。
+    // 直播真正难处理的是第三种：**TCP 连接好好挂着，对端就是不再发数据了**。
+    // 这时 socket 读永远等不到错误，`MEDIA_INFO_BUFFERING_START` 也不会来
+    // （ijkplayer 只在缓存被读空时才报缓冲，而它此时正卡在等包上）。
+    // 于是：既没有 onError 也没有 onCompletion，画面冻在最后一帧，**永远不会自己好**。
+    // 界面层那个 25 秒看门狗只管起播（首帧出来就撤了），也帮不上忙。
+    //
+    // 组播（`udp://`）更彻底：UDP 无连接，上面那些超时选项对它根本没有意义。
+    //
+    // ## 判据（这里刻意**不用** [Liveness.differsFrom]）
+    //
+    // 乍看 `differsFrom` 正合适，其实不行：它把 `outputFps` 也拿 `!=` 比，
+    // 而 `outputFps` 是个**速率**、不是累计计数器 —— 流卡死时它只是在 0 附近抖动，
+    // 相邻两次采样几乎必然不相等。拿它当判据的话，「有动静」永远成立，
+    // 看门狗一辈子都不会触发。
+    //
+    // 所以只认一个单调量：**送显帧率**。真在播就有几十帧/秒，
+    // 真的卡死才会长时间贴近 0；抖动传不过 [STALL_MIN_FPS] 这个门槛。
+    private var stallStrikes = 0
+
+    // 注意：这里**不能**在 lambda 里直接重挂 `stallWatchdog` 自己 ——
+    // 属性初始化期间引用自身，Kotlin 会报「Variable 'stallWatchdog' must be initialized」。
+    // 和 [hardwareWatchdog] 一样，把重挂放进一个私有方法里。
+    private val stallWatchdog = Runnable {
+        // 只管直播；点播有界面层的卡死判据，别在这里抢
+        if (kind != PlaybackMode.Kind.LIVE || !liveReconnect) return@Runnable
+        val p = player ?: return@Runnable
+        val live = runCatching { liveness() }.getOrDefault(PlaybackEngine.Liveness(0, 0, 0, 0f))
+
+        // 「没在播」不算卡死：暂停、或者正在缓冲起播，都不该被判定为断流。
+        // 注意这里**不能**碰 stallStrikes —— 缓冲抖动会让 isPlaying 短暂变 false，
+        // 一旦清零就永远攒不满，看门狗等于没有。
+        if (!runCatching { p.isPlaying }.getOrDefault(false)) {
+            armStallWatchdog()
+            return@Runnable
+        }
+
+        if (live.outputFps > STALL_MIN_FPS) {
+            stallStrikes = 0
+        } else {
+            stallStrikes++
+            Log.w(
+                TAG,
+                "直播卡死判据：送显 ${"%.2f".format(live.outputFps)} 帧/秒（低于 " +
+                    "$STALL_MIN_FPS），已持续约 ${(stallStrikes * STALL_RECHECK_MS) / 1000} 秒" +
+                    "（缓存 ${live.videoCachedMs}ms，流量 ${live.trafficBytes}B，第 $stallStrikes 次）",
+            )
+            if (stallStrikes >= STALL_MAX_STRIKES) {
+                Log.w(TAG, "直播画面已经不动了，走重连（第 ${retryCount + 1} 次）")
+                stallStrikes = 0
+                onMain { listener?.onLiveRetry(retryCount + 1, liveUrlProvider?.invoke()) }
+                scheduleLiveRetry()
+                return@Runnable
+            }
+        }
+        armStallWatchdog()
+    }
+
+    private fun armStallWatchdog() {
+        main.removeCallbacks(stallWatchdog)
+        // 刚出首帧先别急着量：这一刻缓存本来就在剧烈变化，等一个周期再开始比
+        main.postDelayed(stallWatchdog, STALL_RECHECK_MS)
+    }
+
+    private fun cancelStallWatchdog() {
+        main.removeCallbacks(stallWatchdog)
+        stallStrikes = 0
+    }
+
     private val retryRunnable = Runnable {
         val url = liveUrlProvider?.invoke() ?: return@Runnable
         playUrl(url)
@@ -1069,12 +1186,15 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     override fun pause() {
         // 暂停期间不该算「硬解卡住」：音频焦点被别的应用抢走也会走到这里
         cancelHardwareWatchdog()
+        // 暂停时计数器本来就不动，不撤掉存活看门狗会把「用户按了暂停」误判成断流
+        cancelStallWatchdog()
         runCatching { player?.pause() }
     }
 
     override fun resume() {
         // 还没出首帧、而且确实在跑硬解，就接着等（重新起算一个完整超时，宁可多等也不要误判）
         if (!firstFrameFired && usingHardware) armHardwareWatchdog()
+        if (firstFrameFired) armStallWatchdog()
         runCatching { player?.start() }
     }
 
@@ -1090,6 +1210,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     private fun releaseInternal() {
         cancelHardwareWatchdog()
         cancelHardwareTruthCheck()
+        cancelStallWatchdog()
         val p = player ?: return
         player = null
         runCatching {
@@ -1120,6 +1241,33 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
         /** 首帧超时最多宽限几次（每次一个完整超时）。见 [hardwareWatchdog]。 */
         const val WATCHDOG_GRACE = 2
+
+        /** 播放中存活看门狗的检查周期。见 [stallWatchdog]。 */
+        const val STALL_RECHECK_MS = 5_000L
+
+        /**
+         * 连续几次「送显帧率贴近 0」才判定画面不动了。
+         *
+         * 取 3（= 15 秒）：既要盖过正常的网络抖动、缓冲与换台前后的空档，
+         * 又不能让老人对着冻住的画面干等。25 秒（界面层的起播超时）那种量级太久了。
+         */
+        const val STALL_MAX_STRIKES = 3
+
+        /**
+         * 判定「画面真的在动」的送显帧率门槛（帧/秒）。
+         *
+         * 直播片源最低也有 23.976 帧/秒；真要卡死时 `stat.vfps` 会掉到 0 附近。
+         * 取 0.5 是为了让测量噪声过不来，同时又能立刻识别出「几乎不出帧」。
+         */
+        const val STALL_MIN_FPS = 0.5f
+
+        /**
+         * UDP 组播的 `timeout`（**秒**，不是微秒）。
+         *
+         * 它对无连接的组播流其实没有实质作用，给个有限值只是为了不让它停在
+         * 那个语义为「等入向连接」的默认值上。真正兜底的是 [stallWatchdog]。
+         */
+        const val UDP_TIMEOUT_SECONDS = 10L
 
         // ijkplayer `ff_ffmsg.h` 的解码通路常量
         const val FFP_PROPV_DECODER_AVCODEC = 1

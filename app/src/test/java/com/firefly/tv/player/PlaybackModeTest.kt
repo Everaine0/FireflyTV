@@ -141,4 +141,72 @@ class PlaybackModeTest {
         assertTrue(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 10_000L))
         assertEquals(10_000L, PlaybackMode.MIN_TRUSTED_DURATION_MS)
     }
+
+    // ---- 直播源的传输协议 ----
+    //
+    // 直播源从 HTTP/HLS 换成了运营商 IPTV 的 RTSP 单播 + UDP 组播，
+    // 而超时选项的单位/语义**随协议而变** —— 认错协议就会把超时值写错量纲。
+    // 实测事故：给 RTSP 的 `timeout` 塞了微秒值 15000000，
+    // 被当成 15000000 **秒**（约 173 天），顺带把 RTSP 保活间隔也顶掉了
+    // （`rtspdec.c` 里 `>= rt->timeout / 2` 才发 GET_PARAMETER）。
+
+    @Test
+    fun `按 scheme 认出传输协议`() {
+        assertEquals(
+            PlaybackMode.Transport.RTSP,
+            PlaybackMode.Transport.of("rtsp://192.0.2.21/PLTV/88888912/224/3221226426/x.smil"),
+        )
+        assertEquals(PlaybackMode.Transport.RTSP, PlaybackMode.Transport.of("RTSP://host/x"))
+        assertEquals(PlaybackMode.Transport.UDP, PlaybackMode.Transport.of("udp://239.0.0.2.66:4120"))
+        assertEquals(PlaybackMode.Transport.UDP, PlaybackMode.Transport.of("rtp://239.1.1.1:5000"))
+        assertEquals(
+            PlaybackMode.Transport.HTTP,
+            PlaybackMode.Transport.of("http://198.51.100.10:82/live/cctv1hd.m3u8"),
+        )
+        assertEquals(
+            PlaybackMode.Transport.HTTP,
+            PlaybackMode.Transport.of("https://live.example.com/x.m3u8"),
+        )
+    }
+
+    @Test
+    fun `认不出来的地址退回改动前的老行为`() {
+        // 认错协议比认不出更危险，所以默认必须是 HTTP（老行为），不是 RTSP
+        assertEquals(PlaybackMode.Transport.HTTP, PlaybackMode.Transport.of(""))
+        assertEquals(PlaybackMode.Transport.HTTP, PlaybackMode.Transport.of("rtmp://a/b"))
+        assertEquals(PlaybackMode.Transport.HTTP, PlaybackMode.Transport.of("not a url"))
+    }
+
+    @Test
+    fun `直播默认按 HTTP 调参`() {
+        // 不传 transport 时必须完全等于改动前那档 HLS 参数，避免影响既有源
+        val d = PlaybackMode.tuning(PlaybackMode.Kind.LIVE)
+        val h = PlaybackMode.tuning(PlaybackMode.Kind.LIVE, PlaybackMode.Transport.HTTP)
+        assertEquals(d.maxBufferBytes, h.maxBufferBytes)
+        assertEquals(d.probesizeBytes, h.probesizeBytes)
+        assertEquals(d.analyzeDurationUs, h.analyzeDurationUs)
+    }
+
+    @Test
+    fun `RTSP和组播的探测窗口要比HLS大`() {
+        // RTSP/组播是连续 TS，没有「每片自带流信息」这回事；
+        // 原来的 1 MB（按 HLS 分片调的）认不出参数。
+        val http = PlaybackMode.tuning(PlaybackMode.Kind.LIVE, PlaybackMode.Transport.HTTP)
+        for (tr in listOf(PlaybackMode.Transport.RTSP, PlaybackMode.Transport.UDP)) {
+            val t = PlaybackMode.tuning(PlaybackMode.Kind.LIVE, tr)
+            assertTrue("$tr 的探测窗口应大于 HLS", t.probesizeBytes > http.probesizeBytes)
+            assertTrue("$tr 的缓冲应大于 HLS", t.maxBufferBytes > http.maxBufferBytes)
+            assertTrue("$tr 仍要保留包缓冲", t.packetBuffering)
+        }
+    }
+
+    @Test
+    fun `直播各档缓冲都远小于点播`() {
+        val v = PlaybackMode.tuning(PlaybackMode.Kind.ON_DEMAND)
+        for (tr in PlaybackMode.Transport.values()) {
+            val t = PlaybackMode.tuning(PlaybackMode.Kind.LIVE, tr)
+            assertTrue("$tr 直播缓冲必须小于点播，否则延迟越积越多", t.maxBufferBytes < v.maxBufferBytes)
+            assertTrue("$tr 探流要比点播快，否则换台要等", t.probesizeBytes < v.probesizeBytes)
+        }
+    }
 }

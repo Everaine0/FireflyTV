@@ -86,4 +86,17 @@ fi
 
 cp "$BAT" /tmp/ffbuild.bat
 cd /tmp
-cmd.exe /c "\\\\wsl.localhost\\${DISTRO}\\tmp\\ffbuild.bat" 2>&1 | grep -v "^robocopy rc=" | tail -"$TAIL"
+# ⚠️ 必须先把 cmd.exe 的退出码留下来再交给管道：`cmd | grep | tail` 的退出码是
+# **tail 的**，永远是 0 —— 构建失败时脚本照样「成功」返回，CI/自动化里
+# 会把一次没编出来的构建当成都通过了。踩过一次，别改回去。
+set +e
+cmd.exe /c "\\\\wsl.localhost\\${DISTRO}\\tmp\\ffbuild.bat" 2>&1 \
+    | grep -v "^robocopy rc=" | tail -"$TAIL"
+RC=${PIPESTATUS[0]}
+set -e
+
+if [ "$RC" -ne 0 ]; then
+    echo >&2
+    echo "✗ 构建失败（cmd.exe 退出码 $RC）—— 上面只显示了最后 $TAIL 行，需要更多就调大 TAIL" >&2
+fi
+exit "$RC"
