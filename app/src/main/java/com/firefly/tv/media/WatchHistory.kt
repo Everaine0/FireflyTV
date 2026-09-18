@@ -15,10 +15,22 @@ package com.firefly.tv.media
  *
  * ## 关于「老人直接关电视」
  *
- * 记录是**周期性写盘**的（见 `MainActivity.saveRecordTick`，5 秒一次），
+ * 记录是**周期性写盘**的（见 `MainActivity.positionTick`，5 秒一次），
  * 不是只在退出时写。所以拔电源最多丢 5 秒，符合「10 秒左右偏差」的要求。
  * 另外直播**不记时长**（`currentPosition` 对直播是从开播算起的假进度，
  * 拿它去 seek 会让音画长时间不同步）—— 直播只记频道号。
+ *
+ * ## 两条「宁可少写，也不写坏」的规矩
+ *
+ * 整份记录是**一个整体**落盘的（`serialize` 出来的一整段文本），所以每一个写点
+ * 都有能力把全部记录写坏。两条规矩就是为了堵住这件事：
+ *
+ *  1. **问不到进度就不写**（[shouldStore] / [usablePosition]）。换剧/换库/关电视
+ *     这些 `force = true` 的写点正落在「播放器刚重建」的窗口里，那时进度是 0 ——
+ *     0 是「不知道」，不是「片头」，写下去就等于把好记录抹掉。
+ *  2. **只认「真的在播的那一集」**。界面上的「选中的剧」和「正在播的那一集」不是
+ *     一回事：换剧时新剧的集列表要异步去 NAS 列，那几秒里选中项已经变了、播放器
+ *     还在放上一部剧。身份由界面层显式给出（`MainActivity.Spot`），这里不猜。
  *
  * ## 文本格式
  *
@@ -56,6 +68,12 @@ object WatchHistory {
 
     /** 记录条数上限：只留最近这么多部，防止这个 blob 无限长大。 */
     const val MAX_RECORDS = 200
+
+    /** 周期写盘的最小间隔（见 [shouldStore]）。 */
+    const val SAVE_DEBOUNCE_MS = 5_000L
+
+    /** 周期写盘的最小前进量：没走到 1 秒就不必再写一遍。 */
+    const val MIN_STEP_MS = 1_000L
 
     /** 一部剧看到哪儿了。[at] 是最后一次写入的墙上时间。 */
     class Record(
@@ -143,6 +161,44 @@ object WatchHistory {
                 .append(r.at).append(LINE_SEP)
         }
         return sb.toString()
+    }
+
+    /**
+     * 这次量到的进度**能不能信**。
+     *
+     * ⚠️ `0` 不是「看到了片头」，而是「**问不出来**」：
+     * 播放器刚被重建（`prepareAsync` 还没走完）、硬解退回软解重播的窗口里、
+     * 或者已经 release 之后，`PlaybackEngine.positionMs()` 回的都是 0。
+     *
+     * 这条判据是「多次切换以后播放记录丢了」的正解：换剧/换库/退到后台都是
+     * **立刻**写一条（`force = true`），而那几秒正好落在上面那些窗口里 ——
+     * 以前的实现把 0 照收，等于把上一次存下的好进度**抹成 0**，
+     * 用户看到的就是「换回来只能从头看」。
+     */
+    fun usablePosition(posMs: Long): Boolean = posMs > 0
+
+    /**
+     * 要不要把这次量到的进度写进记录（纯函数，单测钉住）。
+     *
+     * - 问不到进度（≤ 0）→ **一律不写**，宁可留着上一次那条旧的（见 [usablePosition]）；
+     * - [force]（换剧/换库/关电视）→ 不等防抖，只要进度可用就写；
+     * - 周期写盘 → 至少隔 [SAVE_DEBOUNCE_MS] 且至少前进 [MIN_STEP_MS] 才写，
+     *   免得一个十几 KB 的 blob 每 5 秒原样重写一遍。
+     *
+     * @param lastSavedAt 上一次写盘的时刻（本次会话内，也就是 `Record.at` 的口径）
+     * @param lastSavedPos 上一次写盘时的进度
+     */
+    fun shouldStore(
+        posMs: Long,
+        force: Boolean,
+        now: Long,
+        lastSavedAt: Long,
+        lastSavedPos: Long,
+    ): Boolean {
+        if (!usablePosition(posMs)) return false
+        if (force) return true
+        if (now - lastSavedAt < SAVE_DEBOUNCE_MS) return false
+        return kotlin.math.abs(posMs - lastSavedPos) >= MIN_STEP_MS
     }
 
     /** 记一条（同一部剧覆盖）。 */

@@ -71,7 +71,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             override fun onAudioFocusChange(focusChange: Int) {
                 // 决策交给 AudioFocusPolicy（有单元测试钉住），这里只负责执行。
                 // 关键点：直播永远不 seek，所以重播时进度必须是 0。
-                val pos = engine.positionMs()
+                //
+                // ⚠️ 点播不能拿「问不出来的 0」去重播：那一刻播放器可能已经 stop/释放
+                // （见 AudioFocusPolicy.Action.StopAndAbandon），positionMs() 回 0 ——
+                // 拿它重播既把画面拉回片头，又会在起播时把 0 写进记录
+                // （[playEpisode] 一起播就写一条），等于主动丢掉续播点。
+                // 问不到就用记录里最后存下的位置。
+                val pos = engine.positionMs().takeIf { WatchHistory.usablePosition(it) }
+                    ?: lastKnownPos()
                 when (val a = AudioFocusPolicy.decide(contentKind(), focusChange, pos)) {
                     is AudioFocusPolicy.Action.Continue -> Unit
                     is AudioFocusPolicy.Action.PauseTransient -> engine.pause()
@@ -190,9 +197,26 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 观看记录（每部剧各一条）。
      *
      * 只在主线程读写：它同时被「周期性写盘」「换剧/换库」「开机恢复」三条路径用到，
-     * 分散到 IO 线程反而容易写出竞态。读盘本身在 onCreate 里丢给 IO 线程做（见 loadHistory）。
+     * 分散到 IO 线程反而容易写出竞态。读盘在 [onCreate] 里**同步**做（见 [loadHistory]）——
+     * 异步读会让「读回来之前先写了一次」变成「拿空记录覆盖整份文件」。
      */
     private var history: WatchHistory.Book = WatchHistory.Book.EMPTY
+
+    /**
+     * 「现在在播的是哪一集」——库 / 剧 / 集。
+     *
+     * 为什么不能直接拿 [showName] + [episodeIndex] 现读：换剧时 [playShow] 会**先**改
+     * [showName]，而这部剧的集列表是**异步**去 NAS 列的（前面还排着 [refreshShows]）。
+     * 那几秒里 [episodeIndex] 还是**上一部剧**的集号、播放器也还在放上一部剧 ——
+     * 定时写盘这时就会把上一部剧的集号和进度记到新剧头上（用户看到的「记录乱了/丢了」）。
+     *
+     * 所以身份只在**真的把这一集交给播放器**时认领（[playEpisodeNow]），离开视频内容时
+     * 清掉（[selectLibrary] / [playChannel] / 排队等 Surface 期间）；[saveRecord] 只认它。
+     */
+    private class Spot(val lib: String, val show: String, val episode: Int)
+
+    /** 当前正在播的那一集；直播、故障页、还没起播时是 null（此时不写记录）。 */
+    private var spot: Spot? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -210,12 +234,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 上次的天气先顶上，过期了在浮层里再联网刷（省心知那边的调用次数）
         restoreWeatherCache()
 
-        // 缓存读盘放在 IO 线程，别在主线程碰 SharedPreferences
-        ioHandler.post {
-            cache = readCache()
-            val book = loadHistory()
-            main.post { history = book }
-        }
+        // 观看记录**必须在任何东西写它之前读出来**。
+        //
+        // 它是一份整体落盘的文本（`WatchHistory.serialize` 的全文），每个写点都是
+        // 「拿内存里这份重新序列化一遍」。以前这里是「先挂一份空的、再去 IO 线程补读」，
+        // 补读回来再 `main.post { history = book }` 无条件盖掉内存 —— 这个窗口里
+        // 任何一次 force 写（换剧/换库/退到后台）都会把**整份记录覆盖成空的**，
+        // 用户看到的就是「记录丢了」。改成先同步读出来，窗口从结构上不存在。
+        //
+        // 读的是同一个 SharedPreferences 文件（Config.smb / configured 早就在主线程读它了），
+        // 这里多出来的只是一次十几 KB 的字符串解析；目录缓存那种大对象仍然留在 IO 线程读。
+        history = loadHistory()
+        ioHandler.post { cache = readCache() }
 
         if (!Config.configured(this)) {
             openConfigServer()
@@ -318,7 +348,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         main.removeCallbacks(pendingTimeout)
         surfaceReady = true
         trace("launchPendingEpisode 起播《${p.show}》startMs=${p.startMs}")
-        playEpisodeNow(p.path, p.startMs)
+        // 身份跟着排队的那一集走，不现读界面字段：排队期间用户可能又换过剧/换过库
+        playEpisodeNow(p.path, p.startMs, p.spot)
     }
 
     private val pendingTimeout = Runnable {
@@ -328,7 +359,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         showFault("画面还没准备好，请按一下遥控器上的返回键再试", retry = false)
     }
 
-    private fun playEpisodeNow(path: String, startMs: Long) {
+    /**
+     * 真的把一集交给播放器。
+     *
+     * [spot] 在**这里**认领，而不是在 [playEpisode]：Surface 没就绪时那一集只是排队
+     * （见 [pendingEpisode]），这段时间播放器还在放**上一集** —— 提前认领就会把上一集
+     * 正在走的进度记到这一集头上（用户看到的「记录乱了」）。
+     */
+    private fun playEpisodeNow(path: String, startMs: Long, s: Spot) {
+        spot = s
         val cfg = Config.smb(this)
         prepared = false
         audioStarted = false
@@ -494,17 +533,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         val lib = libraries.getOrNull(libIndex)
         disarmLivenessWatchdog()
-        // 先把死的那个彻底丢掉，否则新起的播放器会和它抢 Surface
+        // release() 之后 positionMs() 恒为 0（`player` 已经被置空），所以先把还能写的
+        // 那一条写下来、再把重播位置从**记录**里取出来 —— 否则 playEpisode(0L) 会把
+        // 这一集的续播点抹成 0：老人重看一遍是小事，记录没了才是大事。
+        saveRecord(force = true)
+        val resume = lastKnownPos()
+        // 把死的那个彻底丢掉，否则新起的播放器会和它抢 Surface
         runCatching { engine.release() }
         trace("自动重连第 $recoverCount 次 lib=${lib?.name}")
         if (lib is Library.Live) {
             currentTitle = channels.getOrNull(channelIndex)?.name ?: currentTitle
             playChannel()
         } else {
-            // 位置在这条通路上取不到（恒为 0，见 PlayerLivenessTest），
-            // 所以只能从头续播同一集。对老人来说「这一集重头放」远比
-            // 「画面永远冻着」好收拾。
-            playEpisode(0L)
+            playEpisode(resume)
         }
     }
 
@@ -733,26 +774,34 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     /**
      * 把「现在看到哪儿了」写下来。
      *
+     * 两件事必须守住，否则会把好记录写坏（用户报的「多次切换以后记录丢了」）：
+     *
+     *  1. **只认 [spot]**：记录记的是「真的在播的那一集」，不是「界面上选中的那部剧」。
+     *     换剧时新剧的集列表是异步列的，那几秒里 [showName]/[episodeIndex] 互相矛盾。
+     *  2. **问不到进度就不写**：换剧/换库/关电视这些 `force` 写点正好落在
+     *     「播放器刚重建、进度还问不出来」的窗口里，`positionMs()` 回 0。
+     *     0 是「不知道」而不是「片头」，照收就等于把上一次存的好进度抹掉 ——
+     *     判据在 [WatchHistory.shouldStore]（纯函数，有单测）。
+     *
      * @param force true = 不等防抖立刻写（换剧/换库/退到后台时用）
      */
     private fun saveRecord(force: Boolean) {
-        val lib = libraries.getOrNull(libIndex) as? Library.Video ?: return
-        if (showName.isBlank()) return
+        val s = spot ?: return
         val pos = engine.positionMs()
-        // 直播不记时长（见 PlaybackMode）；这里本来就已经限定视频库了，
-        // 这一行防的是「视频库但位置还没出来」的瞬间
-        if (pos <= 0 && !force) return
-
         val now = System.currentTimeMillis()
-        if (!force) {
-            if (now - lastSavedAt < SAVE_DEBOUNCE_MS) return
-            if (kotlin.math.abs(pos - lastSavedPos) < 1000) return
+        if (!WatchHistory.shouldStore(pos, force, now, lastSavedAt, lastSavedPos)) {
+            // 排查「记录怎么没记上」时这一行是判据：问不到进度时我们**故意不写**
+            if (force && !WatchHistory.usablePosition(pos)) {
+                trace("saveRecord：《${s.show}》第 ${s.episode + 1} 集进度问不出来（${pos}ms），保留上一次的记录")
+            }
+            return
         }
+
         lastSavedPos = pos
         lastSavedAt = now
         history = WatchHistory.with(
             history,
-            WatchHistory.Record(lib.name, showName, episodeIndex, pos.coerceAtLeast(0L), now),
+            WatchHistory.Record(s.lib, s.show, s.episode, pos, now),
         )
         // 只更新记录、不动 last_lib：切库那一刻已经单独记过了
         Config.saveWatchHistoryText(this, WatchHistory.serialize(history))
@@ -768,6 +817,50 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun resumeOf(lib: String, show: String): Navigator.Resume {
         val rec = history.find(lib, show) ?: return Navigator.Resume.FIRST
         return Navigator.Resume(rec.episode, rec.resumeMs)
+    }
+
+    /**
+     * 播放器问不到进度时的兜底：**记录里**这一集最后写到哪儿。
+     *
+     * 只用在「重播同一集」的两条路上（音频焦点拿回来、播放器死掉后重建）：
+     * 那两处一旦传 0，[playEpisode] 起播时会立刻把 0 写进记录 ——
+     * 用户什么都没干，续播点就没了。位置 < 15 秒时 [WatchHistory.Record.resumeMs]
+     * 本来就当 0（见 [WatchHistory.MIN_RESUME_MS]），所以直接用 `resumeMs`。
+     */
+    private fun lastKnownPos(): Long {
+        // [spot] 为空时退回界面字段：换剧那一瞬间（正在列集、排队等 Surface，还没交给
+        // 播放器）界面上选中的就是**即将起播**的那一集，记录里存着它的起播点；
+        // 直播/没起播时这两个字段是空的，下面直接返回 0。
+        val s = spot ?: Spot(libraries.getOrNull(libIndex)?.name.orEmpty(), showName, episodeIndex)
+        if (s.lib.isBlank() || s.show.isBlank()) return 0L
+        val rec = history.find(s.lib, s.show) ?: return 0L
+        return if (rec.episode == s.episode) rec.resumeMs else 0L
+    }
+
+    /** 起播锚点：在剧列表里的下标 + 从第几集第几毫秒起播。 */
+    private class Anchor(val index: Int, val episode: Int, val startMs: Long)
+
+    /**
+     * 在 [list] 里找到「上次看的那部剧」并给出起播点。
+     *
+     * 找不到（这部剧在 NAS 上被删了/改名了）就退到第 1 部 —— 但**退过去也要用它自己的
+     * 记录**。原来这里直接给 `(0, 0L)`：于是「上次那部剧不在了」会顺手把第 1 部剧存着的
+     * 续播点抹成 0（[playEpisode] 起播时就写了记录），用户看到的还是「记录丢了」。
+     */
+    private fun anchorFor(
+        lib: Library.Video,
+        list: List<String>,
+        resumeShow: String,
+        resumeEpisode: Int,
+        resumePos: Long,
+    ): Anchor {
+        val found = list.indexOf(resumeShow)
+        if (found >= 0) return Anchor(found, resumeEpisode, resumePos)
+        if (resumeShow.isNotBlank()) {
+            trace("《$resumeShow》不在《${lib.name}》的剧列表里（删了/改名了？）-> 退到第 1 部")
+        }
+        val at = resumeOf(lib.name, list.firstOrNull().orEmpty())
+        return Anchor(0, at.episode, at.positionMs)
     }
 
     // ---- NAS 结构缓存 ----
@@ -877,6 +970,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         episodes = emptyList()
         showName = ""
         episodeIndex = 0
+        // 内容身份也跟着作废：这一刻起还没起播任何一集，定时写盘不该再写记录
+        // （离开上一个库之前，调用方已经 force 写过一条了）
+        spot = null
         cachedShow = ""
         cachedShowsLib = ""
 
@@ -897,14 +993,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 if (cachedShows.isNotEmpty()) {
                     cachedShowsLib = lib.name
                     shows = cachedShows
-                    val found = cachedShows.indexOf(resumeShow)
-                    playShow(
-                        lib,
-                        if (found >= 0) found else 0,
-                        if (found >= 0) resumeIndex else 0,
-                        if (found >= 0) resumePos else 0L,
-                        seq,
-                    )
+                    val at = anchorFor(lib, cachedShows, resumeShow, resumeIndex, resumePos)
+                    playShow(lib, at.index, at.episode, at.startMs, seq)
                     // 注意：这里**不能** return —— 还要去后台刷新一次。
                     // 刷新回来发现首轮已经有内容在播，就不会再切一次（见 refreshShows）。
                 }
@@ -948,8 +1038,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 cachedShowsLib = lib.name
                 shows = list
                 if (firstRun) {
-                    val found = list.indexOf(resumeShow)
-                    playShow(lib, if (found >= 0) found else 0, if (found >= 0) resumeIndex else 0, if (found >= 0) resumePos else 0L, seq)
+                    val at = anchorFor(lib, list, resumeShow, resumeIndex, resumePos)
+                    playShow(lib, at.index, at.episode, at.startMs, seq)
                 }
             }
         }
@@ -1136,25 +1226,31 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         currentTitle = showName
         // 先出名字，再去做后面那些可能慢的事
         announce(showName)
-        // 立刻落一条记录：换集/换剧之后马上拔电源，起来的也是这一集
+        // 立刻落一条记录：换集/换剧之后马上拔电源，起来的也是这一集。
+        // ⚠️ 但**内容身份（[spot]）这一刻还不能认领**：这一集可能因为 Surface 没就绪
+        // 而只是排队（见 [pendingEpisode]），排队期间播放器还在放上一集 ——
+        // 认领了就会把上一集正在走的进度记到这一集头上。
+        // 身份在真正交给播放器时更新（见 [playEpisodeNow]）。
+        val s = Spot(lib.name, showName, episodeIndex)
+        spot = null
         lastSavedPos = startMs
         lastSavedAt = System.currentTimeMillis()
         history = WatchHistory.with(
             history,
-            WatchHistory.Record(lib.name, showName, episodeIndex, startMs.coerceAtLeast(0L), lastSavedAt),
+            WatchHistory.Record(s.lib, s.show, s.episode, startMs.coerceAtLeast(0L), lastSavedAt),
         )
         Config.saveWatchHistoryText(this, WatchHistory.serialize(history))
         trace("playEpisode 《$showName》[$ep] startMs=$startMs surfaceUsable=${surfaceUsable()}")
 
         if (!surfaceUsable()) {
             // Surface 还没建好：排队等着，并在 surfaceCreated 或超时时处理
-            pendingEpisode = PendingEpisode(path, startMs, showName)
+            pendingEpisode = PendingEpisode(path, startMs, showName, s)
             main.removeCallbacks(pendingTimeout)
             main.postDelayed(pendingTimeout, SURFACE_WAIT_MS)
             main.postDelayed(surfacePoll, SURFACE_POLL_MS)
             return
         }
-        playEpisodeNow(path, startMs)
+        playEpisodeNow(path, startMs, s)
         // 音频探测**故意不在这里做**：它要读 1MB，走的是同一条 SMB 连接，
         // 会和播放器读首帧抢锁（实测切换首帧为此多等 100~300ms）。
         // 挪到首帧之后做，结论一样，代价为零 —— 见 onFirstFrame()。
@@ -1205,7 +1301,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         }
     }
 
-    private class PendingEpisode(val path: String, val startMs: Long, val show: String)
+    private class PendingEpisode(val path: String, val startMs: Long, val show: String, val spot: Spot)
     private var pendingEpisode: PendingEpisode? = null
 
     /**
@@ -1235,7 +1331,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         } else {
             val cur = list.indexOf(showName)
             val next = if (cur < 0) 0 else (cur + 1) % list.size
-            playShow(lib, next, 0, 0L, librarySeq)
+            // 下一部剧也接着**它自己的**记录看。原来这里写死 `(0, 0L)`，
+            // 而一起播 [playEpisode] 就会写记录 —— 等于「看完一部剧」顺手把下一部剧
+            // 存着的续播点抹成 0（和换剧的规矩不一致：换到哪部剧就接着哪部看）。
+            val at = resumeOf(lib.name, list[next])
+            playShow(lib, next, at.episode, at.positionMs, librarySeq)
         }
     }
 
@@ -1281,6 +1381,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private fun playChannel() {
         val ch = channels.getOrNull(channelIndex) ?: return
+        // 直播不记进度（见 PlaybackMode）：把内容身份清掉，定时写盘就不会碰记录
+        spot = null
         currentTitle = ch.name
         announce(ch.name) // 立刻出频道名，换台不能看起来没反应
         // 上一个频道留下的「信号中断」提示要马上撤掉，否则换到好频道也还挂着那句话
@@ -1813,8 +1915,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     override fun onPause() {
         super.onPause()
         // 关电视/切后台：不管离上次写盘多久，立刻写一条。
-        // 直播没有时长可记（存了下次就会拿它去 seek 出一条不同步的流），所以由
-        // saveRecord 内部按库类型挡掉，这里不用再判一次。
+        // 直播、故障页、还没起播时 [spot] 是 null（见 [Spot]），saveRecord 会直接返回；
+        // 进度问不出来时也不写（0 是「不知道」，写下去就是把记录抹了）——
+        // 两种情况都在 saveRecord 里挡掉，这里不用再判一次。
         saveRecord(force = true)
     }
 
@@ -1849,7 +1952,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         private const val OVERLAY_MS = 10_000L
         private const val RETRY_MS = 10_000L
         private const val POSITION_INTERVAL_MS = 5_000L
-        private const val SAVE_DEBOUNCE_MS = 5_000L
+
+        // 写盘的防抖与「进度不前进就不写」的判据都在 WatchHistory.shouldStore 里
+        // （纯函数，有单测）；这里不再留一份同名常量，免得两处各改一半。
+
         private const val HUD_TICK_MS = 200L
 
         /** 诊断页刷新间隔（1 Hz）：再快没意义，还费 CPU。 */

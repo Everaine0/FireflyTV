@@ -139,6 +139,62 @@ class WatchHistoryTest {
         assertNull("最老的应该被挤掉了", back.find("电视剧", "剧1"))
     }
 
+    // ---- 写盘判据（「多次切换以后记录丢了」的正解） ----
+
+    /**
+     * 用户报的 bug：**多次切换/关机以后播放记录丢了**。
+     *
+     * 现场：换剧、换库、退到后台都会**立刻**写一条（`force = true`），而那一刻
+     * 播放器往往刚被重建（`prepareAsync` 还没走完、硬解退回软解重播中、已经 release），
+     * `positionMs()` 回的是 0。老实现把 0 照收 —— 0 不是「看到了片头」，是「问不出来」，
+     * 写下去等于把上一次存的好进度抹掉，换回来只能从头看。
+     */
+    @Test
+    fun `问不到进度时绝不写盘，好记录不会被抹成 0`() {
+        var book = WatchHistory.with(WatchHistory.Book.EMPTY, rec("大宅门", 2, 1_700_000L, 1L))
+
+        // 换剧那一刻：force 写，但进度问不出来（播放器刚重建）
+        val write = WatchHistory.shouldStore(
+            posMs = 0L, force = true, now = 2L, lastSavedAt = 0L, lastSavedPos = 0L,
+        )
+        assertFalse("0 = 问不出来，不是片头；写下去就是把 1_700_000 抹成 0", write)
+        if (write) book = WatchHistory.with(book, rec("大宅门", 2, 0L, 2L))
+
+        assertEquals("大宅门的续播点必须原样留着", 1_700_000L, book.find("电视剧", "大宅门")?.posMs)
+        assertEquals(2, book.find("电视剧", "大宅门")?.episode)
+    }
+
+    @Test
+    fun `负数一样当作问不出来`() {
+        // 有些播放器在出错/停止时回 -1，同样不能当进度写下去
+        assertFalse(WatchHistory.usablePosition(-1L))
+        assertFalse(WatchHistory.shouldStore(-1L, force = true, now = 9L, lastSavedAt = 0L, lastSavedPos = 0L))
+        assertTrue(WatchHistory.usablePosition(1L))
+    }
+
+    @Test
+    fun `强制写盘只要进度可用就立刻写，不等防抖`() {
+        // 换台/关电视等不了 5 秒
+        assertTrue(WatchHistory.shouldStore(30_000L, force = true, now = 1_000L, lastSavedAt = 999L, lastSavedPos = 30_000L))
+    }
+
+    @Test
+    fun `周期写盘要隔够时间、也要真的前进了才写`() {
+        val now = 100_000L
+        // 离上次写盘不到 5 秒：不写（老行为，别退化成一个 blob 每 5 秒原样重写）
+        assertFalse(WatchHistory.shouldStore(60_000L, force = false, now = now, lastSavedAt = now - 4_999L, lastSavedPos = 0L))
+        // 时间够了，但只前进了不到 1 秒：不写
+        assertFalse(WatchHistory.shouldStore(60_500L, force = false, now = now, lastSavedAt = now - 5_000L, lastSavedPos = 60_000L))
+        // 时间够、进度也真的前进了：写
+        assertTrue(WatchHistory.shouldStore(61_000L, force = false, now = now, lastSavedAt = now - 5_000L, lastSavedPos = 60_000L))
+    }
+
+    @Test
+    fun `刚起播时没有上次写盘时刻也能写`() {
+        // lastSavedAt = 0（本次会话还没写过）不能让防抖把第一条记录挡住
+        assertTrue(WatchHistory.shouldStore(16_000L, force = false, now = 1_700_000_000_000L, lastSavedAt = 0L, lastSavedPos = 0L))
+    }
+
     // ---- 升级迁移 ----
 
     @Test
