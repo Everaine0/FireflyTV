@@ -15,17 +15,27 @@ stco 里存的是**绝对文件偏移**。重排只是改变了字节在虚拟�
 这里改用**真实的 box 链**逐个走，两者对不上就说明扫描不可靠。
 
 用法：
-    python3 scripts/inspect-mp4-moov.py
+    # 片源路径不入库：--root 指到媒体根目录，后面跟具体文件（不给就自动挑前几个 mp4）
+    python3 scripts/inspect-mp4-moov.py --root <媒体根目录>
+    python3 scripts/inspect-mp4-moov.py --root <媒体根目录> <剧名/第01集.mp4>
 """
+import argparse
+import os
 import struct
 import sys
 from pathlib import Path
 
-NAS = Path(r"<NAS 媒体根目录>")
-TARGETS = [
-    ("大宅门", NAS / "大宅门" / "[大宅门].The.Grand.Mansion.Gate.2001.S01E01.2160p.WEB-DL.H265.AAC-HotWEB.mp4"),
-    ("猫和老鼠", NAS / "猫和老鼠 50周年珍藏版 157集" / "猫和老鼠（001）.mp4"),
-]
+
+def pick_files(root: Path, names: list, limit: int = 2) -> list:
+    """给了文件名就用给的；没给就在 --root 下自动挑前几个 mp4（只扫到够数为止）。"""
+    if names:
+        return [root / n for n in names]
+    out = []
+    for p in root.rglob("*.mp4"):
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
 
 CONTAINERS = {
     b"moov": [b"mvhd", b"trak", b"mvex", b"udta", b"iods"],
@@ -80,16 +90,28 @@ def walk(f, start, end, depth=0, out=None):
 
 
 def parse_stco(f, off, size):
-    """stco: 4 字节 version/flags + 4 字节 entry_count + N*4 字节绝对偏移。"""
-    body = read_range(f, off + 8, size - 8)
-    n = struct.unpack(">I", body[0:4])[0]
-    entries = [struct.unpack(">I", body[4 + 4 * i:8 + 4 * i])[0] for i in range(min(n, 8))]
+    """stco: 4 字节 box 头之后是 4 字节 version/flags + 4 字节 entry_count + N*4 字节绝对偏移。"""
+    body = read_range(f, off + 8, max(size - 8, 0))
+    if len(body) < 8:
+        return 0, []
+    n = struct.unpack(">I", body[4:8])[0]
+    entries = [struct.unpack(">I", body[8 + 4 * i:12 + 4 * i])[0] for i in range(min(n, 8))]
     return n, entries
 
 
-def main():
-    for label, path in TARGETS:
-        print(f"\n########## {label} ##########")
+def main() -> int:
+    ap = argparse.ArgumentParser(description="把 moov 里的关键表摊开，检查重排后 chunk 偏移对不对")
+    ap.add_argument("--root", default=os.environ.get("FF_NAS_ROOT", ""),
+                    help="媒体根目录（也可用环境变量 FF_NAS_ROOT）")
+    ap.add_argument("files", nargs="*", help="相对 --root 的文件路径；不给就自动挑前几个 mp4")
+    args = ap.parse_args()
+    if not args.root:
+        print("缺少 --root（或环境变量 FF_NAS_ROOT）—— 片源路径不入库", file=sys.stderr)
+        return 2
+
+    root = Path(args.root)
+    for path in pick_files(root, args.files):
+        print(f"\n########## {path.name} ##########")
         if not path.exists():
             print("  找不到文件")
             continue
@@ -141,9 +163,11 @@ def main():
                     if entries and not in_range:
                         print("      [!] 偏移**不在** mdat 数据区内 —— 重排后必然解不出来")
                 elif btype == "co64":
-                    body = read_range(f, off + 8, min(size - 8, 4 + 8 * 4))
-                    n = struct.unpack(">I", body[0:4])[0]
-                    entries = [struct.unpack(">Q", body[4 + 8 * i:12 + 8 * i])[0] for i in range(min(n, 8))]
+                    body = read_range(f, off + 8, min(size - 8, 8 + 8 * 4))
+                    if len(body) < 8:
+                        continue
+                    n = struct.unpack(">I", body[4:8])[0]
+                    entries = [struct.unpack(">Q", body[8 + 8 * i:16 + 8 * i])[0] for i in range(min(n, 8))]
                     print(f"    co64: {n} 个条目，前几个 = {entries}")
 
             # 3) 直接把 mdat 开头当成裸 HEVC 试解，确认数据本身是好的

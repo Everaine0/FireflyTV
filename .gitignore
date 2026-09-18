@@ -33,6 +33,12 @@ captures/
 # 私密：真 NAS 测试账号等本机配置（模板见 local.properties.example）
 local.properties
 
+# 直播源播放列表：运营商真实地址 + 地区信息，且与源码无关 —— 只留本机，不入库
+iptv/
+
+# 打包好的 APK 留档目录（体积大、可重编；*.apk 那条已经排除了文件本身）
+firefly-apk/
+
 # Python 脚本（scripts/*.py）跑起来会留字节码，生成物不入库
 __pycache__/
 *.pyc

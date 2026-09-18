@@ -1,5 +1,6 @@
 param(
-    [string]$Ffmpeg = "<ffmpeg>\bin\ffmpeg.exe",
+    # ffmpeg 从 PATH 找，也可以用 FFMPEG 环境变量 / -Ffmpeg 指定
+    [string]$Ffmpeg = $(if ($env:FFMPEG) { $env:FFMPEG } else { 'ffmpeg' }),
     [string]$OutDir = "app\src\androidTest\assets"
 )
 
@@ -18,7 +19,7 @@ param(
 $ErrorActionPreference = "Stop"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-if (-not (Test-Path $Ffmpeg)) { throw "找不到 ffmpeg: $Ffmpeg" }
+if (-not (Get-Command $Ffmpeg -ErrorAction SilentlyContinue)) { throw "找不到 ffmpeg: $Ffmpeg" }
 
 $V = "testsrc=size=320x240:rate=15:duration=12"
 $A = "sine=frequency=440:sample_rate=48000:duration=12"
@@ -68,7 +69,7 @@ Get-ChildItem $OutDir -Filter "audio-*" | ForEach-Object {
 
 Write-Host ""
 Write-Host "=== 逐个确认实际编码（防止 ffmpeg 悄悄换了编码器）==="
-$ffprobe = $Ffmpeg -replace "ffmpeg\.exe$", "ffprobe.exe"
+$ffprobe = if ($env:FFPROBE) { $env:FFPROBE } else { $Ffmpeg -replace "ffmpeg", "ffprobe" }
 Get-ChildItem $OutDir -Filter "audio-*" | ForEach-Object {
     $v = (& $ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 $_.FullName) -join ""
     $au = (& $ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 $_.FullName) -join ""

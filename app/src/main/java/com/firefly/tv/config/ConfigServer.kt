@@ -191,8 +191,8 @@ class ConfigServer(
         val wText = wMsg ?: if (weatherSkipped) {
             "没填，已跳过（电视上不显示天气）"
         } else {
-            // 试通时把「查到的是哪儿、现在多少度」带回去：默认地点是坐标，
-            // 用户能一眼看出是不是查到了自己家
+            // 试通时把「查到的是哪儿、现在多少度」带回去，
+            // 用户能一眼看出地点填得对不对
             weatherOkDetail ?: "连接成功"
         }
         return """{"ok":$ok,"smb":${json(smbText)},"weather":${json(wText)}}"""
@@ -224,8 +224,7 @@ class ConfigServer(
     /**
      * 天气是可选项：两项全空 = 跳过（不算失败，但也不能说成「连接成功」）。
      *
-     * 心知只要**私钥 + 地点**两项，地点留空会用默认坐标（北京），
-     * 所以只有「填了地点却没填私钥」才算是填错了。
+     * 心知要**私钥 + 地点**两项，两项都没有默认值，所以只填一半就是填错了。
      */
     private fun testWeather(p: Map<String, String>): String? {
         val key = p["wkey"].orEmpty().trim()
@@ -236,7 +235,8 @@ class ConfigServer(
             weatherSkipped = true
             return null // 可选，留空即跳过
         }
-        if (key.isBlank()) return "填了城市但没填天气私钥"
+        if (key.isBlank()) return "填了地点但没填天气私钥"
+        if (loc.isBlank()) return "填了私钥但没填城市或坐标"
         val verdict = WeatherClient.test(Config.Weather(key, loc))
         if (verdict.ok) weatherOkDetail = verdict.message
         return if (verdict.ok) null else verdict.message
@@ -423,9 +423,9 @@ class ConfigServer(
   <input id="wkey" autocomplete="off" autocapitalize="off">
   <div class="hint">在 seniverse.com 控制台复制<b>私钥</b>（一串字母数字）。<b>不要填公钥</b>，公钥会被直接拒绝</div>
   <label>城市或坐标</label>
-  <input id="wloc" placeholder="<纬度:经度>" autocomplete="off" autocapitalize="off">
-  <div class="hint">留空就用默认：北京市北京市区（<纬度:经度>）。<br>
-    也可以填城市名（如「北京」）；有些地名套餐里没权限，这时改用坐标一定行</div>
+  <input id="wloc" placeholder="北京，或 39.904:116.407" autocomplete="off" autocapitalize="off">
+  <div class="hint">填城市名，或者「纬度:经度」。<br>
+    有些地名套餐里没权限（保存时会提示「这个地点查不了」），这时改用坐标</div>
 </section>
 
 <button id="btnSave" type="button"><span id="spin"></span>保存并开始使用</button>

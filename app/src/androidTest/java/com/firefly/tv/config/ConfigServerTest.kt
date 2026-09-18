@@ -107,9 +107,8 @@ class ConfigServerTest {
                 empty.body.contains("\"weather\":\"没填，已跳过"),
             )
 
-            // 天气只填一半：**地点填了但没填私钥** —— 这半边必须报出来，
-            // 不能因为「地点有默认值」就静默通过。
-            // （心知只有两项，私钥是唯一必填的那项；原来和风是三项全填或全空。）
+            // 天气只填一半：**地点填了但没填私钥** —— 这半边必须报出来。
+            // （心知只有两项，要么都填、要么都留空。）
             val halfWeather = request(
                 "POST", url,
                 mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare", "wloc" to "北京"),
@@ -118,11 +117,24 @@ class ConfigServerTest {
             assertFalse("不该成功：${halfWeather.body}", halfWeather.body.contains("\"ok\":true"))
             assertTrue("天气填一半应提示：${halfWeather.body}", halfWeather.body.contains("没填天气私钥"))
 
-            // 地点留空是允许的：会用默认坐标（北京），所以只填私钥不算填错，
-            // 但会真的去打一次接口 —— 假 Key 要能拿到一句人话，而不是空白
-            val fakeKey = request(
+            // 只填私钥、没填地点同样是填错：地点没有默认值，
+            // 不能拿一个写死的坐标替用户决定看哪儿的天气
+            val noLoc = request(
                 "POST", url,
                 mapOf("t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare", "wkey" to "not-a-real-key"),
+            )
+            assertEquals(200, noLoc.code)
+            assertFalse("不该成功：${noLoc.body}", noLoc.body.contains("\"ok\":true"))
+            assertTrue("缺地点应提示：${noLoc.body}", noLoc.body.contains("没填城市或坐标"))
+
+            // 两项都填、但私钥是假的：会真的去打一次接口 ——
+            // 假 Key 要能拿到一句人话，而不是空白
+            val fakeKey = request(
+                "POST", url,
+                mapOf(
+                    "t" to server.token, "host" to "127.0.0.1", "share" to "nosuchshare",
+                    "wkey" to "not-a-real-key", "wloc" to "北京",
+                ),
             )
             assertEquals(200, fakeKey.code)
             assertFalse("不该成功：${fakeKey.body}", fakeKey.body.contains("\"ok\":true"))
@@ -186,7 +198,7 @@ class ConfigServerTest {
                     "share" to "media&more",              // & → %26
                     "user" to "user@domain",              // @ → %40
                     "pass" to "p@ss&word=1",              // 三种特殊字符
-                    "wkey" to "k", "wloc" to "<纬度:经度>",
+                    "wkey" to "k", "wloc" to "39.904:116.407",
                 ),
             )
             assertEquals(200, res.code)
@@ -212,7 +224,7 @@ class ConfigServerTest {
                 mapOf(
                     "t" to server.token,
                     "host" to "127.0.0.1", "share" to "nosuchshare",
-                    "wkey" to "fake", "wloc" to "<纬度:经度>",
+                    "wkey" to "fake", "wloc" to "39.904:116.407",
                 ),
             )
             assertEquals(200, res.code)

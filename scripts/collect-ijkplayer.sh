@@ -8,7 +8,8 @@
 #   bash scripts/collect-ijkplayer.sh            # 收集 + 校验
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORK="${WORK:-$HOME/ijkbuild}"
+# 和 build-ijkplayer.sh 的默认 WORK 保持一致，可用 WORK= 覆盖
+WORK="${WORK:-$ROOT/build/ijkbuild}"
 OUT="${OUT:-$ROOT/build-out/ijkplayer-full}"
 ABIS="${ABIS:-armv7a arm64 x86}"
 

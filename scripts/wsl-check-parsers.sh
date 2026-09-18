@@ -6,7 +6,8 @@
 # 正确切成帧，表现是解码器收到一堆垃圾 NAL：
 #   Invalid NAL unit size (...) / get_buffer() failed
 # 而且这种缺失在 `nm | grep decoder` 里**看不出来** —— 那一步只查解码器。
-IJK=/home/<用户>/ijkbuild/ijkplayer
+# ijkplayer 源码目录：默认用仓库内 build-ijkplayer.sh 的产物位置，可用 IJK= 覆盖
+IJK="${IJK:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/ijkbuild/ijkplayer}"
 cd "$IJK" || exit 1
 
 for abi in x86 arm64 armv7a; do

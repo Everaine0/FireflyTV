@@ -52,14 +52,17 @@ class NetworkDiagTest {
         log("host=[$nasHost] -> ${if (nasHost.isBlank()) "未配置" else tcp(nasHost, 445, 6000)}")
 
         log("=== 直播源 (TCP) ===")
-        val targets = listOf(
-            "198.51.100.10" to 82,
-            "192.0.2.112" to 9901,
-            "192.0.2.223" to 9901,
-            "192.0.2.124" to 85,
-            "live.example.com" to 80,
-            "live2.example.com" to 443,
-        )
+        // 直播源地址因运营商/地区而异，不写进仓库：
+        // local.properties 里 ff.live.targets=host:port,host:port，由 build.gradle.kts 转发进来
+        val targets = args.getString("ff.live.targets").orEmpty()
+            .split(',')
+            .mapNotNull { item ->
+                val t = item.trim()
+                if (t.isEmpty()) return@mapNotNull null
+                t.substringBeforeLast(':') to
+                    (t.substringAfterLast(':', "").toIntOrNull() ?: 80)
+            }
+        if (targets.isEmpty()) log("未配置 ff.live.targets（见 local.properties.example），跳过")
         for ((h, p) in targets) log("$h:$p -> ${tcp(h, p)}")
 
         // 这一条必须成立：测试参数没传进来的话，上面所有结论都是假的

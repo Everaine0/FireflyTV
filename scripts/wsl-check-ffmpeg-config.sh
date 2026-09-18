@@ -1,6 +1,7 @@
 #!/bin/bash
 # 直接查每个 ABI 构建出来的 FFmpeg config.h，确认 AC-3 相关的开关。
-IJK=/home/<用户>/ijkbuild/ijkplayer
+# ijkplayer 源码目录：默认用仓库内 build-ijkplayer.sh 的产物位置，可用 IJK= 覆盖
+IJK="${IJK:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/ijkbuild/ijkplayer}"
 cd "$IJK" || exit 1
 
 for abi in x86 arm64-v8a armeabi-v7a; do

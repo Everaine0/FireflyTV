@@ -157,7 +157,7 @@ class PlaybackModeTest {
             PlaybackMode.Transport.of("rtsp://192.0.2.21/PLTV/88888912/224/3221226426/x.smil"),
         )
         assertEquals(PlaybackMode.Transport.RTSP, PlaybackMode.Transport.of("RTSP://host/x"))
-        assertEquals(PlaybackMode.Transport.UDP, PlaybackMode.Transport.of("udp://239.0.0.2.66:4120"))
+        assertEquals(PlaybackMode.Transport.UDP, PlaybackMode.Transport.of("udp://239.0.0.1:4120"))
         assertEquals(PlaybackMode.Transport.UDP, PlaybackMode.Transport.of("rtp://239.1.1.1:5000"))
         assertEquals(
             PlaybackMode.Transport.HTTP,

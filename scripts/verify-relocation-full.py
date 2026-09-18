@@ -13,7 +13,15 @@
 == 做法 ==
 写出**完整**的重排副本：ftyp + moov + 其余全部字节（和 MoovRelocatingSource
 的虚拟视图逐字节等价），再用 ffmpeg 真解。
+
+用法：
+    # 片源路径不入库：--root 指到媒体根目录，后面跟具体文件（不给就自动挑前几个 mp4）
+    # ffmpeg 从 PATH 找，也可以用 FFMPEG 环境变量指定
+    python3 scripts/verify-relocation-full.py --root <媒体根目录>
+    python3 scripts/verify-relocation-full.py --root <媒体根目录> <剧名/第01集.mp4>
 """
+import argparse
+import os
 import shutil
 import struct
 import subprocess
@@ -21,14 +29,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-FFMPEG = r"<ffmpeg>\bin\ffmpeg.exe"
-FFPROBE = r"<ffmpeg>\bin\ffprobe.exe"
 
-NAS = Path(r"<NAS 媒体根目录>")
-TARGETS = [
-    ("猫和老鼠", NAS / "猫和老鼠 50周年珍藏版 157集" / "猫和老鼠（001）.mp4"),
-    ("大宅门", NAS / "大宅门" / "[大宅门].The.Grand.Mansion.Gate.2001.S01E01.2160p.WEB-DL.H265.AAC-HotWEB.mp4"),
-]
+def pick_files(root: Path, names: list, limit: int = 2) -> list:
+    """给了文件名就用给的；没给就在 --root 下自动挑前几个 mp4（只扫到够数为止）。"""
+    if names:
+        return [root / n for n in names]
+    out = []
+    for p in root.rglob("*.mp4"):
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def read_range(f, offset, length):
@@ -112,9 +123,24 @@ def relocated_bytes(local: Path) -> tuple[Path, str]:
     return out, desc
 
 
-def main():
-    for label, path in TARGETS:
-        print(f"\n########## {label} ##########")
+def main() -> int:
+    ap = argparse.ArgumentParser(description="物化完整的 moov 重排副本，再用 ffmpeg 真解一遍")
+    ap.add_argument("--root", default=os.environ.get("FF_NAS_ROOT", ""),
+                    help="媒体根目录（也可用环境变量 FF_NAS_ROOT）")
+    ap.add_argument("files", nargs="*", help="相对 --root 的文件路径；不给就自动挑前几个 mp4")
+    args = ap.parse_args()
+    if not args.root:
+        print("缺少 --root（或环境变量 FF_NAS_ROOT）—— 片源路径不入库", file=sys.stderr)
+        return 2
+
+    ffmpeg = os.environ.get("FFMPEG") or shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("找不到 ffmpeg：装一个，或用 FFMPEG 环境变量指定路径", file=sys.stderr)
+        return 2
+
+    root = Path(args.root)
+    for path in pick_files(root, args.files):
+        print(f"\n########## {path.name} ##########")
         if not path.exists():
             print("  找不到文件")
             continue
@@ -133,7 +159,7 @@ def main():
         print(f"  布局: {desc}")
 
         r = subprocess.run(
-            [FFMPEG, "-v", "error", "-xerror", "-i", str(out), "-t", "5", "-f", "null", "-"],
+            [ffmpeg, "-v", "error", "-xerror", "-i", str(out), "-t", "5", "-f", "null", "-"],
             capture_output=True, text=True, errors="replace",
         )
         ok = r.returncode == 0

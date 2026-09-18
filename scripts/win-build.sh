@@ -41,7 +41,20 @@ MSG
 fi
 
 WSL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WIN_ROOT="${WIN_ROOT:-<Windows 源码树>}"
+
+# Windows 侧的源码树路径因机器而异，不写进仓库 —— 必须显式给出。
+if [ -z "${WIN_ROOT:-}" ]; then
+    cat >&2 <<'MSG'
+✗ 没设置 WIN_ROOT（Windows 侧那棵源码树的路径）
+
+  用法：
+      WIN_ROOT='<Windows 源码树>' scripts/win-build.sh assembleDebug
+
+  脚本会把 app/src、app/build.gradle.kts、app/proguard-rules.pro 和
+  app/libs/*.aar 同步到那棵树，再在 Windows 侧调 Gradle 构建。
+MSG
+    exit 1
+fi
 
 # Windows 侧看不到 /home，走 \\wsl.localhost\<发行版>\... 这条路
 DISTRO="${WSL_DISTRO_NAME:-Debian}"
@@ -67,10 +80,14 @@ copy /Y "%SRC%\\app\\libs\\ijkplayer-full-0.8.8.aar" "%WIN%\\app\\libs\\ijkplaye
 echo copy-aar rc=%ERRORLEVEL%
 
 cd /d "%WIN%"
-set JAVA_HOME=C:\\Program Files\\Microsoft\\jdk-17.0.18.8-hotspot
-set ANDROID_HOME=<Android SDK>
-set ANDROID_SDK_ROOT=<Android SDK>
-call C:\\Users\\<用户>\\.gradle\\wrapper\\dists\\gradle-8.11.1-bin\\bpt9gzteqjrbo1mjrsomdt32c\\gradle-8.11.1\\bin\\gradle.bat %TASKS%
+rem JDK / SDK / Gradle come from the environment or the usual install locations.
+if not defined JAVA_HOME for /d %%j in ("%ProgramFiles%\\Microsoft\\jdk-17*") do set JAVA_HOME=%%~fj
+if not defined ANDROID_HOME if defined LOCALAPPDATA set ANDROID_HOME=%LOCALAPPDATA%\\Android\\Sdk
+if not defined ANDROID_SDK_ROOT set ANDROID_SDK_ROOT=%ANDROID_HOME%
+set GRADLE_BAT=
+for /d %%g in ("%USERPROFILE%\\.gradle\\wrapper\\dists\\gradle-8.11.1-bin\\*") do if exist "%%~fg\\gradle-8.11.1\\bin\\gradle.bat" set GRADLE_BAT=%%~fg\\gradle-8.11.1\\bin\\gradle.bat
+if not defined GRADLE_BAT echo gradle 8.11.1 not found under %USERPROFILE%\\.gradle\\wrapper\\dists & exit /b 1
+call "%GRADLE_BAT%" %TASKS%
 set RC=%ERRORLEVEL%
 
 if exist "%WIN%\\app\\build\\outputs\\apk\\debug\\app-debug.apk" copy /Y "%WIN%\\app\\build\\outputs\\apk\\debug\\app-debug.apk" "%SRC%\\build\\apk\\app-debug.apk" >nul

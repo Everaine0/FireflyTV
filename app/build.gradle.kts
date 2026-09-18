@@ -40,6 +40,8 @@ android {
             "ff.smb.pass", "ff.smb.domain", "ff.smb.root",
             // 天气私钥是临时的、以后可能换，所以同样不写进仓库
             "ff.weather.key", "ff.weather.location",
+            // 直播源探测目标（NetworkDiagTest）：host:port,host:port —— 因运营商而异
+            "ff.live.targets",
         ).forEach { key ->
             localSecrets[key]?.let { testInstrumentationRunnerArguments[key] = it }
         }

@@ -5,15 +5,16 @@
 # so Chinese comments/literals in this file get mangled and break parsing.
 # The generated asset names and paths are ASCII, so nothing is lost.
 param(
-    [string]$FfmpegPath = '<ffmpeg>\bin\ffmpeg.exe',
-    [string]$MediaRoot = '<本地媒体目录>'
+    # ffmpeg comes from PATH (or the FFMPEG env var / -FfmpegPath).
+    [string]$FfmpegPath = $(if ($env:FFMPEG) { $env:FFMPEG } else { 'ffmpeg' }),
+    [string]$MediaRoot = (Join-Path $env:TEMP 'firefly-media')
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 
-if (-not (Test-Path $FfmpegPath)) {
-    Write-Error "ffmpeg not found at $FfmpegPath"
+if (-not (Get-Command $FfmpegPath -ErrorAction SilentlyContinue)) {
+    Write-Error "ffmpeg not found: $FfmpegPath (put it on PATH or pass -FfmpegPath)"
 }
 
 # 1) sample videos for instrumentation tests

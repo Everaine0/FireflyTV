@@ -158,7 +158,7 @@ object PlaybackMode {
     //
     // 直播源换过一批：原来是 HTTP/HLS（`http://…/live/cctv1hd.m3u8`），
     // 现在是运营商 IPTV 的 **RTSP 单播**（`rtsp://192.0.2.21/PLTV/…smil`）
-    // 和 **UDP 组播**（`udp://239.0.0.2.66:4120`）。
+    // 和 **UDP 组播**（`udp://239.0.0.1:4120`）。
     // 但 [PlaybackEngine] 的选项是照 HTTP/HLS 写的，于是两处硬伤：
     //
     // ### 硬伤 1：`timeout` 是**秒**，不是微秒

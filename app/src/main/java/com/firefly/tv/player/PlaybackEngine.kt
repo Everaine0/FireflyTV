@@ -749,7 +749,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
                     // ## 这两行是「IPTV 直播播不了 / 播一段卡住」的修复点
                     //
                     // 1) `rtsp_transport = tcp`
-                    //    ijkplayer 默认走 UDP，而运营商这套 IPTV 拒绝 UDP 的 SETUP
+                    //    ijkplayer 默认走 UDP，而这套运营商 IPTV 拒绝 UDP 的 SETUP
                     //    （回 `405 Method Not Allowed`）。ffmpeg 3.4 本来有一条
                     //    「UDP 超时 → 改用 TCP」的回退，实测在这条通路上触发不了，
                     //    表现是每个频道都在 `could not find codec parameters` 上死掉。

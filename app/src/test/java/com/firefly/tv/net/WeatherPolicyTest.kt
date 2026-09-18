@@ -82,29 +82,18 @@ class WeatherPolicyTest {
     // ---- 配置 ----
 
     @Test
-    fun `默认地点就是用户家，而且坐标比地名权限宽`() {
-        // 实测：location=北京 → AP010006 没权限访问这个地点；
-        //       <纬度:经度> → 正常返回「北京,北京,内蒙古,中国」。
-        // 所以默认值必须是坐标
-        assertEquals("<纬度:经度>", Config.Weather.DEFAULT_LOCATION)
-        assertTrue(Config.Weather.DEFAULT_LOCATION.contains(":"))
-        assertEquals(
-            "地点留空时要用默认坐标，而不是留空去请求",
-            Config.Weather.DEFAULT_LOCATION,
-            Config.Weather("key", "").normalized().location,
-        )
-    }
-
-    @Test
-    fun `只填了私钥也算配置好了`() {
-        assertTrue(Config.Weather("k", "").normalized().ready)
-        assertFalse(Config.Weather("", "北京").ready)
+    fun `没有默认地点，私钥和地点必须都填`() {
+        // 曾经写死过一个具体坐标当默认地点：既泄露隐私，也等于替用户决定看哪儿的天气。
+        // 现在两项都没有默认值，只填一半就是没配好。
+        assertFalse(Config.Weather("key", "").normalized().ready)
+        assertFalse(Config.Weather("", "北京").normalized().ready)
+        assertTrue(Config.Weather("key", "北京").normalized().ready)
     }
 
     @Test
     fun `地点和私钥两边的空格会被去掉`() {
-        val w = Config.Weather("  <私钥>  ", "  <纬度:经度>  ").normalized()
-        assertEquals("<私钥>", w.key)
-        assertEquals("<纬度:经度>", w.location)
+        val w = Config.Weather("  key  ", "  39.904:116.407  ").normalized()
+        assertEquals("key", w.key)
+        assertEquals("39.904:116.407", w.location)
     }
 }

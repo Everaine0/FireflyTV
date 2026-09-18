@@ -15,16 +15,27 @@ stco 存的是 chunk 在文件里的位置。如果它存的是**绝对偏移**�
 工具错了就会得出错误结论（今天已经栽过一次），所以这版每一步都打印原始字节。
 
 用法：
-    python3 scripts/dump-stco.py
+    # 片源路径不入库：--root 指到媒体根目录，后面跟具体文件（不给就自动挑前几个 mp4）
+    python3 scripts/dump-stco.py --root <媒体根目录>
+    python3 scripts/dump-stco.py --root <媒体根目录> <剧名/第01集.mp4>
 """
+import argparse
+import os
 import struct
 import sys
 from pathlib import Path
 
-NAS = Path(r"<NAS 媒体根目录>")
-TARGETS = [
-    ("猫和老鼠", NAS / "猫和老鼠 50周年珍藏版 157集" / "猫和老鼠（001）.mp4"),
-]
+
+def pick_files(root: Path, names: list, limit: int = 3) -> list:
+    """给了文件名就用给的；没给就在 --root 下自动挑前几个 mp4（只扫到够数为止）。"""
+    if names:
+        return [root / n for n in names]
+    out = []
+    for p in root.rglob("*.mp4"):
+        out.append(p)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def read_range(f, offset, length):
@@ -61,9 +72,19 @@ def find_box(f, start, end, want, depth=0):
     return None
 
 
-def main():
-    for label, path in TARGETS:
-        print(f"\n########## {label} ##########")
+def main() -> int:
+    ap = argparse.ArgumentParser(description="把 moov 里的 stco 摊开，和物理布局对照")
+    ap.add_argument("--root", default=os.environ.get("FF_NAS_ROOT", ""),
+                    help="媒体根目录（也可用环境变量 FF_NAS_ROOT）")
+    ap.add_argument("files", nargs="*", help="相对 --root 的文件路径；不给就自动挑前几个 mp4")
+    args = ap.parse_args()
+    if not args.root:
+        print("缺少 --root（或环境变量 FF_NAS_ROOT）—— 片源路径不入库", file=sys.stderr)
+        return 2
+
+    root = Path(args.root)
+    for path in pick_files(root, args.files):
+        print(f"\n########## {path.name} ##########")
         if not path.exists():
             print("  找不到文件")
             continue
@@ -138,9 +159,11 @@ def main():
                 co64 = find_box(f, stbl[0] + 8, stbl[0] + stbl[1], "co64")
                 print(f"\n    trak#{idx} handler={handler}  stbl@{stbl[0]:,}")
                 if stco:
-                    off, size, hdr = stco
-                    raw = read_range(f, off, min(size, 8 + 4 * 6))
-                    print(f"      stco @{off:,} size={size:,}")
+                    # find_box 返回的是 box 起点，version/flags 要再跳过 8 字节的 box 头
+                    pos, size, hdr = stco
+                    body = pos + hdr
+                    raw = read_range(f, body, min(size - hdr, 8 + 4 * 6))
+                    print(f"      stco @{pos:,} size={size:,}")
                     print(f"        原始字节: {raw.hex()}")
                     version_flags = struct.unpack(">I", raw[0:4])[0]
                     count = struct.unpack(">I", raw[4:8])[0]
@@ -150,15 +173,15 @@ def main():
                     print(f"        前几个偏移: {[hex(e) for e in ents]}")
                     print(f"        (十进制)   {ents}")
                     inside = sum(1 for i in range(count)
-                                 if struct.unpack(">I", read_range(f, off + 8 + 4 * i, 4))[0]
+                                 if struct.unpack(">I", read_range(f, body + 8 + 4 * i, 4))[0]
                                  >= mdat[1] + 8)
                     print(f"        落在 mdat 起始之后的: {inside}/{count}")
                 if co64:
-                    off, size, hdr = co64
-                    raw = read_range(f, off, min(size, 8 + 8 * 4))
+                    pos, size, hdr = co64
+                    raw = read_range(f, pos + hdr, min(size - hdr, 8 + 8 * 4))
                     version_flags = struct.unpack(">I", raw[0:4])[0]
                     count = struct.unpack(">I", raw[4:8])[0]
-                    print(f"      co64 @{off:,} size={size:,} count={count} 原始={raw[:32].hex()}")
+                    print(f"      co64 @{pos:,} size={size:,} count={count} 原始={raw[:32].hex()}")
 
                 trak_pos = trak[0] + trak[1]
 

@@ -1,6 +1,7 @@
 param(
-    [string]$Ffprobe = "<ffmpeg>\bin\ffprobe.exe",
-    [string]$Ffmpeg  = "<ffmpeg>\bin\ffmpeg.exe",
+    # ffmpeg/ffprobe come from PATH; override with the env vars if yours live elsewhere.
+    [string]$Ffprobe = $(if ($env:FFPROBE) { $env:FFPROBE } else { 'ffprobe' }),
+    [string]$Ffmpeg  = $(if ($env:FFMPEG)  { $env:FFMPEG }  else { 'ffmpeg' }),
     [string]$File    = "build-out\verify\sample.ts"
 )
 

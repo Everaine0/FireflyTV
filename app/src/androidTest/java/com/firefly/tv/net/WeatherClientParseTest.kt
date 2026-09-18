@@ -16,9 +16,9 @@ import org.junit.Test
  * （实测过，加一个真的 `org.json:json` 也盖不过它）。所以凡是跟 JSON 有关的断言
  * 都在这里跑 —— 真机/模拟器上是真的 org.json。
  *
- * 下面两段报文是**从接口上抓下来的真实响应**
- * （`location=<纬度:经度>`，北京市北京市区）。字段名打错的话接口不报错、
- * 只是电视上永远显示空白，所以必须拿真报文钉住。
+ * 下面两段报文是**从接口上抓下来的真实响应**（地名与 location id 做过匿名替换，
+ * 字段结构原样）。字段名打错的话接口不报错、只是电视上永远显示空白，
+ * 所以必须拿真报文钉住。
  *
  * 结果看 `adb logcat -s FireflyWeather`。
  */
@@ -27,14 +27,14 @@ class WeatherClientParseTest {
     private fun log(msg: String) = android.util.Log.i("FireflyWeather", msg)
 
     private val realNow = """
-    {"results":[{"location":{"id":"WXSRS6SF7KJ2","name":"北京","country":"CN",
-    "path":"北京,北京,内蒙古,中国","timezone":"Asia/Shanghai","timezone_offset":"+08:00"},
+    {"results":[{"location":{"id":"WXPLACEHOLDER","name":"北京","country":"CN",
+    "path":"北京,北京,中国","timezone":"Asia/Shanghai","timezone_offset":"+08:00"},
     "now":{"text":"晴","code":"1","temperature":"17"},
     "last_update":"2026-09-11T21:20:00+08:00"}]}
     """.trimIndent()
 
     private val realDaily = """
-    {"results":[{"location":{"id":"WXSRS6SF7KJ2","name":"北京"},
+    {"results":[{"location":{"id":"WXPLACEHOLDER","name":"北京"},
     "daily":[
     {"date":"2026-09-11","text_day":"阴","code_day":"9","text_night":"晴","code_night":"1",
      "high":"27","low":"11","precip":"0.00","wind_direction":"西","wind_scale":"5","humidity":"39"},

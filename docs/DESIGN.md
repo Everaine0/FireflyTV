@@ -467,12 +467,12 @@ OpenSSL_1_0_2n），`do-compile-ffmpeg.sh` 里有
 
 | 请求 | 结果 |
 | :--- | :--- |
-| `key=<公钥>&location=北京` | `AP010003 API 密钥 key 错误` —— **公钥不能用** |
-| `key=<私钥>&location=北京` | `AP010006 没有权限访问这个地点` |
-| `key=<私钥>&location=<纬度:经度>` | ✅ 返回「北京,北京,内蒙古,中国」 |
+| `key=<公钥>&location=<某地名>` | `AP010003 API 密钥 key 错误` —— **公钥不能用** |
+| `key=<私钥>&location=<某地名>` | `AP010006 没有权限访问这个地点` |
+| `key=<私钥>&location=<纬度:经度>` | ✅ 正常返回该地点 |
 
-所以默认地点是**市区的坐标**而不是城市名 —— 用户要的「越精确越好，市区没有就北京」，
-而这个坐标解析出来正好就是北京。
+所以配置页两种写法都收，**不留默认地点**：写死一个坐标既泄露隐私，
+也等于替用户决定看哪儿的天气。两项要么都填、要么都留空（留空 = 电视上不显示天气）。
 
 **频率**（用户特意交代）：免费套餐按次计费，超了回 `AP010014`。
 `WeatherClient.shouldFetch` 是纯函数（有单测）：成功 30 分钟保鲜、失败 5 分钟冷却、
@@ -736,9 +736,11 @@ len > 0 且位置已在末尾 → 返回 -1（这才是 EOF；ijkmds_read 里 0 
 
 直播源已经从 `http://…/live/cctv1hd.m3u8` 那批 HLS 换成了运营商 IPTV：
 
-- **RTSP 单播** —— `rtsp://192.0.2.21/PLTV/…/…_0.smil`（19 个频道，见 `iptv/运营商-单播.m3u`），
+- **RTSP 单播** —— `rtsp://192.0.2.21/PLTV/…/…_0.smil`（19 个频道），
   服务端先回 `302` 跳到 `192.0.2.x:554` 并带一次性 `online=<unix秒>` 参数；
-- **UDP 组播** —— `udp://239.0.0.x.x:4120`（见 `iptv/运营商-组播.m3u`）。
+- **UDP 组播** —— `udp://239.0.0.x:4120`。
+
+> 两份播放列表本身**不入库**（含运营商真实地址与地区），见 `.gitignore` 里的 `iptv/`。
 
 下面这张表是 2026-09-12 在模拟器上直连真实源重测的（含 `assembleRelease`
 出来的**正式包**，不只是 debug 包）：
@@ -747,7 +749,7 @@ len > 0 且位置已在末尾 → 返回 -1（这才是 EOF；ijkmds_read 里 0 
 | :--- | :--- | :--- | :--- | :---: | :---: | :---: |
 | CCTV-1 / CCTV-6 / CCTV-8 / CCTV-11（RTSP 单播） | MPEG-TS over RTSP | H.264 High 1080p25 | AAC-LC 或 MP2 | ✅ | ✅ | ✅ |
 | 其余单播频道（共 19 个） | 同上 | 同上 | 同上 | ✅ | ✅ | ✅ |
-| 组播 `udp://239.0.0.x.x` | MPEG-TS over UDP | — | — | ⚠️ | — | — |
+| 组播 `udp://239.0.0.x` | MPEG-TS over UDP | — | — | ⚠️ | — | — |
 
 实测数据（CCTV-6，7.66 Mbit/s = 18094 KiB 视频 + 632 KiB 音频 / 20.03 秒）：
 `302` 之后 **约 1.2 秒出首帧**，连续三分钟零错误、零重连。
@@ -925,7 +927,7 @@ scripts/pack-ijkplayer-aar.sh  # 打包成 app/libs/ijkplayer-full-0.8.8.aar
 - **字幕规则**（§5）仍未实现。
 - **`AudioSupport.BUILT_IN` 必须跟着内核一起维护**：换了内核却忘了改这张表，
   就会误报「这台电视不支持」。单元测试会遍历所有编码把两个方向都钉住。
-- **UDP 组播频道（`udp://239.0.0.x.x`）仍未验证**。不是源的问题，是**模拟器**的问题：
+- **UDP 组播频道（`udp://239.0.0.x`）仍未验证**。不是源的问题，是**模拟器**的问题：
   它走 SLIRP NAT，组播本身就通不出去，所以这条路只能上真机/真网络测。
   代码侧已按组播的特性给了独立的超时处理与存活看门狗（见上面「两个根因」），
   但**没有实测背书**，别当成已支持。百度网盘直链那类同理。
@@ -1384,7 +1386,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | **直播也在写续播进度** | IPTV 的 `currentPosition` 是从开播算起的毫秒数，被当成进度存下来，下次拿它去 seek 一条直播流 —— 这就是「IPTV 音画不同步」的确定成因。现在 `PlaybackMode` 写死「只有点播配拥有进度」，6 项测试钉住 |
 | **SMB 会话废掉后再也连不上** | 底层断过一次后，单例里缓存的 `DiskShare` 一直在报 "already been closed"，每次调用都失败，只能重启应用。现在 `SmbStore` 每次调用前检查连接可用性，坏了就重建 |
 | **换剧回来只能从头看** | 全局只有一份观看记录，换一部剧就把它覆盖掉，`Navigator.vertical` 还写死从第 1 集 0 秒起。现在按「库 + 剧」各存一条，5 秒一次周期写盘（老人直接关电视也最多丢 5 秒），换剧/换库/开机都接着上次看（风险 19） |
-| **天气换成心知天气** | 和风要填专属 Host，老人填不对；心知只有私钥 + 地点两栏。实测公钥会被拒（AP010003）、地名可能没权限（AP010006），所以默认地点用市区坐标 <纬度:经度>（解析为北京）。频率做了 30 分钟保鲜 + 5 分钟冷却 + 结果落盘（风险 20） |
+| **天气换成心知天气** | 和风要填专属 Host，老人填不对；心知只有私钥 + 地点两栏。实测公钥会被拒（AP010003）、地名可能没权限（AP010006）；地点不留默认值（写死坐标既泄露隐私也替用户做决定），两项要么都填、要么都留空。频率做了 30 分钟保鲜 + 5 分钟冷却 + 结果落盘（风险 20） |
 | **换回直播就冻住（403）** | ijkplayer 的 DNS 缓存只按主机名做键、却把端口一起缓存：央视 `…:82` 的地址被连到缓存里的 `…:81`，请求行/`Host` 却还是 `:82` 那份 → openresty 403，缓存活到进程结束所以永远不好。改为不信那份缓存（风险 15），实测每次换台都是 `:82→302→:81→206`，CCTV-1 稳定 25.00 fps |
 | **直播失败一声不吭** | 引擎的直播分支自己重连、却一次回调都不发，界面永远冻在上一帧、按键还有反应 —— 看起来就是死机。新增 `Listener.onLiveRetry` + 两句人话（风险 16） |
 | **`https://` 直播源全部起不来** | 内核没编 OpenSSL（官方三个 AAR 也没有），https 源一律 `Protocol not found`。已给三个 ABI 补上（风险 17） |
@@ -1400,13 +1402,13 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | 项 | 值 |
 | :--- | :--- |
 | 构建 | 联网机器：`.\gradlew assembleDebug`；**本机：`.\build.ps1`**（本机访问不到 services.gradle.org，脚本直接用缓存里的 Gradle 8.11.1）。WSL 里改代码、Windows 里构建时用 `scripts/win-build.sh`（**连 build.gradle.kts / proguard / AAR 一起同步**，只镜像 app/src 会「改了构建脚本却不生效」） |
-| 环境 | SDK `<Android SDK>`，JDK 17，Gradle 8.11.1（均已就绪） |
+| 环境 | Android SDK + JDK 17 + Gradle 8.11.1（本机路径不入库，构建脚本会自己找） |
 | **ABI** | 必须含 `armeabi-v7a` + `arm64-v8a`（电视）+ **`x86`**（模拟器，缺了会直接崩） |
 | 正式包 | `.\build.ps1 assembleRelease` → `app-release.apk`（~25MB，debug 包 ~30MB）：R8 压缩 + 资源裁剪 + 去掉 `v/d/i` 日志（规则见 `app/proguard-rules.pro`）。**签名复用 debug keystore**，否则装不上电视上现有的包（换签名 = `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，卸载会清配置） |
 | R8 两个坑 | ①`net.engio.mbassy` 被写成 `net.engio.mbassador`（keep 规则等于没写，debug 包不压缩所以一直没症状）；②`javax.el.**` / `org.ietf.jgss.**` 是 Java SE 专有依赖，必须 `-dontwarn`，否则 R8 直接失败。**开 R8 的价值一半在这里** —— 它把「装上能开、一连 NAS 就崩」这类问题提到了构建期 |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**219 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**228 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
 | 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
 | 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |

@@ -16,11 +16,21 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$adb = '<Android SDK>\platform-tools\adb.exe'
-$emulator = '<Android SDK>\emulator\emulator.exe'
 
-$env:JAVA_HOME = if ($env:JAVA_HOME) { $env:JAVA_HOME } else { 'C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot' }
-$env:ANDROID_HOME = if ($env:ANDROID_HOME) { $env:ANDROID_HOME } else { '<Android SDK>' }
+# Android SDK / JDK：环境变量优先，其次常见安装位置（路径因机器而异，不入库）
+if (-not $env:ANDROID_HOME) {
+    $env:ANDROID_HOME = @("$env:LOCALAPPDATA\Android\Sdk") |
+        Where-Object { Test-Path (Join-Path $_ 'platform-tools') } |
+        Select-Object -First 1
+}
+if (-not $env:ANDROID_HOME) { throw '找不到 Android SDK：设置 ANDROID_HOME，或装一个 Android Studio' }
+if (-not $env:JAVA_HOME) {
+    $jdk = Get-ChildItem "$env:ProgramFiles\Microsoft\jdk-17*" -Directory -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($jdk) { $env:JAVA_HOME = $jdk.FullName }
+}
+$adb = Join-Path $env:ANDROID_HOME 'platform-tools\adb.exe'
+$emulator = Join-Path $env:ANDROID_HOME 'emulator\emulator.exe'
 
 # ---- 1) 模拟器 ----
 $running = (& $adb devices) -match 'emulator-\d+\s+device'

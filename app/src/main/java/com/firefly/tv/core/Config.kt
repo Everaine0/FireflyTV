@@ -87,20 +87,14 @@ object Config {
      * 原来还要一个「账号专属 Host」（和风 2026 起的规定），换到心知之后
      * 域名是固定的 `api.seniverse.com`，那一栏就删掉了 —— 少一栏就少一个填错的机会。
      *
-     * 地点默认给的是**经纬度**而不是城市名：心知的免费套餐里
-     * 「北京」这个名字会回 `AP010006 没有权限访问这个地点`，
-     * 而 `<纬度:经度>` 能查到，返回的正是「北京,北京,内蒙古,中国」。
-     * 也就是说坐标反而比名字更准、权限也更宽。
+     * 地点**不留默认值**：写死过某个具体坐标既泄露隐私，也等于替用户决定看哪儿的天气。
+     * 要么私钥和地点都填，要么都留空（留空 = 电视上不显示天气）。
+     * 实测地名有时会回 `AP010006 没有权限访问这个地点`，这时换成「纬度:经度」通常就能查到。
      */
     data class Weather(val key: String, val location: String) {
         val ready: Boolean get() = key.isNotBlank() && location.isNotBlank()
 
-        fun normalized(): Weather = Weather(key.trim(), location.trim().ifBlank { DEFAULT_LOCATION })
-
-        companion object {
-            /** 北京市北京市区（接口解析为「北京」）。 */
-            const val DEFAULT_LOCATION = "<纬度:经度>"
-        }
+        fun normalized(): Weather = Weather(key.trim(), location.trim())
     }
 
     fun weather(ctx: Context): Weather {

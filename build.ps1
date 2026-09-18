@@ -26,9 +26,22 @@ if (-not $gradleBat) {
     Write-Error "Gradle 8.11.1 not found in the local wrapper cache. Install Gradle or use gradlew with network access."
 }
 
-if (-not $env:JAVA_HOME) { $env:JAVA_HOME = 'C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot' }
-if (-not $env:ANDROID_HOME) { $env:ANDROID_HOME = '<Android SDK>' }
-if (-not $env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME }
+# JDK / Android SDK: environment variables win; otherwise probe the usual spots.
+# Machine-specific install paths must not be baked into the repo.
+if (-not $env:JAVA_HOME) {
+    $jdk = Get-ChildItem "$env:ProgramFiles\Microsoft\jdk-17*" -Directory -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($jdk) { $env:JAVA_HOME = $jdk.FullName }
+    else { Write-Warning 'JAVA_HOME is not set and no Microsoft JDK 17 was found; Gradle may fail.' }
+}
+if (-not $env:ANDROID_HOME) {
+    $sdk = @("$env:LOCALAPPDATA\Android\Sdk", "$env:ProgramFiles\Android\Android Studio") |
+        Where-Object { $_ -and (Test-Path (Join-Path $_ 'platform-tools')) } |
+        Select-Object -First 1
+    if ($sdk) { $env:ANDROID_HOME = $sdk }
+    else { Write-Warning 'ANDROID_HOME is not set and no SDK was found; Gradle may fail.' }
+}
+if ($env:ANDROID_HOME -and -not $env:ANDROID_SDK_ROOT) { $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME }
 
 Write-Host "gradle : $gradleBat"
 Write-Host "tasks  : $($Tasks -join ' ')"
