@@ -246,4 +246,51 @@ class NavigatorTest {
         assertEquals(0, Navigator.libraryIndexAfterRefresh(fresh, null))
         assertEquals(0, Navigator.libraryIndexAfterRefresh(fresh, ""))
     }
+
+    // ---- 「再次打开应用」该不该救一把 ----
+
+    /**
+     * `singleTask` 下再次打开走 `onNewIntent`，**不会重建 Activity**；而它原来是个
+     * 空操作 —— 于是"进程活着但界面卡住"时，用户点图标毫无反应，只能强停或重启电视。
+     * 判据必须很窄：正常播放中点一下图标绝不能把画面打断重来。
+     */
+    @Test
+    fun `再次打开时只有真的什么都没在播才救`() {
+        assertTrue(
+            "没在播、没排队、没故障页 = 卡住了",
+            Navigator.needsRecovery(playing = false, hasPending = false, faultVisible = false, configVisible = false),
+        )
+    }
+
+    @Test
+    fun `正常播放时再次打开不动它`() {
+        assertFalse(
+            "正在播就别打扰",
+            Navigator.needsRecovery(playing = true, hasPending = false, faultVisible = false, configVisible = false),
+        )
+    }
+
+    @Test
+    fun `还在排队等 Surface 或等 NAS 时再次打开也不动它`() {
+        assertFalse(
+            "有内容排着队，让它自己走完",
+            Navigator.needsRecovery(playing = false, hasPending = true, faultVisible = false, configVisible = false),
+        )
+    }
+
+    @Test
+    fun `故障页已经在说原因时再次打开不抢它`() {
+        assertFalse(
+            "故障页自带 10 秒重试，抢它只会多跑一次扫描",
+            Navigator.needsRecovery(playing = false, hasPending = false, faultVisible = true, configVisible = false),
+        )
+    }
+
+    @Test
+    fun `配置页占屏时再次打开不当作卡住`() {
+        assertFalse(
+            "那是用户在配置，不是卡住",
+            Navigator.needsRecovery(playing = false, hasPending = false, faultVisible = false, configVisible = true),
+        )
+    }
 }

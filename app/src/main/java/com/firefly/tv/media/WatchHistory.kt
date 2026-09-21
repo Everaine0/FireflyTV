@@ -178,6 +178,27 @@ object WatchHistory {
     fun usablePosition(posMs: Long): Boolean = posMs > 0
 
     /**
+     * 自动连播到第 [epIndex] 集时该从哪儿起播（拿不到就用 0）。
+     *
+     * ⚠️ 传 0 的后果不是"从头看"那么轻：`MainActivity.playEpisode(startMs)` 一进去
+     * 就按这个值**写一条记录**，所以自动连播时传 0 会把下一集已经存下的续播点
+     * **直接覆盖掉** —— 用户第二天打开就从那一集开头重看。
+     *
+     * 两条规矩：
+     *  - 记录里的集号必须就是这一集（否则那是别的集的进度，拿它 seek 会跳到莫名其妙的位置）；
+     *  - 进度必须「可信」（见 [usablePosition]；小于 [MIN_RESUME_MS] 的会被
+     *    [Record.resumeMs] 归 0，那本来也是"刚点开看了一眼"）。
+     *
+     * 抽成纯函数是为了能用单测钉住 —— 这条 bug 只在"上一集播完"那一刻才显形，
+     * 靠手点很难回归。
+     */
+    fun autoAdvanceResumeMs(rec: Record?, epIndex: Int): Long {
+        if (rec == null || rec.episode != epIndex) return 0L
+        val pos = rec.resumeMs
+        return if (usablePosition(pos)) pos else 0L
+    }
+
+    /**
      * 要不要把这次量到的进度写进记录（纯函数，单测钉住）。
      *
      * - 问不到进度（≤ 0）→ **一律不写**，宁可留着上一次那条旧的（见 [usablePosition]）；

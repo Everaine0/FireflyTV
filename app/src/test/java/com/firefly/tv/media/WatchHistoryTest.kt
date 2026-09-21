@@ -212,4 +212,43 @@ class WatchHistoryTest {
         assertTrue(book.isEmpty)
         assertFalse(WatchHistory.serialize(book).contains("r="))
     }
+
+    // ---- 自动连播时的续播点 ----
+
+    /**
+     * 自动连播到下一集时，**不能**把下一集存着的续播点抹成 0。
+     *
+     * 现场：一集播完自动跳下一集，`playEpisode(0L)` 一进去就按 0 写记录 ——
+     * 于是下一集已经看到的进度被覆盖，用户第二天打开从那一集开头重看。
+     * 这条只在"上一集播完"那一刻才显形，靠手点很难回归，所以用纯函数钉住。
+     */
+    @Test
+    fun `自动连播要接着下一集自己的进度`() {
+        val rec = WatchHistory.Record("电视剧", "娘道", 3, 600_000L, 1L)
+        assertEquals(600_000L, WatchHistory.autoAdvanceResumeMs(rec, 3))
+    }
+
+    @Test
+    fun `自动连播拿到别的集的记录时从头播`() {
+        val rec = WatchHistory.Record("电视剧", "娘道", 3, 600_000L, 1L)
+        // 记录属于第 3 集，但要播的是第 4 集 —— 拿别人的进度去 seek 会跳到莫名其妙的位置
+        assertEquals(0L, WatchHistory.autoAdvanceResumeMs(rec, 4))
+    }
+
+    @Test
+    fun `自动连播没有记录时从头播`() {
+        assertEquals(0L, WatchHistory.autoAdvanceResumeMs(null, 0))
+        assertEquals(0L, WatchHistory.autoAdvanceResumeMs(null, 7))
+    }
+
+    @Test
+    fun `自动连播时刚点开一眼的进度不算数`() {
+        // resumeMs 对 < MIN_RESUME_MS（15 秒）的进度返回 0：那是"点开看了一眼"，
+        // 从第 8 秒接着播反而让人以为"怎么一打开就跳到中间"
+        val barely = WatchHistory.Record("电视剧", "娘道", 0, 8_000L, 1L)
+        assertEquals(0L, WatchHistory.autoAdvanceResumeMs(barely, 0))
+        // 可信的进度照常传下去
+        val watched = WatchHistory.Record("电视剧", "娘道", 0, 600_000L, 1L)
+        assertEquals(600_000L, WatchHistory.autoAdvanceResumeMs(watched, 0))
+    }
 }

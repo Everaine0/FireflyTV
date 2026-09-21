@@ -1592,14 +1592,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     /** 一集播完自动下一集 → 全剧播完下一部剧 → 最后一部回到该库第一部（DESIGN §5）。 */
     private fun onEpisodeFinished() {
-        trace("onEpisodeFinished lib=${libraries.getOrNull(libIndex)?.name} show=[$showName] ep=$episodeIndex/${episodes.size}")
+        val libNow = libraries.getOrNull(libIndex)
+        trace("onEpisodeFinished lib=${libNow?.name} show=[$showName] ep=$episodeIndex/${episodes.size}")
         if (episodeIndex + 1 < episodes.size) {
             episodeIndex++
-            playEpisode(0L)
+            // 下一集自己的续播点，别用 0 把它抹掉（见 [autoAdvanceStartMs]）。
+            // `libNow` 为空（库还没就绪）时按 0 处理：宁可从头，也不要拿错库的记录去 seek。
+            playEpisode(autoAdvanceStartMs(libNow?.name.orEmpty(), showName, episodeIndex))
             return
         }
         // 全剧播完 → 下一部剧（用缓存的剧列表，不再问 NAS）
-        val lib = libraries.getOrNull(libIndex) as? Library.Video ?: run {
+        val lib = libNow as? Library.Video ?: run {
             playEpisode(0L)
             return
         }
@@ -1624,7 +1627,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     /** 换到 [list] 里 [showName] 的下一部剧；列表为空就原地重播这一集。 */
     private fun advanceToNextShow(lib: Library.Video, list: List<String>) {
         if (list.isEmpty()) {
-            playEpisode(0L)
+            playEpisode(autoAdvanceStartMs(lib.name, showName, episodeIndex))
             return
         }
         val cur = list.indexOf(showName)
@@ -1635,6 +1638,22 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         val at = resumeOf(lib.name, list[next])
         playShow(lib, next, at.episode, at.positionMs, librarySeq)
     }
+
+    /**
+     * 自动连播到下一集时，该从哪一毫秒起播。
+     *
+     * ## ⚠️ 这里曾经写死 0，等于把下一集存着的续播点抹掉
+     *
+     * `playEpisode(startMs)` 一开始就会按 `startMs` 写一条记录（见那里的注释），
+     * 所以上一集播完自动跳下一集时传 0，就把下一集**已经存下的**续播点覆盖成 0 ——
+     * 用户第二天打开会从那一集的开头重看。而"换剧/换库去别的剧"那条路早就改用
+     * 那一集自己的记录了（[resumeOf]），只有"自动连播"这条漏了。
+     *
+     * 点播才谈得上进度；直播 [Library.Live] 与故障页不会走到这里（[spot] 为空时
+     * 这条记录也读不出东西），所以拿不到就老实回 0。
+     */
+    private fun autoAdvanceStartMs(lib: String, show: String, epIndex: Int): Long =
+        WatchHistory.autoAdvanceResumeMs(history.find(lib, show), epIndex)
 
     private fun loadChannels(lib: Library.Live, startIndex: Int, seq: Int) {
         // 频道列表按库缓存：换台时不该每次重拉一遍 m3u
@@ -2280,8 +2299,42 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     // ---- 生命周期 ----
 
+    /**
+     * 已经有过一次"救活"尝试的时刻，给 [onNewIntent] 做节流。
+     *
+     * 为什么要节流：老年用户可能对着遥控器/图标连按好几下。每次按都重跑一遍
+     * 完整启动链路（列库→列剧→列集→开文件）代价不小，而且互相打断。
+     * 60 秒一次足够，也比"按了没反应"好得多。
+     */
+    private var lastRecoverAt = 0L
+
+    /**
+     * 再次打开应用（`singleTask` 下不会重建 Activity，走这里）。
+     *
+     * 原来是个空操作 —— 于是"进程还活着但界面卡住"时，用户点图标**没有任何反应**，
+     * 只能去系统设置里强停、或者重启电视。而"重进软件就好了"恰恰是用户报这条
+     * 故障时唯一的自救手段（见 DESIGN 里的记录），所以这里要认它。
+     *
+     * 判据交给 [Navigator.needsRecovery]（有单测钉住）：**只在真的什么都没在播的时候**
+     * 才重新走一遍启动链路；正常播放中点一下图标不会打断画面。
+     */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        val stuck = Navigator.needsRecovery(
+            playing = engine.isPlaying(),
+            hasPending = pendingEpisode != null || pendingChannel != null,
+            faultVisible = faultScreen.visibility == View.VISIBLE,
+            configVisible = configScreen.visibility == View.VISIBLE,
+        )
+        val now = System.currentTimeMillis()
+        if (!stuck || now - lastRecoverAt < RECOVER_THROTTLE_MS) {
+            trace("onNewIntent：stuck=$stuck，不重跑（节流或不需要）")
+            return
+        }
+        lastRecoverAt = now
+        Log.w(TAG, "再次打开时既没在播也没有待播任务，按「卡住了」重跑一遍启动链路")
+        trace("onNewIntent -> startPlayback（救活）")
+        startPlayback()
     }
 
     override fun onPause() {
@@ -2395,6 +2448,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 距离上次自动重启超过这么久，就把重启额度还回去（见 [startupWatchdog]）。 */
         private const val STARTUP_RECOVER_COOLDOWN_MS = 5 * 60 * 1000L
+
+        /**
+         * [onNewIntent] 里"救活"的最小间隔。
+         *
+         * 取 60 秒：老人可能对着图标连按好几下，每次按都重跑一整条启动链路代价不小，
+         * 而且互相打断；一次成功的话本来也轮不到第二次。
+         */
+        private const val RECOVER_THROTTLE_MS = 60_000L
 
         /**
          * 被别的应用抢走音频焦点后，最多等多久就自己接着播（见 [focusWait]）。

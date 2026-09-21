@@ -123,6 +123,30 @@ object Navigator {
         }
     }
 
+    /**
+     * 重复"打开"同一个实例时，要不要重新走一遍 `MainActivity.startPlayback`。
+     *
+     * 背景：Activity 是 `singleTask`，所以再次点图标 / 被开机广播拉起时走的是
+     * `onNewIntent`，**不会**重建 Activity。而 `onNewIntent` 原来是个空操作 ——
+     * 对一个"已经卡住、但进程还活着"的实例，用户点图标没有任何反应，
+     * 只能去系统设置里强停（或重启电视）。
+     *
+     * 判据故意写得很窄，**只在"真的需要救"时才返回 true** ——
+     * 正常播放中点一次图标绝不能把画面打断重来：
+     *  - 已经在播 → 不救；
+     *  - 已有内容排着队等 Surface / 等 NAS → 不救（让它自己走完）；
+     *  - 已写着故障原因 → 不救（10 秒重试自己会好，抢它反而多一次扫描）；
+     *  - 配置页占屏 → 不救（那是用户在配置）。
+     *
+     * 其余情况（黑屏、加载条挂着、什么都不在播）才当成"卡住了"救一把。
+     */
+    fun needsRecovery(
+        playing: Boolean,
+        hasPending: Boolean,
+        faultVisible: Boolean,
+        configVisible: Boolean,
+    ): Boolean = !playing && !hasPending && !faultVisible && !configVisible
+
     /** 取模并保证结果非负（Kotlin 的 % 对负数返回负值）。 */
     private fun wrap(v: Int, size: Int): Int = ((v % size) + size) % size
 }
