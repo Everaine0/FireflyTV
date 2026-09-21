@@ -243,8 +243,22 @@ object Scanner {
      * 实测「娘道」76 集后缀是 .mp4、内容却是 MPEG-TS，所以这条路必须留。
      * 但它是最慢的一条路（每个文件一次 SMB 往返），所以：
      *  - 只在后缀全军覆没时才走；
-     *  - 并发探测（SmbStore 内部串行，开并发只是让网络往返重叠起来），
-     *    实测 76 个文件从「按秒等」降到基本瞬发。
+     *  - 用线程池去探（smbj 的调用本身由 [SmbStore] 串行化，开并发只是让
+     *    多次往返有重叠的机会）。
+     *
+     * ## ⚠️ 必须有总时限
+     *
+     * 老实现是 `f.get()` **不带超时**，而探测本身是同步网络 I/O：NAS 半死不活时
+     * 每个文件最坏能拖到 20 秒 × 若干次往返，`PROBE_LIMIT = 400` 个文件叠起来
+     * 就是**几十分钟甚至几小时**占着调用线程（在界面上就是"永远在加载"）。
+     * 而 `runCatching` 只能接住异常，接不住"永远不返回"。
+     *
+     * 所以这里给整轮探测一个总预算 [PROBE_BUDGET_MS]：
+     *  - 每个 future 用 `get(剩余时间)` 等，超时就不等了、也不再提交新的；
+     *  - 超预算后**返回已经探到的结果**（宁可少几集，也不要卡住界面），
+     *    并在日志里留一行，便于事后判断"是不是因为超时少列了内容"。
+     *  - 注意这里**不能**把"没探到"当成"不是视频"写进缓存 ——
+     *    集列表的 `byContent` 结果本来就不跨次复用（见 `LibraryCache.episodesOf`）。
      */
     private fun probeNamesByContent(cfg: Config.Smb, dir: String, names: List<String>): List<String> {
         if (names.isEmpty()) return emptyList()
@@ -252,17 +266,38 @@ object Scanner {
         val pool = java.util.concurrent.Executors.newFixedThreadPool(PROBE_THREADS) { r ->
             Thread(r, "firefly-probe").apply { isDaemon = true }
         }
+        val startedAt = System.currentTimeMillis()
         return try {
             val futures = candidates.map { name ->
                 pool.submit(java.util.concurrent.Callable { name to isVideoByContent(cfg, "$dir/$name") })
             }
-            futures.asSequence()
-                .mapNotNull { f -> runCatching { f.get() }.getOrNull() }
-                .filter { it.second }
-                .map { it.first }
-                .sortedWith(NaturalOrder)
-                .take(MAX_ENTRIES)
-                .toList()
+            val found = ArrayList<String>(futures.size)
+            var timedOut = 0
+            for (f in futures) {
+                val left = probeBudgetLeftMs(startedAt, System.currentTimeMillis())
+                if (left <= 0) {
+                    timedOut++
+                    continue
+                }
+                val hit = try {
+                    f.get(left, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: java.util.concurrent.TimeoutException) {
+                    f.cancel(true)
+                    timedOut++
+                    continue
+                } catch (_: Throwable) {
+                    continue
+                }
+                if (hit.second) found += hit.first
+            }
+            if (timedOut > 0) {
+                android.util.Log.w(
+                    "FireflyScan",
+                    "按内容探测超预算（${PROBE_BUDGET_MS}ms）：$dir 有 $timedOut/${futures.size} 个没探完，" +
+                        "已探到 ${found.size} 个。列表可能少了内容，下次扫描会重探",
+                )
+            }
+            found.sortedWith(NaturalOrder).take(MAX_ENTRIES)
         } finally {
             pool.shutdownNow()
         }
@@ -274,6 +309,25 @@ object Scanner {
     } catch (_: Throwable) {
         false
     }
+
+    /**
+     * 一轮「按内容探测」的总预算。
+     *
+     * 取 20 秒：正常的 NAS 上 76～157 个文件是"基本瞬发"（实测），20 秒足够；
+     * 真到 20 秒还没探完，说明这台 NAS 此刻不正常 —— 这时候"少列几集"远好过
+     * "界面永远转圈"。剩下的下次扫描会重探（`byContent` 列表不跨次复用）。
+     */
+    private const val PROBE_BUDGET_MS = 20_000L
+
+    /**
+     * 还剩多少毫秒可以等下一个探测（<= 0 = 该收手了）。
+     *
+     * 抽成纯函数只为一件事故：**这个预算曾经不存在**，`f.get()` 无限期等下去，
+     * NAS 半死不活时整个扫描线程被占住几十分钟，界面永远在加载。
+     * 有它就能用单测把"到点必须停"钉住（`ScannerTest`）。
+     */
+    fun probeBudgetLeftMs(startedAtMs: Long, nowMs: Long, budgetMs: Long = PROBE_BUDGET_MS): Long =
+        budgetMs - (nowMs - startedAtMs)
 
     /** 并发探测的线程数。电视只有 1–2 条 SMB 连接，再多也没用。 */
     private const val PROBE_THREADS = 4

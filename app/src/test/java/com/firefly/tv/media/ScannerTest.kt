@@ -94,4 +94,25 @@ class ScannerTest {
         assertTrue(Scanner.isLooseShow("合集.mp4", "合集.mp4"))
         assertTrue(Scanner.isLooseShow("合集.mp4", ""))
     }
+
+    /**
+     * 「按内容探测」必须有总时限。
+     *
+     * 这条钉的是一类真实事故：老实现是 `Future.get()` **不带超时**，而探测本身是
+     * 同步 SMB I/O —— NAS 半死不活时每个文件最坏几十秒，`PROBE_LIMIT = 400` 个叠起来
+     * 就是几十分钟占着扫描线程，界面上表现为"永远在加载"，而 `runCatching` 接不住
+     * "永远不返回"。所以预算必须是硬上限，到点就得收手（宁可少列几集）。
+     */
+    @Test
+    fun `按内容探测的预算到点必须收手`() {
+        val t0 = 1_000_000L
+        // 典型情况：正常 NAS 上几十个文件是"基本瞬发"，预算绰绰有余
+        assertTrue("刚开始必须还有预算", Scanner.probeBudgetLeftMs(t0, t0 + 300L) > 0)
+        // 预算边界：正好用完
+        assertEquals(0L, Scanner.probeBudgetLeftMs(t0, t0 + 20_000L))
+        // 超预算：必须是负数（调用方据此停止等待、返回已探到的结果）
+        assertTrue("超预算必须为负", Scanner.probeBudgetLeftMs(t0, t0 + 60_000L) < 0)
+        // 自定义预算也成立（测试里缩短用）
+        assertEquals(0L, Scanner.probeBudgetLeftMs(t0, t0 + 500L, budgetMs = 500L))
+    }
 }
