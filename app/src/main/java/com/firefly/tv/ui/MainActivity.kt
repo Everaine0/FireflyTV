@@ -106,14 +106,52 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                     ?: lastKnownPos()
                 when (val a = AudioFocusPolicy.decide(contentKind(), focusChange, pos)) {
                     is AudioFocusPolicy.Action.Continue -> Unit
-                    is AudioFocusPolicy.Action.PauseTransient -> engine.pause()
-                    is AudioFocusPolicy.Action.StopAndAbandon -> engine.stop()
+                    is AudioFocusPolicy.Action.PauseTransient -> {
+                        // ⚠️ 暂停之后一定要有人管。`pause()` 会撤掉引擎的两道看门狗
+                        // （硬解首帧 + 播放中存活），而界面层的起播看门狗在首帧时就撤了 ——
+                        // 万一焦点**再也不回来**（某些电视固件就是这样：抢走焦点后不发 GAIN），
+                        // 画面就永远冻在那一帧，没有任何东西会报故障。
+                        // 这里挂一道"等焦点"的兜底：到点还没回来就自己接着播。
+                        engine.pause()
+                        armFocusWait()
+                    }
+
+                    is AudioFocusPolicy.Action.StopAndAbandon -> {
+                        disarmFocusWait()
+                        engine.stop()
+                    }
+
                     // 点播接着刚才的位置；直播 a.resumeMs 恒为 0，从当前时刻重新起播
-                    is AudioFocusPolicy.Action.Replay ->
+                    is AudioFocusPolicy.Action.Replay -> {
+                        disarmFocusWait()
                         replayCurrent(if (a.content == AudioFocusPolicy.Content.OnDemand) pos else 0L)
+                    }
                 }
             }
         }
+    }
+
+    /**
+     * 等音频焦点回来的兜底（见 [focusListener] 里的 `PauseTransient`）。
+     *
+     * 直播没有"进度"可续，所以重播一律用 [lastKnownPos]（点播拿到记录里的位置，
+     * 直播拿到 0）—— 与 `AudioFocusPolicy.Action.Replay` 的语义一致。
+     */
+    private val focusWait = object : Runnable {
+        override fun run() {
+            Log.w(TAG, "音频焦点 ${FOCUS_WAIT_MS}ms 没回来，自己接着播")
+            trace("focusWait 超时：焦点没回来，主动重播")
+            replayCurrent(lastKnownPos())
+        }
+    }
+
+    private fun armFocusWait() {
+        main.removeCallbacks(focusWait)
+        main.postDelayed(focusWait, FOCUS_WAIT_MS)
+    }
+
+    private fun disarmFocusWait() {
+        main.removeCallbacks(focusWait)
     }
 
     /**
@@ -1341,24 +1379,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     /** 当前库的剧列表。内存 → 落盘缓存 → 最后才问 NAS。 */
-    private fun loadShows(lib: Library.Video): List<String> {
+    /**
+     * 当前库的剧列表，**只查缓存、绝不问 NAS**（内存 → 落盘缓存），拿不到返回 null。
+     *
+     * 拆出这一条是为了让"自动换下一部剧"这类回调路径不在主线程上做网络调用
+     * （见 [onEpisodeFinished]）。
+     */
+    private fun showsFromCache(lib: Library.Video): List<String>? {
         if (cachedShowsLib == lib.name && shows.isNotEmpty()) return shows
         val cached = cache?.showsOf(lib.name).orEmpty()
-        if (cached.isNotEmpty()) {
-            cachedShowsLib = lib.name
-            shows = cached
-            return cached
-        }
-        val list = try {
-            Scanner.shows(Config.smb(this), lib)
-        } catch (t: Throwable) {
-            emptyList()
-        }
-        if (list.isNotEmpty()) {
-            cachedShowsLib = lib.name
-            shows = list
-        }
-        return list
+        if (cached.isEmpty()) return null
+        cachedShowsLib = lib.name
+        shows = cached
+        return cached
     }
 
     private fun playShow(
@@ -1570,18 +1603,37 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             playEpisode(0L)
             return
         }
-        val list = loadShows(lib)
+        // ⚠️ 这里**不能**直接去问 NAS：本函数是从 ijkplayer 的 onCompletion 回调
+        // （经 onMain 回主线程）进来的，在这上面做 SMB = 网络调用占着 UI 线程，
+        // 实测能卡住好几秒（慢 NAS 上就是 ANR）。缓存里有就直接用，没有才让 IO 线程去查。
+        val cached = showsFromCache(lib)
+        if (cached != null) {
+            advanceToNextShow(lib, cached)
+            return
+        }
+        ioHandler.post {
+            val list = try {
+                Scanner.shows(Config.smb(this), lib)
+            } catch (t: Throwable) {
+                emptyList()
+            }
+            main.post { advanceToNextShow(lib, list) }
+        }
+    }
+
+    /** 换到 [list] 里 [showName] 的下一部剧；列表为空就原地重播这一集。 */
+    private fun advanceToNextShow(lib: Library.Video, list: List<String>) {
         if (list.isEmpty()) {
             playEpisode(0L)
-        } else {
-            val cur = list.indexOf(showName)
-            val next = if (cur < 0) 0 else (cur + 1) % list.size
-            // 下一部剧也接着**它自己的**记录看。原来这里写死 `(0, 0L)`，
-            // 而一起播 [playEpisode] 就会写记录 —— 等于「看完一部剧」顺手把下一部剧
-            // 存着的续播点抹成 0（和换剧的规矩不一致：换到哪部剧就接着哪部看）。
-            val at = resumeOf(lib.name, list[next])
-            playShow(lib, next, at.episode, at.positionMs, librarySeq)
+            return
         }
+        val cur = list.indexOf(showName)
+        val next = if (cur < 0) 0 else (cur + 1) % list.size
+        // 下一部剧也接着**它自己的**记录看。原来这里写死 `(0, 0L)`，
+        // 而一起播 [playEpisode] 就会写记录 —— 等于「看完一部剧」顺手把下一部剧
+        // 存着的续播点抹成 0（和换剧的规矩不一致：换到哪部剧就接着哪部看）。
+        val at = resumeOf(lib.name, list[next])
+        playShow(lib, next, at.episode, at.positionMs, librarySeq)
     }
 
     private fun loadChannels(lib: Library.Live, startIndex: Int, seq: Int) {
@@ -2250,12 +2302,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         runCatching { hud.dismiss() }
         runCatching { main.removeCallbacks(stallWatchdog) }
         runCatching { disarmLivenessWatchdog() }
+        runCatching { disarmFocusWait() }
         runCatching { engine.release() }
         runCatching { tts.shutdown() }
         runCatching { abandonAudioFocus() }
         runCatching { closeConfigServer() }
         configScreen.recycle()
-        runCatching { SmbStore.drop() }
+        // ⚠️ `SmbStore.drop()` 要放到 IO 线程上关。
+        //
+        // 它内部会 close share/session/connection：smbj 的 TREE_DISCONNECT + LOGOFF
+        // 各是一个请求（每个都有 20 秒超时），而且全程攥着 SmbStore 那把全局锁。
+        // 在 onDestroy（主线程）里做，最坏情况是**退出时卡住几十秒**，
+        // 而这段时间系统已经在拆界面了 —— 用户看到的是"退了半天没退出去"。
+        // 这里只把"丢掉"排进队列；进程随后就没了，关不干净也无所谓（NAS 会回收）。
+        runCatching { ioHandler.post { runCatching { SmbStore.drop() } } }
         runCatching { io.quitSafely() }
         runCatching { playerThread.quitSafely() }
         super.onDestroy()
@@ -2335,6 +2395,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 距离上次自动重启超过这么久，就把重启额度还回去（见 [startupWatchdog]）。 */
         private const val STARTUP_RECOVER_COOLDOWN_MS = 5 * 60 * 1000L
+
+        /**
+         * 被别的应用抢走音频焦点后，最多等多久就自己接着播（见 [focusWait]）。
+         *
+         * 取 45 秒：正常的"抢一下"（系统提示音、语音助手）几秒就还回来；
+         * 而实测有些电视固件抢走之后根本不发 GAIN，那时候宁可自己接着播，
+         * 也不要留一个永远冻住的画面。
+         */
+        private const val FOCUS_WAIT_MS = 45_000L
 
         /** 等 Surface 时的问询间隔。 */
         private const val SURFACE_POLL_MS = 500L
