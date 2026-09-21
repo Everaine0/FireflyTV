@@ -47,7 +47,7 @@ bash scripts/pack-ijkplayer-aar.sh       # 打包成 app/libs/ijkplayer-full-0.8
 `if [ "$FF_ARCH" = "x86" ]; then --disable-asm` 改成打开汇编。
 上游这么写有历史原因（2015 年的 yasm + NDK r10 会产出带文本重定位的 .so），
 但代价是**模拟器拿到的是一份纯 C 的 libavcodec** —— 4K HEVC 软解只有 4fps。
-改完之后同一个文件的解码 CPU 从 246ms/帧降到 117ms/帧。详见根目录 README 的「根因 D」。
+改完之后同一个文件的解码 CPU 从 246ms/帧降到 117ms/帧。详见 [docs/DEVLOG.md](../../docs/DEVLOG.md#模拟器上-4k-还是卡) 的「根因 D」。
 
 > 只编 FFmpeg（不跑 `compile-ijk.sh`）时产物是**没 strip** 的（x86 约 55MB）。
 > 用 NDK 自带的 `i686-linux-android-strip --strip-unneeded` 处理到 14MB 再打包。

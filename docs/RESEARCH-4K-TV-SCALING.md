@@ -598,7 +598,7 @@ val overlay = OverlayScreen(createConfigurationContext(cfg))
    （ActivityThread 在配置变化时仍会调用 `ResourcesManager.applyConfigurationToResources`，
    即 `resources.displayMetrics` 是**新的**，过期的只是已算好的 px 值。）
 
-### 6.4 上真机取样（决定 H1 / H3，必须先做）
+### 6.4 在目标设备上取样（用来判定 H1 / H3）
 
 ```bash
 adb shell getprop ro.sf.lcd_density                 # 厂商写死的密度
@@ -611,7 +611,7 @@ adb shell dumpsys SurfaceFlinger | grep -A6 "HWC layers"   # 看 Disp Frame vs S
 `SurfaceFlinger` 那一条是判定 H3 的关键：若应用层是 `Disp Frame 0 0 3840 2160` + `Source Crop 0 0 1920 1080`
 → UI 层被放大（H3 不成立）；若 `Disp Frame` 就是 `0 0 1920 1080` → UI 没被放大（H3 成立）。
 
-App 侧加一行日志（浮层显示时打印，便于远程让用户回报）：
+App 侧加一行日志（浮层显示时打印，现场截图就能看到）：
 
 ```kotlin
 val dm = resources.displayMetrics
