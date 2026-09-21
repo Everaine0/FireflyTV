@@ -683,11 +683,24 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 重启画面 —— 那比原来的问题更糟。所以这里加了 [LIVENESS_ENABLED] 开关，
      * 默认关闭，等找到可信判据再打开。**不要只是把开关改成 true。**
      *
+     * ## 后续（2026-09-21）：直播这一半已经在引擎里解决了，不用再走这条路
+     *
+     * 按下面的方向继续找「哪个帧率计数器在动」是死路 —— 实测**这两个候选量都不可信**：
+     *
+     *  - `outputFps`：把直播入向包丢掉以后画面冻住 3 分钟，它一直停在冻住前的 25.00 帧/秒
+     *    （速率量在管线停住后不会归零），而它在 SMB 通路上又恒为 0。
+     *  - `trafficStatisticByteCount`：本以为「累计计数器，收不到数据就不动」可以用，
+     *    实测在 RTSP 通路上**恒为 0**（正常播 25 帧/秒时也是 0）—— 拿它当判据的那一版
+     *    写出来一次都没触发过。
+     *
+     * 最后真正管用的是播放器**自己报的状态**：`BUFFERING_START` 实测丢包后 0 毫秒就到，
+     * 而且 Java 回调确实送得到（「持续缓冲 10 秒就重连」）。这条判据实现在
+     * `IjkPlaybackEngine.stallWatchdog` 里（纯函数 + 单测在 `LiveStall`），只覆盖直播；
+     * **点播（SMB）上的「悄悄死掉」仍然没有判据** —— 点播既不报缓冲、上面两个计数器又都坏，
+     * 这里的开关继续关着。
+     *
      * 可行的方向（都还没验证）：
      *  - 让 `IMediaDataSource` 通路上的统计生效（可能要设某个 ijk 选项）
-     *  - 用「读取字节数的增量」等别的计数器（`PlaybackEngine.Liveness` 已经把
-     *    cached/traffic/position/fps 四个一起取回来了，但需要先在真实片源上
-     *    量出哪个在动）
      *  - 在 `MainActivity` 里记录最近一次 `onInfo`/`onPrepared` 等回调的时间，
      *    用「多久没收到任何播放器事件」当判据
      */

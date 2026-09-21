@@ -809,9 +809,12 @@ ffmpeg 3.4 本有一条回退（`rtspdec.c`：`ret == AVERROR(ETIMEDOUT) && !rt-
   （连续 15 秒贴近 0 就重连），**刻意不用 `Liveness.differsFrom`** ——
   它拿 `outputFps` 做 `!=` 比较，而那是个速率、卡死时也在 0 附近抖动，
   「有动静」永远成立，看门狗会一辈子不触发。组播尤其需要它。
+  ⚠️ **后来实测证明「送显帧率」这个判据本身也不可用**（管线停住后它停在最后一个值上，
+  不归零），已于 2026-09-21 换成「播放器自报持续缓冲」，见下面那条
+  「**直播断流后画面永远冻着（本次修）**」。
 
 回归防线：`PlaybackModeTest` 钉住协议识别、认不出时退回 HTTP 老行为、
-以及各档参数的大小关系（单测 224 项全过）。
+以及各档参数的大小关系（单测 248 项全过，含 `LiveStallTest` 的 8 项断流判据）。
 
 #### 「没声音」有两个完全不同的根因，现象一模一样
 
@@ -1362,7 +1365,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | **字幕规则**（§5） | ❌ 未实现 | 当前只开了 `subtitle=1`，会把文件里的**任意**字幕轨显示出来，违反「无中文字幕则不显示任何字幕」。要做对需要：枚举字幕轨、判断语言（`IjkMediaMeta` 的轨语言/轨名），再决定开关或外挂同名 `.srt`/`.ass`。需要带多语言字幕轨的测试片源才能验证 |
 | **AC-3 / MP2 片源没有声音** | ✅ 已解决 | **两个根因都修了才有效**：①自己编了带 AC-3/E-AC-3/MP2/DTS 的内核；②点播探测窗口从 2 MB 提到 16 MB（见「格式兼容性」）。`Ac3AudioTest` 直连真实 NAS 播整集娘道断言出声。实测娘道有声音 |
 | **切换剧集卡在当前页面** | ✅ 已解决 | 三个根因：①`surfaceUsable()` 改成按状态查询 + 轮询兜底（原来等一个可能永不再来的回调）；②**moov 重排没改 `stco` 偏移**（真根因，见风险 8）；③首帧判据假绿导致看门狗被提前撤销。`EveryShowPlaysTest` 全库扫描断言严格首帧，3/3 通过；**实测大宅门 / 猫和老鼠「有画面了」** |
-| **播放中「播放器悄悄死亡」没有自救** | ❌ **未解决** | 现场已定性（抓线程栈看到 ijkplayer 线程全部消失、CPU 增量为 0，但既无 `onError` 也无 `onCompletion`）。看门狗框架已写，但**唯一候选判据在 SMB 通路上恒为 0**（`outputFps` 在本地文件上正常，SMB 上恒 0），拿它当判据会把正常播放误判成死机、不断重启画面。已加 `LIVENESS_ENABLED = false` 默认关闭，**不要只把开关改成 true**。可行方向写在 `MainActivity.livenessWatchdog` 注释里 |
+| **播放中「播放器悄悄死亡」没有自救** | 🟡 **直播已解决，点播仍未解决** | **直播这一半已修**（2026-09-21）：判据换成「播放器自报持续缓冲 10 秒」，实测丢包后 0 毫秒收到 `BUFFERING_START`、21 秒内自动重连、画面自动回来，约 3 分钟里连救两次真实断流（见下面「**直播断流后画面永远冻着（本次修）**」）。**点播（SMB）上的「悄悄死掉」仍然没有判据**：SMB 通路上 `outputFps` 恒为 0、`trafficStatisticByteCount` 在 RTSP 通路上恒为 0，两个候选量都不可信，`LIVENESS_ENABLED = false` 继续关着，**不要只把开关改成 true**。已排除的方向写在 `MainActivity.livenessWatchdog` 注释里 |
 | **电视上 4K 的帧率还是不够** | 模拟器测不出，看诊断页的「解码 / 帧率 / 结论」三行 | 实机观感：还算流畅、声音跟得上，但帧率明显偏低（25 甚至更低）。三种根因（解码不够快 / 送显来不及 / 读取供不上）在电视上没法用 adb 区分，所以加了**播放诊断页**：**双击「设置 / 信息」键**，看「解码」「帧率」「结论」三行 —— `硬解 OMX.xxx` + `解码 ≈ 片源帧率` 说明通路没问题，`软解（硬解没建成！）` 就是风险 22。需要日志时同时抓 `adb logcat -s FireflyDecode FireflyTV`（如果方便接 adb） |
 | 硬解真值 | 模拟器测不出，看诊断页的「解码」行 | 模拟器上只有 `OMX.google.*`（`RANK_SOFTWARE=200`，被 ijkplayer 拒掉），所以**「选中硬解 → 真的建成」这条路在模拟器上跑不到**。真机要看诊断页的「解码」行或日志 `解码通路确认：硬解 OMX.xxx（vdec_type=2）`。若出现 `硬解没建成：选中的 … 实际没接上`，说明这台电视的 MediaCodec 建得出来却接不上，代码会自动拉黑它换下一个候选 |
 | 键值差异（风险 6） | 用 logcat 查实际 keyCode | 代码同时处理 `DPAD_*` 与 `ENTER`，但**设置键的 keyCode 尚未在真机上确认**；模拟器遥控器没有设置键 |
@@ -1370,7 +1373,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | 天气接口（风险 5） | 在 Android 5.1 设备上实测 TLS | 接口形态已按和风 v7 确认（`X-QW-Api-Key` + `lang=zh`），但 Android 5.1 的 TLS 握手只能在目标设备上实测 |
 | `CATEGORY_HOME`（风险 1） | 在长虹系统上试抢主屏 | 开机自启已写；抢主屏需在长虹系统上试 |
 | 「这台电视不支持 AC-3」这句话 | 看设备能力查询结果 | 判据走设备能力查询，模拟器（纯软件解码器）上没有 AC-3；目标电视是 Amlogic 方案，**系统可能自带**，要在目标机上确认 |
-| 直播重连 | 造一次真实断流看自愈 | 退避重连逻辑已写；真实直播源已验证能起播，但**断流自愈还没造过真实断流** |
+| 直播重连 | ✅ **已造过真实断流并验证自愈** | 用包过滤（`iptables -I INPUT -s <边缘服务器IP> -j DROP`）造出与真实故障同形的断流：**TCP 连着、对端不再发数据**。旧判据（送显帧率）在画面冻住 3 分钟里一次都没触发（帧率停在 25.00）；新判据 21 秒内完成「判定 → 重连 → 画面回来」，且换台/静置期间不误判。另观察到该网络**本身就会频繁断流**（同一轮测试里 4 分钟内自然断了 3 次，落在不同边缘服务器上），所以这条自愈不是纸面功能 |
 | 音画不同步（只在下/刚启动时） | 模拟器上复现不出来 | 已排除一个确定成因（直播写续播进度导致拿假进度去 seek，已修）。剩下的**没能在模拟器上可靠复现**：模拟器是纯软解，1080p25 H.264 本来就跑不满帧率，画面落后很可能是模拟器性能所致，而不是代码问题。已把直播缓冲压到 512 KB。**要在目标电视上实测**才能定性 |
 
 > 说明：早先记录过「`娘道` 的容器格式未知」，现在已确认为 **MPEG-TS + H.264 + AC-3**（见「格式兼容性」）。
@@ -1380,6 +1383,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | 项 | 说明 |
 | :--- | :--- |
 | **崩溃闪退** | ijkplayer 的 `onPrepared/onError/onCompletion/onInfo` 回调**不在它自己的线程上**：`IjkMediaPlayer.initPlayer` 是 `Looper.myLooper()` 优先、`getMainLooper()` 兜底（核对了 AAR 字节码），即「谁 new 的播放器就排谁的队列」。之前直接透传给界面层，界面在非 UI 线程碰 View，抛 `CalledFromWrongThreadException` 当场崩；Activity 重建后又立刻报同样的错，于是「闪退之后再也打不开」。现在 `IjkPlaybackEngine` 用 `onMain{}` 统一把回调切回主线程 |
+| **直播断流后画面永远冻着（本次修）** | 用户报的「看着看着卡住不动，得重进软件才好」。模拟器上抓到现场：直播流断掉（TCP 连着、对端不再发数据）后画面冻在最后一帧，`ff_read` 之类的原生线程还在、`isPlaying` 仍是 true、**既无 `onError` 也无 `onCompletion`**，于是永远冻着 —— 界面层的起播看门狗首帧时就撤了，引擎那道存活看门狗的判据（送显帧率）实测**根本不会掉**（画面冻住 3 分钟它一直显示 25.00 帧/秒）。修法：判据换成播放器**自己报的** `BUFFERING_START` —— 实测丢包后 **0 毫秒**就到，「持续缓冲 10 秒」即判断流，3 次巡检后走既有的直播重连。**实测（`iptables` 丢包造断流）**：21 秒完成「判定 → 重连 → 画面回来」，同一轮里连救两次真实断流；随后 3 分多钟正常播放零误判。判据抽成纯函数 `LiveStall`（8 项单测钉住「真断流必判」与「正常播放/暂停不判」）。⚠️ 被否掉的两个候选量记在 `LiveStall` 类注释里（`outputFps` 停住不归零、`trafficStatisticByteCount` 在 RTSP 上恒为 0），别再试 |
 | **刚开机卡住加载不动（本次修）** | 播放器原来在 `firefly-io` 上构造，而那条队列上同时排着 NAS 扫描 / 剧集列目录 / 音频探测 —— 于是**画面早就上屏了，撤掉「正在打开…」的那条回调还堵在后面**，屏幕永远停在加载条上；而那条加载提示当时还是"永不超时"。四处一起改：① 播放器独立到 `firefly-player` 线程；② `SwitchHud` 的加载提示有 60 秒期限；③ 新增 40 秒**启动兜底看门狗**（覆盖"决定要播 → 列库 → 列剧 → 列集"这段原本无人看管的窗口，到点自动重启，额度 3 次 + 5 分钟冷却）；④ 报故障时顺手收掉加载条（它原来画在故障页**上面**） |
 | **等 Surface 超时就永远不出画面（本次修）** | 老实现 8 秒等不到 Surface 就**丢掉排队的那一集**并报 `retry=false` 的故障，提示还写着「请按返回键再试」—— 而返回键在本应用里是被明确吞掉的。现在请求留着继续等（退避重问 3/6/10/15/20 秒），Surface 一好立刻起播，彻底等不到由启动兜底看门狗接手；直播也补上了同样的 Surface 排队（原来直播压根不查 Surface，会在没有 Surface 时建出"收数据不出画面"的解码器） |
 | **列目录失败被当成"这个库是空的"（本次修）** | `Scanner.classify` 原来把每个库的列目录异常吞成 `Kind.Empty`，开机那几秒 NAS 没就绪时会扫出一个**空库表却不抛异常** → 报「NAS 上还没有可以播放的内容」且 `retry=false`，而空库表下左右上下键全都不响应 = 只能重开应用的死页面。更糟的是那一轮的空 `libraries` 会被写进落盘缓存，下次开机走缓存路径得到空表 → `restoreSpot` 里 `libs[0]` 主线程越界崩。现在：列目录异常照原样上抛（整轮判失败 → 保留缓存 + 报故障重试）、"没有内容"改为带重试、`restoreSpot` 加空表防护 |
@@ -1427,7 +1431,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | R8 两个坑 | ①`net.engio.mbassy` 被写成 `net.engio.mbassador`（keep 规则等于没写，debug 包不压缩所以一直没症状）；②`javax.el.**` / `org.ietf.jgss.**` 是 Java SE 专有依赖，必须 `-dontwarn`，否则 R8 直接失败。**开 R8 的价值一半在这里** —— 它把「装上能开、一连 NAS 就崩」这类问题提到了构建期 |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**228 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**248 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
 | 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
 | 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |

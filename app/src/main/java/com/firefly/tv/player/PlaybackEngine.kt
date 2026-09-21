@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import com.firefly.tv.core.Config
@@ -376,6 +377,10 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         if (firstFrameFired) return
         firstFrameFired = true
         cancelHardwareWatchdog()
+        // ⚠️ 起播瞬间报的那次缓冲要作废：`BUFFERING_END` 实测**不会来**（见 [LiveStall]），
+        // 留着它的话，一路正常播放的直播会在开播十几秒后被自己的看门狗判成断流。
+        // 首帧之后的缓冲才是真的「播着播着断了」。
+        bufferingSince = 0L
         // 首帧出来才开始盯「播放中卡死」：起播阶段由界面层的 25 秒看门狗负责
         armStallWatchdog()
         onMain { listener?.onFirstFrame() }
@@ -619,6 +624,9 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         decoderName = null
         watchdogGrace = 0
         cachedMediaInfo = null
+        // 断流判据的起算点也必须清掉：否则上一路的「已经缓冲了 30 秒」会直接算到新一路上，
+        // 新画面刚出来就被自己的看门狗判死。
+        bufferingSince = 0L
         cancelHardwareTruthCheck()
         // 直播源的传输协议决定超时选项怎么给（单位/语义都不同，见下面 setOption 处）
         val transport = url?.let { PlaybackMode.Transport.of(it) } ?: PlaybackMode.Transport.HTTP
@@ -666,11 +674,20 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
                 tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_VIDEO_DECODED_START ->
                     Log.i(TAG, "视频首帧已解出（VIDEO_DECODED_START）")
 
-                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_BUFFERING_START ->
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_BUFFERING_START -> {
+                    // 「画面停了」最早、最准的信号：实测丢包后 0 毫秒就到（见 [LiveStall]）。
+                    // 这里只记时刻，判不判卡死交给看门狗（要连续 3 轮巡检都成立才重连）。
                     Log.i(TAG, "开始缓冲")
+                    bufferingSince = SystemClock.elapsedRealtime()
+                }
 
-                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_BUFFERING_END ->
+                tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_INFO_BUFFERING_END -> {
+                    // ⚠️ 实测这个事件**不会来** —— 断流后不来，网络恢复了也不来。
+                    // 所以缓冲时刻不能只靠它清：判定重连时会重建播放器（[newPlayer] 清零），
+                    // 首帧那一刻也会清零（见 [fireFirstFrame]）。
                     Log.i(TAG, "缓冲结束")
+                    bufferingSince = 0L
+                }
             }
             false
         }
@@ -1021,23 +1038,29 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     // 上面给 socket 设了 `rw_timeout` / `stimeout`，但它们只能覆盖
     // 「**socket 报错**」和「**对端关闭连接**」这两种情况。
     // 直播真正难处理的是第三种：**TCP 连接好好挂着，对端就是不再发数据了**。
-    // 这时 socket 读永远等不到错误，`MEDIA_INFO_BUFFERING_START` 也不会来
-    // （ijkplayer 只在缓存被读空时才报缓冲，而它此时正卡在等包上）。
-    // 于是：既没有 onError 也没有 onCompletion，画面冻在最后一帧，**永远不会自己好**。
-    // 界面层那个 25 秒看门狗只管起播（首帧出来就撤了），也帮不上忙。
+    // 这时 socket 读永远等不到错误，也没有 onError / onCompletion，
+    // 画面冻在最后一帧；界面层那个 25 秒看门狗只管起播（首帧出来就撤了），也帮不上忙。
+    //
+    // ⚠️ 这段注释原先还写着「`MEDIA_INFO_BUFFERING_START` 也不会来」—— **实测是错的**。
+    // 丢包实验（2026-09-21，模拟器 + 运营商 IPTV）：入向包一丢，播放器 **0 毫秒**就报了
+    // `FFP_MSG_BUFFERING_START`。正因为会来，它才是现在的主判据（见 [LiveStall]）。
     //
     // 组播（`udp://`）更彻底：UDP 无连接，上面那些超时选项对它根本没有意义。
     //
-    // ## 判据（这里刻意**不用** [Liveness.differsFrom]）
+    // ## 判据
     //
-    // 乍看 `differsFrom` 正合适，其实不行：它把 `outputFps` 也拿 `!=` 比，
-    // 而 `outputFps` 是个**速率**、不是累计计数器 —— 流卡死时它只是在 0 附近抖动，
-    // 相邻两次采样几乎必然不相等。拿它当判据的话，「有动静」永远成立，
-    // 看门狗一辈子都不会触发。
-    //
-    // 所以只认一个单调量：**送显帧率**。真在播就有几十帧/秒，
-    // 真的卡死才会长时间贴近 0；抖动传不过 [STALL_MIN_FPS] 这个门槛。
+    // 全部逻辑在 [LiveStall] 里（纯函数 + 单测）。这里只负责取数、计数、到点了重连。
+    // 这里刻意**不用** [Liveness.differsFrom]：它把 `outputFps` 也拿 `!=` 比，
+    // 而速率量在管线停住以后不会归零，相邻两次采样还几乎必然不相等 —— 「有动静」永远成立。
     private var stallStrikes = 0
+
+    /**
+     * 播放器自报「正在缓冲」的起算时刻（[SystemClock.elapsedRealtime]，0 = 没在缓冲）。
+     *
+     * 写在播放器回调线程（`firefly-player`）、读在主线程的看门狗里，所以加 `@Volatile`。
+     */
+    @Volatile
+    private var bufferingSince = 0L
 
     // 注意：这里**不能**在 lambda 里直接重挂 `stallWatchdog` 自己 ——
     // 属性初始化期间引用自身，Kotlin 会报「Variable 'stallWatchdog' must be initialized」。
@@ -1047,32 +1070,32 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         if (kind != PlaybackMode.Kind.LIVE || !liveReconnect) return@Runnable
         val p = player ?: return@Runnable
         val live = runCatching { liveness() }.getOrDefault(PlaybackEngine.Liveness(0, 0, 0, 0f))
+        val bufferingMs = if (bufferingSince == 0L) 0L else SystemClock.elapsedRealtime() - bufferingSince
 
-        // 「没在播」不算卡死：暂停、或者正在缓冲起播，都不该被判定为断流。
-        // 注意这里**不能**碰 stallStrikes —— 缓冲抖动会让 isPlaying 短暂变 false，
-        // 一旦清零就永远攒不满，看门狗等于没有。
-        if (!runCatching { p.isPlaying }.getOrDefault(false)) {
+        if (!LiveStall.strike(
+                playing = runCatching { p.isPlaying }.getOrDefault(false),
+                outputFps = live.outputFps,
+                bufferingMs = bufferingMs,
+            )
+        ) {
+            stallStrikes = 0
             armStallWatchdog()
             return@Runnable
         }
 
-        if (live.outputFps > STALL_MIN_FPS) {
+        stallStrikes++
+        Log.w(
+            TAG,
+            "直播卡死判据：已缓冲 ${bufferingMs / 1000} 秒" +
+                "（送显 ${"%.2f".format(live.outputFps)} 帧/秒，缓存 ${live.videoCachedMs}ms，" +
+                "播放中 ${runCatching { p.isPlaying }.getOrDefault(false)}，第 $stallStrikes 次）",
+        )
+        if (stallStrikes >= LiveStall.MAX_STRIKES) {
+            Log.w(TAG, "直播画面已经不动了，走重连（第 ${retryCount + 1} 次）")
             stallStrikes = 0
-        } else {
-            stallStrikes++
-            Log.w(
-                TAG,
-                "直播卡死判据：送显 ${"%.2f".format(live.outputFps)} 帧/秒（低于 " +
-                    "$STALL_MIN_FPS），已持续约 ${(stallStrikes * STALL_RECHECK_MS) / 1000} 秒" +
-                    "（缓存 ${live.videoCachedMs}ms，流量 ${live.trafficBytes}B，第 $stallStrikes 次）",
-            )
-            if (stallStrikes >= STALL_MAX_STRIKES) {
-                Log.w(TAG, "直播画面已经不动了，走重连（第 ${retryCount + 1} 次）")
-                stallStrikes = 0
-                onMain { listener?.onLiveRetry(retryCount + 1, liveUrlProvider?.invoke()) }
-                scheduleLiveRetry()
-                return@Runnable
-            }
+            onMain { listener?.onLiveRetry(retryCount + 1, liveUrlProvider?.invoke()) }
+            scheduleLiveRetry()
+            return@Runnable
         }
         armStallWatchdog()
     }
@@ -1080,7 +1103,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     private fun armStallWatchdog() {
         main.removeCallbacks(stallWatchdog)
         // 刚出首帧先别急着量：这一刻缓存本来就在剧烈变化，等一个周期再开始比
-        main.postDelayed(stallWatchdog, STALL_RECHECK_MS)
+        main.postDelayed(stallWatchdog, LiveStall.RECHECK_MS)
     }
 
     private fun cancelStallWatchdog() {
@@ -1277,24 +1300,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         /** 首帧超时最多宽限几次（每次一个完整超时）。见 [hardwareWatchdog]。 */
         const val WATCHDOG_GRACE = 2
 
-        /** 播放中存活看门狗的检查周期。见 [stallWatchdog]。 */
-        const val STALL_RECHECK_MS = 5_000L
-
-        /**
-         * 连续几次「送显帧率贴近 0」才判定画面不动了。
-         *
-         * 取 3（= 15 秒）：既要盖过正常的网络抖动、缓冲与换台前后的空档，
-         * 又不能让老人对着冻住的画面干等。25 秒（界面层的起播超时）那种量级太久了。
-         */
-        const val STALL_MAX_STRIKES = 3
-
-        /**
-         * 判定「画面真的在动」的送显帧率门槛（帧/秒）。
-         *
-         * 直播片源最低也有 23.976 帧/秒；真要卡死时 `stat.vfps` 会掉到 0 附近。
-         * 取 0.5 是为了让测量噪声过不来，同时又能立刻识别出「几乎不出帧」。
-         */
-        const val STALL_MIN_FPS = 0.5f
+        // 播放中存活看门狗的**周期与次数**在 [LiveStall] 里（连同门槛一起，
+        // 因为「用户等多久」是这三个数共同决定的）。
 
         /**
          * UDP 组播的 `timeout`（**秒**，不是微秒）。
