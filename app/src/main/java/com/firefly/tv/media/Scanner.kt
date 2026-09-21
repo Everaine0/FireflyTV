@@ -59,6 +59,10 @@ object Scanner {
     /**
      * 列根目录下的媒体库。
      * 容错：无视频文件的文件夹、无有效内容的库一律跳过（DESIGN §4）。
+     *
+     * ⚠️ 但**列目录失败不等于"这个库是空的"**：那种情况会把异常抛给调用方，
+     * 由上层判为"整轮扫描失败"（保留缓存 + 报故障重试），而不是丢掉整个媒体库列表。
+     * 依据见 [classify] 的说明。
      */
     fun libraries(cfg: Config.Smb): List<Library> {
         val entries = SmbStore.with(cfg) { it.list("") }
@@ -85,13 +89,26 @@ object Scanner {
         class Live(val m3u: String) : Kind()
     }
 
-    /** 目录内含 .m3u 即判定为直播库；否则含视频文件（或含子文件夹）即为视频库。 */
+    /**
+     * 目录内含 .m3u 即判定为直播库；否则含视频文件（或含子文件夹）即为视频库。
+     *
+     * ⚠️ 这里**不能**把列目录失败吞成 [Kind.Empty]。
+     *
+     * 老实现是 `catch (_: Throwable) { return Kind.Empty }`，看起来"很宽容"，
+     * 实际后果很重：开机那几秒 NAS/WiFi 还没就绪时，**每一个**库的列目录都可能失败，
+     * 于是整轮扫下来 `libraries()` 返回一个空表但**不抛异常** ——
+     * 上层只能报「NAS 上还没有可以播放的内容」，用户看到的是一个
+     * 左右上下键全都不响应的死页面，只能重开应用（实机反馈的"卡住"之一）。
+     *
+     * 更糟的是那一轮的 `libraries = []` 还会被写进落盘缓存，而 `Snapshot.isEmpty`
+     * 只看"库/剧/集是不是全空"，旧剧集列表还在 → 缓存看着仍然"有内容"，
+     * 下次开机直接走缓存路径得到空库表（见 `MainActivity.restoreSpot` 的空表防护）。
+     *
+     * 所以让异常**照原样冒出去**：`libraries()` 那一层会把整轮扫描判为失败，
+     * 于是走的是「保留缓存 + 报故障并每 10 秒重试」，而不是"你的 NAS 是空的"。
+     */
     private fun classify(cfg: Config.Smb, dir: String): Kind {
-        val entries = try {
-            SmbStore.with(cfg) { it.list(dir) }
-        } catch (_: Throwable) {
-            return Kind.Empty
-        }
+        val entries = SmbStore.with(cfg) { it.list(dir) }
         entries.firstOrNull { !it.isDir && MediaExt.isM3u(it.name) }?.let { return Kind.Live(it.name) }
         if (entries.any { !it.isDir && MediaExt.isVideo(it.name) }) return Kind.Video
         // 电视剧目录：本级只有子文件夹，真正的视频在剧名目录里

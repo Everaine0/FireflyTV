@@ -235,6 +235,23 @@ interface PlaybackEngine {
     fun diag(): Diag
 
     /**
+     * 播放器有没有**真的解出过画面帧**（不问回调，直接问计数器）。
+     *
+     * ## 为什么不能只信 `VIDEO_RENDERING_START`
+     *
+     * 起播超时（`MainActivity.stallWatchdog`）原本只认 `onFirstFrame`，而后者只由
+     * `MEDIA_INFO_VIDEO_RENDERING_START` 触发。实测：**这个事件在有些通路上根本不来** ——
+     * 模拟器（纯软解 + GLES2 渲染）上画面明明已经正常在放，该事件一次都没收到，
+     * 于是 25 秒时 watchdog 判定「打不开」，把好好的播放打断并报故障页（A/B 对照：
+     * 改动前的代码同样收不到这个事件，只是没有一道恰好 25 秒的闸门去打断它）。
+     *
+     * 所以超时判据要补一个「真的出过帧」的真值：累计解码帧数 > 0。
+     * 它比渲染事件保守 —— 只说明解码器在出帧，配合「读取字节数在涨」就足以证明没卡死。
+     * 真实电视上该事件照常会来，这条路只是兜底，不会抢跑。
+     */
+    fun decodedAnyFrame(): Boolean = false
+
+    /**
      * 一份用于判断「播放器还活着吗」的快照。
      *
      * 为什么不是单一指标：在 SMB + `IMediaDataSource` 通路上，
@@ -943,10 +960,18 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     /**
      * 所有对外回调都必须回到主线程。
      *
-     * ijkplayer 的 onPrepared / onError / onCompletion / onInfo 是在它自己的
-     * `IjkMediaPlayer$EventHandler` 线程上触发的。直接透传给界面层的话，
-     * 界面会在非 UI 线程上碰 View —— 抛 `CalledFromWrongThreadException` 当场崩，
-     * 而且 Activity 重建后立刻再报同样的错，表现就是「闪退之后再也打不开」。
+     * ijkplayer 的 onPrepared / onError / onCompletion / onInfo **不在它自己的线程上**：
+     * `IjkMediaPlayer.initPlayer` 是 `Looper.myLooper()` 优先、`Looper.getMainLooper()` 兜底
+     * （核对过 `app/libs/ijkplayer-full-0.8.8.aar` 里 `IjkMediaPlayer.class` 的字节码），
+     * 也就是说回调排在**构造播放器的那个线程**的 MessageQueue 上。
+     * （这里原来写着"在它自己的 IjkMediaPlayer\$EventHandler 线程上"，是错的 ——
+     *   那个 Handler 没有自己的线程。当时按错的前提去设计，就直接导致了
+     *   「画面在放、加载条不消失」：播放器和 NAS 扫描共用了同一条 HandlerThread。
+     *   现在播放器在 MainActivity 的 `firefly-player` 上构造。）
+     *
+     * 不管它在哪个线程触发，直接透传给界面层都会在非 UI 线程上碰 View ——
+     * 抛 `CalledFromWrongThreadException` 当场崩，而且 Activity 重建后立刻再报同样的错，
+     * 表现就是「闪退之后再也打不开」。所以这里统一回主线程。
      */
     private fun onMain(block: () -> Unit) {
         if (Looper.myLooper() === Looper.getMainLooper()) block() else main.post(block)
@@ -1086,6 +1111,16 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         FFP_PROPV_DECODER_AVCODEC -> PlaybackEngine.Decoder.SOFTWARE
         else -> PlaybackEngine.Decoder.UNKNOWN
     }
+
+    /**
+     * 播放器有没有**真的在出画面帧**（问计数器，不问回调）。
+     *
+     * 判据取「解码帧率或送显帧率 > 0」。这两个都是 ijkplayer 真的在写、且每秒刷新的量。
+     */
+    override fun decodedAnyFrame(): Boolean = runCatching {
+        val p = player ?: return false
+        p.videoDecodeFramesPerSecond > 0f || p.videoOutputFramesPerSecond > 0f
+    }.getOrDefault(false)
 
     /**
      * `getMediaInfo()` 会顺带解析一遍 media meta（几百个字段），

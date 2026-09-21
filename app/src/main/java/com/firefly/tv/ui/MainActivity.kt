@@ -63,6 +63,31 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private lateinit var io: HandlerThread
     private lateinit var ioHandler: Handler
 
+    /**
+     * 播放器专用线程。**这个线程存在的唯一理由是 ijkplayer 的回调线程归属。**
+     *
+     * `IjkMediaPlayer.initPlayer` 里是这么绑事件队列的（核对过 `app/libs/ijkplayer-full-0.8.8.aar`
+     * 里 `IjkMediaPlayer.class` 的字节码，顺序就是下面这样）：
+     *
+     * ```
+     * Looper.myLooper()                                  ← 先取「**构造播放器的那个线程**」的 looper
+     *   new IjkMediaPlayer$EventHandler(this, looper)
+     * Looper.getMainLooper()                             ← 只有 myLooper() 为 null 才回退主线程
+     *   new IjkMediaPlayer$EventHandler(this, looper)
+     * ```
+     *
+     * 也就是说 `onPrepared` / `onFirstFrame` / `onError` **不在什么"它自己的 EventHandler 线程"上**
+     * （[com.firefly.tv.player.IjkPlaybackEngine] 里原来的注释写错了），而是排在
+     * 「谁 new 的播放器就排谁的 MessageQueue」。
+     *
+     * 以前播放器是在 [ioHandler] 上 new 的，而那条队列上还排着 NAS 扫描、剧集列目录、
+     * 音频探测那 1MB 读 —— 于是**画面早就上屏了，撤掉「正在打开…」的那条回调还堵在后面**，
+     * 屏幕上就永远是加载条（实测用户报的「刚开机卡住加载不动」）。分成两条线程之后，
+     * 播放/回调这条路上只剩播放自己的活。
+     */
+    private lateinit var playerThread: HandlerThread
+    private lateinit var playerHandler: Handler
+
     private var configServer: ConfigServer? = null
     private var surfaceReady = false
     private var audioManager: android.media.AudioManager? = null
@@ -225,6 +250,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         io = HandlerThread("firefly-io").apply { start() }
         ioHandler = Handler(io.looper)
+        // 播放器与它的回调单独一条线程，绝不和 NAS 扫描共用（见 [playerThread] 的说明）
+        playerThread = HandlerThread("firefly-player").apply { start() }
+        playerHandler = Handler(playerThread.looper)
 
         buildViews()
         requestAudioFocus()
@@ -303,6 +331,71 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         ViewGroup.LayoutParams.MATCH_PARENT,
     )
 
+    // ---- 启动兜底看门狗 ----
+
+    /** 已经自动重启过几轮（见 [startupWatchdog]）。 */
+    private var startupRecover = 0
+
+    /** 上一次因为启动兜底而重启的时刻，用来给重启次数做"冷却"（见 [startupWatchdog]）。 */
+    private var startupRecoverAt = 0L
+
+    /**
+     * 启动兜底：**从"决定要播"到"真的有画面"这条路上，任何一段卡住都能自己好。**
+     *
+     * 为什么单独要一个：[stallWatchdog] 是 `playEpisodeNow` 里才挂的，只保护"播放器拿到活之后"；
+     * 而列库（[Scanner.libraries]）、列剧、列集这三段排在它前面，之前**完全没有保护**。
+     * 那几段卡住时的屏幕状态是 SwitchHud 的「正在打开…」，于是用户看到的就是
+     * 「刚开机卡在加载不动」，而且永远不会自己好（实机反馈）。
+     *
+     * 判据故意用 `engine.isPlaying()` 而不是界面上的标志位：
+     * ijkplayer 的回调也可能被拖后（它的事件队列绑在构造线程上，见 [playerThread]），
+     * 所以"界面以为还没起播"不等于"真的没在播"。已经在放就当场撤哨，绝不打断。
+     */
+    private val startupWatchdog = Runnable {
+        if (engine.isPlaying()) {
+            trace("startupWatchdog：其实已经在播了，撤哨")
+            startupRecover = 0
+            return@Runnable
+        }
+        // 故障页已经写着原因了（而且多半带着 10 秒重试），别抢它的话。
+        // 尤其是直播：引擎自己会退避重连，界面层再插一脚只会打架（见 onLiveRetry）。
+        if (faultScreen.visibility == View.VISIBLE) return@Runnable
+        // 配置页占屏时不管：那是用户在配置，不是卡住
+        if (configScreen.visibility == View.VISIBLE) return@Runnable
+
+        // 次数做"冷却"：一段时间没再出事就把额度还回去，免得偶尔卡一次就永久用光
+        val now = System.currentTimeMillis()
+        if (now - startupRecoverAt > STARTUP_RECOVER_COOLDOWN_MS) startupRecover = 0
+
+        startupRecover++
+        if (startupRecover > MAX_STARTUP_RECOVER) {
+            Log.w(TAG, "启动兜底已自动重启 $MAX_STARTUP_RECOVER 次仍没有画面，交回故障页")
+            trace("startupWatchdog 自动重启额度用尽 -> 故障页重试")
+            startupRecoverAt = now
+            startupRecover = 0
+            // 带重试：10 秒后再走一遍 startPlayback，不是死页面
+            showFault("这台电视还没打开片源，正在重试", retry = true)
+            return@Runnable
+        }
+        startupRecoverAt = now
+        Log.w(TAG, "启动 ${STARTUP_TIMEOUT_MS}ms 还没画面，自动重启第 $startupRecover 次")
+        trace("startupWatchdog 自动重启第 $startupRecover 次")
+        // 画面没起来，那个还在等 Surface 的排队请求已经没意义了；交给 startPlayback 重来
+        pendingEpisode = null
+        pendingChannel = null
+        startPlayback()
+    }
+
+    private fun armStartupWatchdog() {
+        main.removeCallbacks(startupWatchdog)
+        main.postDelayed(startupWatchdog, STARTUP_TIMEOUT_MS)
+    }
+
+    private fun disarmStartupWatchdog() {
+        main.removeCallbacks(startupWatchdog)
+        startupRecover = 0
+    }
+
     // ---- Surface ----
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -327,7 +420,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         surfaceView.holder.surface?.isValid == true
 
     /**
-     * 把排队等 Surface 的那一集放出去。
+     * 把排队等 Surface 的那一集（或那一路直播）放出去。
      *
      * 这里原来只有一个隐患很大的前提：「播放请求排上队以后，surfaceCreated 一定会再来一次」。
      * 实测不成立 —— 从后台回到前台时 `dispatchKeyEvent` 是可以触发的，但 Surface 早就建好了，
@@ -336,28 +429,70 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * （日志里那一行 `startMs=1180132 surfaceReady=false` 就是它。）
      *
      * 现在改成：只要有排队的东西，就当场问一次 Surface 能不能用，能用就立刻起播；
-     * 排队超时就明确报故障，不再无声无息地烂在队列里。
+     * 不能用就**留着队列**继续等（[surfacePoll] 每 500ms 问一次，[pendingTimeout] 退避重问），
+     * 一直等不到由 [startupWatchdog] 接手自动重启 —— 不再有"超时就丢掉请求"这条路。
      */
     private fun launchPendingEpisode() {
-        val p = pendingEpisode ?: return
+        val e = pendingEpisode
+        val c = pendingChannel
+        if (e == null && c == null) return
         if (!surfaceUsable()) {
-            trace("launchPendingEpisode 仍在等 Surface：《${p.show}》")
+            trace("launchPendingEpisode 仍在等 Surface")
             return
         }
+        // 先清队列再起播：起播路径里可能又排进新东西（例如硬解兜底重播），别被自己覆盖
         pendingEpisode = null
+        pendingChannel = null
         main.removeCallbacks(pendingTimeout)
+        main.removeCallbacks(surfacePoll)
         surfaceReady = true
-        trace("launchPendingEpisode 起播《${p.show}》startMs=${p.startMs}")
-        // 身份跟着排队的那一集走，不现读界面字段：排队期间用户可能又换过剧/换过库
-        playEpisodeNow(p.path, p.startMs, p.spot)
+        if (e != null) {
+            trace("launchPendingEpisode 起播《${e.show}》startMs=${e.startMs}")
+            // 身份跟着排队的那一集走，不现读界面字段：排队期间用户可能又换过剧/换过库
+            playEpisodeNow(e.path, e.startMs, e.spot)
+            return
+        }
+        trace("launchPendingEpisode 起播频道《${c!!.name}》")
+        playChannelNow(c.name, c.url)
     }
 
-    private val pendingTimeout = Runnable {
-        val p = pendingEpisode ?: return@Runnable
-        pendingEpisode = null
-        Log.w(TAG, "等 Surface 超时，放弃起播《${p.show}》")
-        showFault("画面还没准备好，请按一下遥控器上的返回键再试", retry = false)
+    /**
+     * 等 Surface 超时。
+     *
+     * ⚠️ 这里**不再丢掉排队的那一集**。老实现是"超时就放弃 + 报故障且不重试"，
+     * 而提示还写着「请按一下遥控器上的返回键」—— 可那个键在本应用里是被明确吞掉的
+     * （`dispatchKeyEvent` 的 `else -> true`），于是用户按什么都不管用，只能重开应用。
+     *
+     * 现在改成：请求留着继续等（Surface 一好就起播），期间给一句在动的话，
+     * 并按 3/6/10/15/20 秒退避重问。真正的兜底交给 [startupWatchdog]，
+     * 它到点会走「故障页 + 自动重启」这条路。
+     */
+    private val pendingTimeout = object : Runnable {
+        override fun run() {
+            val e = pendingEpisode
+            val c = pendingChannel
+            if (e == null && c == null) return
+            if (surfaceUsable()) {
+                launchPendingEpisode()
+                return
+            }
+            val waited = System.currentTimeMillis() - queueWaitAnchor
+            surfaceWaits++
+            Log.w(TAG, "等 Surface 已 ${waited}ms（第 $surfaceWaits 次），继续等并重问")
+            if (surfaceWaits == 1) {
+                showFault("电视画面正在准备，稍等一下", retry = false)
+            }
+            val backoff = SURFACE_RETRY_BACKOFF_MS[
+                (surfaceWaits - 1).coerceIn(0, SURFACE_RETRY_BACKOFF_MS.size - 1)
+            ]
+            // 自引用必须写成匿名对象：`Runnable { ... this ... }` 那种 lambda 形式会让
+            // Kotlin 报 "recursive problem / must be initialized"（这条是编译器逼出来的写法）
+            main.removeCallbacks(this)
+            main.postDelayed(this, backoff)
+        }
     }
+
+    private var surfaceWaits = 0
 
     /**
      * 真的把一集交给播放器。
@@ -372,7 +507,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         prepared = false
         audioStarted = false
         armStallWatchdog()
-        ioHandler.post {
+        // 记下"这一集是什么时候排上队的"：下面这条工作一旦排在别的活后面（例如上一集的
+        // 硬解兜底重播、或者 SMB 连接还在忙着），等待时间要能从起播超时里扣掉，
+        // 否则排队的时间会被算成播放器卡死，冤枉它一次。
+        queueWaitAnchor = System.currentTimeMillis()
+        // ⚠️ 这里必须是 [playerHandler] 而不是 [ioHandler]：ijkplayer 的事件回调绑在
+        // **构造播放器的线程**上（见 [playerThread]），跟 NAS 扫描共用一条队列就会出现
+        // 「画面在放、加载条不消失」。
+        playerHandler.post {
             try {
                 engine.playSmb(cfg, path, startMs)
             } catch (t: Throwable) {
@@ -384,6 +526,16 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private var startedAt = 0L
     private var gotFirstFrame = false
+
+    /**
+     * 这一集**排上队**的时刻（见 [playEpisodeNow]）。
+     *
+     * 起播超时只该量"播放器拿到活之后过了多久"，不该把排队等 NAS / 等上一条播放任务的时间
+     * 也算进去 —— 原来就是这么算的：`armStallWatchdog()` 在把 `engine.playSmb` 投出去之前
+     * 就起算，而那条请求可能还排在剧集列目录、音频探测那 1MB 读后面。于是 SMB 一慢，
+     * 看门狗就在**播放器还没开始干活**的时候判它卡死。
+     */
+    private var queueWaitAnchor = 0L
 
     /**
      * 播放器已经起播（`onPrepared` 回来之后）。
@@ -409,6 +561,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun armStallWatchdog() {
         gotFirstFrame = false
         startedAt = System.currentTimeMillis()
+        // 起算时先把"排队锚点"清掉：软解重播时 [playEpisodeNow] 会重新写它，
+        // 而那之前的时间本来就该算在播放器头上。
+        queueWaitAnchor = 0L
         main.removeCallbacks(stallWatchdog)
         main.postDelayed(stallWatchdog, STALL_TIMEOUT_MS)
     }
@@ -424,17 +579,40 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 软解也不行才当播放失败处理（跳故障页 → 自动重试）。
      * 宁可让它自己重试几次，也不要留一个死的画面。
      */
-    private val stallWatchdog = Runnable {
-        if (gotFirstFrame) return@Runnable
-        val waited = System.currentTimeMillis() - startedAt
-        if (engine.canFallbackToSoftware() && engine.retryInSoftware()) {
-            trace("stallWatchdog 卡死 ${waited}ms，先退回软解重播")
-            armStallWatchdog()
-            return@Runnable
+    private val stallWatchdog = object : Runnable {
+        override fun run() {
+            if (gotFirstFrame) return
+            val waited = System.currentTimeMillis() - startedAt
+            // 扣掉排队等 NAS 的那段：那是网络的账，不是播放器的账（见 [queueWaitAnchor]）
+            val queued = queueWaitAnchor
+            val waitedPlaying = if (queued in 1..startedAt) waited - (startedAt - queued) else waited
+            if (waitedPlaying < STALL_TIMEOUT_MS) {
+                // 还在排队：重新起算，别把"排队"判成"卡死"
+                trace("stallWatchdog 还在排队（已等 ${waited}ms，其中播放器实际只等了 ${waitedPlaying}ms）")
+                main.removeCallbacks(this)
+                main.postDelayed(this, STALL_TIMEOUT_MS - waitedPlaying + 200L)
+                return
+            }
+            // ⚠️ 到点了也**先别急着判卡死**：`onFirstFrame` 只由 VIDEO_RENDERING_START 触发，
+            // 而实测这个事件在有些通路上根本不来（模拟器纯软解 + GLES2：画面正常在放，
+            // 事件一次都没收到 —— A/B 对照过，改动前的代码同样收不到，只是没有一道恰好
+            // 25 秒的闸门去打断它）。只认它的话，一到点就会把**正在播的画面**打断并报故障页。
+            // 所以补一个「真的在出帧吗」的真值：解码/送显帧率不为 0 就说明它活着。
+            if (engine.decodedAnyFrame()) {
+                gotFirstFrame = true
+                Log.w(TAG, "起播 ${waitedPlaying}ms 没收到渲染事件，但帧率非 0：按已出画面处理")
+                trace("stallWatchdog：无渲染事件但帧率非 0，撤哨")
+                return
+            }
+            if (engine.canFallbackToSoftware() && engine.retryInSoftware()) {
+                trace("stallWatchdog 卡死 ${waitedPlaying}ms，先退回软解重播")
+                armStallWatchdog()
+                return
+            }
+            Log.w(TAG, "起播 ${waitedPlaying}ms 还没出首帧，判定卡死，走故障页重试")
+            trace("stallWatchdog 卡死 ${waitedPlaying}ms")
+            onError("这个视频打不开，正在换下一个", fatal = false)
         }
-        Log.w(TAG, "起播 ${waited}ms 还没出首帧，判定卡死，走故障页重试")
-        trace("stallWatchdog 卡死 ${waited}ms")
-        onError("这个视频打不开，正在换下一个", fatal = false)
     }
 
     // ---- 播放中存活看门狗 ----
@@ -677,7 +855,30 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             return
         }
 
-        showFault(null) // 清掉故障页
+        // ⚠️ 重试不能把"为什么没播成"从屏幕上拿掉。
+        //
+        // 每 10 秒重试一次，每次都会走到这里。原来的顺序是「先清故障页、再挂一条
+        // 『正在连接 NAS』提示」—— 而真正去列库还要几秒（实测不可达的 NAS：5 秒超时）。
+        // 于是屏幕在「让人看不懂的加载条」和「看得懂的原因」之间来回切，而且**每次切都在
+        // 用户刚读出原因之后**。实测（模拟器 + 不可达的 NAS，120 秒采样）看到的现象就是
+        // 「一直卡在加载」。
+        //
+        // 现在：刚失败不久就把原因继续挂在屏幕上，只有真的隔了很久（用户重新进来的那种）
+        // 才有必要说"正在连接 NAS"。阈值取 60 秒而不是一个重试周期（10 秒）：
+        // 取 10 秒时实测正好卡在边界上（上一轮 10 秒整点触发），结果又退回"正在连接"。
+        val showingReason = lastFault != null &&
+            System.currentTimeMillis() - lastFaultAt < REASON_KEEP_MS
+        showFault(null, keepHud = showingReason)
+        trace("startPlayback 开始：挂启动兜底看门狗（显示原因=$showingReason）")
+        // ⚠️ 从这里到 [playEpisodeNow] 之间（列库 → 列剧 → 列集）原本**没有任何看门狗**：
+        // 起播看门狗是在 playEpisodeNow 里才挂的，而这段时间屏幕上只有 SwitchHud 那条
+        // 「正在打开…」。SMB 卡在这几段任何一处，就永远停在那句话上，只能重进应用。
+        // 所以"决定要播"这一刻就先挂一道兜底。
+        armStartupWatchdog()
+        if (!showingReason) {
+            hud.onRestoring(System.currentTimeMillis())
+            postHudTick()
+        }
         ioHandler.post {
             // 先把落盘缓存读出来：冷启动靠它直接出画面，不必等 NAS 扫完（DESIGN §7）
             if (cache == null) cache = readCache()
@@ -694,9 +895,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 val libs = Scanner.libraries(cfg)
                 val snap = LibraryCache.withLibraries(cache, libs)
                 commitCache(snap)
+                trace("startPlayback 列库完成：${libs.size} 个库（cached=${cached != null}）")
                 main.post {
                     if (libs.isEmpty()) {
-                        showFault("NAS 上还没有可以播放的内容")
+                        // ⚠️ `retry` 必须为 true。这里看着像"NAS 上确实没东西"，其实
+                        // 更常见的是**开机瞬间**的假空：`Scanner.classify` 会把一次
+                        // 列目录失败也表达成"这个库是空的"，于是整轮扫下来一个库都不剩。
+                        // 老的 `retry = false` 配上"libraries 为空时左右上下键全都不响应"，
+                        // 就是一个只能重开应用的死页面（实机反馈的"卡住"之一）。
+                        showFault("NAS 上还没有可以播放的内容，正在重试", retry = true)
                     } else {
                         // 新列表可能比缓存里多/少几个库（用户刚在 NAS 上加了文件夹就是这样），
                         // 下标会整体错位 —— 必须按**名字**把当前库重新锚一次，见
@@ -712,6 +919,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             } catch (t: Throwable) {
                 val msg = SmbClient.describe(t)
                 SmbStore.drop()
+                trace("startPlayback 列库失败：${t.javaClass.simpleName} / $msg")
                 main.post {
                     // 缓存里有内容就先照常看，NAS 的毛病等它自己好；没有才报故障
                     if (cache?.isEmpty != false) {
@@ -735,6 +943,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      *  - 什么都没记过 → 老行为：第 0 个库、第 1 部剧、第 1 集、开头。
      */
     private fun restoreSpot(libs: List<Library>) {
+        // ⚠️ 空表必须当场挡住。缓存里的 `libraries` 完全可能是空的（`Snapshot.isEmpty`
+        // 只看「库/剧/集三者是不是全空」，一次失败的扫描会把 libraries 写成空表、
+        // 而旧的 shows 还留着，于是缓存看着"有内容"），接着下面 `libs[0]` 就是
+        // 主线程上一发 IndexOutOfBoundsException —— 用户看到的是开机就闪退/打不开。
+        if (libs.isEmpty()) {
+            Log.w(TAG, "restoreSpot：库列表是空的，先什么都不播")
+            return
+        }
         val book = history
         val wanted = book.lastLib.ifBlank { libraries.firstOrNull()?.name.orEmpty() }
         var li = libs.indexOfFirst { it.name == wanted }
@@ -909,17 +1125,30 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         return true
     }
 
+    /**
+     * 先撤掉旧的刷新链再重挂。
+     *
+     * 为什么必须 remove 一下：提示条在 [SwitchHud] 里是"到点自己消失"的，
+     * 每条链子都要跑到自己那个 deadline 才肯停。不过滤的话，每按一次键、
+     * 每换一次库都会再挂一条 —— 几十条 5Hz 的链子同时刷同一个 View，
+     * 而屏幕上只有一条提示。这是纯浪费（电视 CPU 本来就紧）。
+     */
+    private fun postHudTick() {
+        main.removeCallbacks(hudTick)
+        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
+    }
+
     /** 内容真的开始播了：把「正在打开…」换成名字，1.6 秒后自动收起。 */
     private fun onContentPicked(title: String) {
         if (!Config.configured(this)) return
         hud.onPlaying(title, System.currentTimeMillis())
-        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
+        postHudTick()
     }
 
     /** 换剧/换台：先出一条名字，别让屏幕一动不动。 */
     private fun announce(title: String) {
         hud.onContentSwitch(title, System.currentTimeMillis())
-        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
+        postHudTick()
     }
 
     private fun announceLibrary(name: String) {
@@ -928,8 +1157,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         audioWarning = null
         // 库名同时写进 OK 浮层：按左右键时用户本来就习惯按 OK 确认，现在按下就看到库名变了
         currentTitle = SwitchHud.libraryTitle(name)
-        hud.onLibrarySwitch(name)
-        if (renderHud()) main.postDelayed(hudTick, HUD_TICK_MS)
+        hud.onLibrarySwitch(name, System.currentTimeMillis())
+        postHudTick()
     }
 
     /**
@@ -1211,10 +1440,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 排查用的调用链日志。
      *
      * 按键/切库这类问题的现象是「它自己跳到别的库去了」，光看代码推不出来是哪条路进去的，
-     * 必须有调用链。默认关闭，只在排查时把 [DEBUG_TRACE] 改成 true 重新打包。
+     * 必须有调用链。
+     *
+     * 走 `Log.w` 是**故意的**：正式包的 R8 会去掉 `v/d/i` 三档，只留 `w/e`
+     * （见 `proguard-rules.pro`）。原先这里用 `Log.i` + `DEBUG_TRACE` 编译期开关，
+     * 结果就是电视上跑的正式包**一个字都留不下** —— 用户报「卡住」时手里没有任何证据，
+     * 只能让对方换成 debug 包重装一遍再等复现（这次排查就卡在这儿）。
+     * 换成 `w` 之后正式包也能留痕，而消息体量很小（一次启动十几行），不影响性能。
+     *
+     * 规则：**只记真值，不记密码**（SMB 配置里的密码绝不进日志）。
      */
     private fun trace(msg: String) {
-        if (DEBUG_TRACE) Log.i(TAG_TRACE, msg)
+        if (DEBUG_TRACE) Log.w(TAG_TRACE, msg)
     }
 
     private fun playEpisode(startMs: Long) {
@@ -1245,6 +1482,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         if (!surfaceUsable()) {
             // Surface 还没建好：排队等着，并在 surfaceCreated 或超时时处理
             pendingEpisode = PendingEpisode(path, startMs, showName, s)
+            pendingChannel = null
+            surfaceWaits = 0
+            // 排队期间不该留着"首帧后探音频"的指针：那是给真正起播的那一集用的，
+            // 留着它会让之后某次首帧去探一个已经不是当前内容（甚至已切库）的路径。
+            pendingAudioCheck = null
             main.removeCallbacks(pendingTimeout)
             main.postDelayed(pendingTimeout, SURFACE_WAIT_MS)
             main.postDelayed(surfacePoll, SURFACE_POLL_MS)
@@ -1261,12 +1503,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 排队等 Surface 时的轮询兜底。
      *
      * 不想只依赖 `surfaceCreated`：它是回调，不是状态 —— 回调错过一次就永远不会再来。
-     * 每 500ms 自己问一次「Surface 现在能用了吗」，问到了就起播，问不到就一直等
-     * （直到 [pendingTimeout] 兜底报故障）。
+     * 每 500ms 自己问一次「Surface 现在能用了吗」，问到了就起播，问不到就一直问下去
+     * （超时那一档由 [pendingTimeout] 退避重问，最终由 [startupWatchdog] 接手）。
+     *
+     * 判据是"队列里还有没有东西"，不是"有没有某一集"：直播排队走的是同一条路
+     * （见 [playChannel]），老代码只看 [pendingEpisode]，于是排队的直播永远不会被放出去。
      */
     private val surfacePoll = object : Runnable {
         override fun run() {
-            if (pendingEpisode == null) return
+            if (pendingEpisode == null && pendingChannel == null) return
             if (surfaceUsable()) {
                 launchPendingEpisode()
             } else {
@@ -1381,18 +1626,51 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private fun playChannel() {
         val ch = channels.getOrNull(channelIndex) ?: return
+        // ⚠️ 直播这里原来**不查 Surface**（点播那条路是查的）。没有 Surface 时
+        // ijkplayer 会建一个"收数据、不出画面"的解码器，之后再 setSurface 只能靠
+        // reconfigure 补救 —— 表现就是黑屏、没提示、没重试（见 PlaybackEngine 里
+        // 「假的解码器」那段注释）。所以和点播一样排队等。
+        if (!surfaceUsable()) {
+            trace("playChannel 《${ch.name}》Surface 还没好，排队等")
+            pendingChannel = PendingChannel(ch.name, ch.url)
+            pendingEpisode = null
+            surfaceWaits = 0
+            queueWaitAnchor = System.currentTimeMillis()
+            main.removeCallbacks(pendingTimeout)
+            main.postDelayed(pendingTimeout, SURFACE_WAIT_MS)
+            main.postDelayed(surfacePoll, SURFACE_POLL_MS)
+            return
+        }
+        playChannelNow(ch.name, ch.url)
+    }
+
+    /**
+     * 真的把一路直播交给播放器（Surface 已经确认可用）。
+     *
+     * 拆出来是因为「排队等 Surface」那条路也要用它（见 [launchPendingEpisode]）：
+     * 以前这个函数是私有的内联逻辑，排队那条路根本没有直播入口。
+     */
+    private fun playChannelNow(name: String, url: String) {
         // 直播不记进度（见 PlaybackMode）：把内容身份清掉，定时写盘就不会碰记录
         spot = null
-        currentTitle = ch.name
-        announce(ch.name) // 立刻出频道名，换台不能看起来没反应
+        currentTitle = name
+        announce(name) // 立刻出频道名，换台不能看起来没反应
         // 上一个频道留下的「信号中断」提示要马上撤掉，否则换到好频道也还挂着那句话
         showFault(null)
         prepared = false
         audioStarted = false
+        // 换台之后不该再去探上一集的音频（探针是排在首帧之后跑的）
+        pendingAudioCheck = null
+        // 直播没有首帧之前也得有人盯着：引擎的存活看门狗是首帧之后才挂的
+        // （见 PlaybackEngine.fireFirstFrame），这段空档由启动兜底看门狗兜住。
+        armStartupWatchdog()
         engine.setMode(PlaybackMode.Kind.LIVE)
         engine.setLiveReconnect(true) { channels.getOrNull(channelIndex)?.url }
-        engine.playUrl(ch.url)
+        engine.playUrl(url)
     }
+
+    private class PendingChannel(val name: String, val url: String)
+    private var pendingChannel: PendingChannel? = null
 
     // ---- 浮层 ----
 
@@ -1791,11 +2069,30 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     // ---- 故障页 ----
 
-    private fun showFault(message: String?, retry: Boolean = false) {
+    /**
+     * @param keepHud true = 只藏起故障页，**保留**屏幕上那条提示（重试期间用，见 [startPlayback]）。
+     *   默认 false：报故障时把提示收掉，让那句人话独占屏幕（提示条画在故障页上面，
+     *   不收掉就会把原因盖住 —— 用户实测的「卡在加载不动」就是这么来的）。
+     */
+    private fun showFault(message: String?, retry: Boolean = false, keepHud: Boolean = false) {
         main.removeCallbacks(retryTick)
+        // 记住"上一次为什么没播成"：10 秒后的重试会先清掉故障页，而重试本身又要花时间，
+        // 这段时间必须把原因继续挂在屏幕上（见 [startPlayback] 里的说明）。
+        lastFault = message
+        lastFaultAt = System.currentTimeMillis()
         if (message == null) {
             faultScreen.visibility = View.GONE
             return
+        }
+        // ⚠️ 报故障时必须把那条「正在打开…」收掉。
+        //
+        // hudView 是在 faultScreen **之后** add 进 root 的（见 buildViews），所以那条
+        // 加载条画在故障页**上面**。而 SwitchHud 的 LOADING 状态又没有出口 —— 于是
+        // 用户看到的永远是「《库名》正在打开…」，底下那句人话（"连不上 NAS"之类）被盖住，
+        // 看起来就是"卡在加载不动"。用户实测报的就是这个现象。
+        if (!keepHud) {
+            hud.dismiss()
+            renderHud()
         }
         // 故障页优先：诊断页不能盖在「出了什么事」这句话上面
         hideDiag()
@@ -1807,11 +2104,25 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         }
     }
 
+    /**
+     * 上一次报给用户的故障原因（null = 最近一次是成功的），以及它是什么时候报的。
+     *
+     * 只用来在**重试期间**把那句话继续挂在屏幕上：10 秒重试一到就先清故障页去重连，
+     * 而重连可能又是十几秒 —— 没有它的话，用户在这十几秒里看到的是"正在连接"，
+     * 而不是"连不上 NAS"。实测就是靠这一条把「无限加载」变成「看得见的原因」。
+     */
+    private var lastFault: String? = null
+    private var lastFaultAt = 0L
+
     // ---- PlaybackEngine.Listener ----
 
     override fun onPrepared(durationMs: Long) {
         prepared = true
         showFault(null)
+        // 播放器已经起播：启动兜底看门狗不用再盯着"有没有画面"了。
+        // （真正的首帧判据是 [onFirstFrame]，但播放器都说准备好了，
+        //   再自动重启一遍只会把刚起来的画面打断。）
+        disarmStartupWatchdog()
         // 「正在打开…」换成内容名，1.6 秒后收起 —— 这一刻用户才算确认换台/换剧成功
         onContentPicked(currentTitle)
     }
@@ -1841,13 +2152,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             // 单集文件损坏：3 秒后跳下一个（DESIGN §8）
             showFault(friendlyMessage, retry = false)
             main.postDelayed({
-                showFault(null)
                 // 这里同样要先确认时长可信，否则损坏文件会把整部剧一路跳完
                 val kind = PlaybackMode.of(libraries.getOrNull(libIndex))
                 if (PlaybackMode.canAutoAdvance(kind, engine.durationMs())) {
+                    showFault(null)
                     onEpisodeFinished()
                 } else {
-                    Log.w(TAG, "时长不可信，损坏后不自动跳集")
+                    // ⚠️ 以前这里只写了一行日志：`showFault(null)` 把屏幕清空，
+                    // 又没有重试、又不跳集 —— 用户看到的是一片黑，什么提示都没有，
+                    // 只能重开应用。而 `fatal=true` 最常见的来源恰恰是**网络类错误**
+                    // （SMB 读失败会被 ijkplayer 报成 MEDIA_ERROR_IO，见 PlaybackEngine），
+                    // 开机那几秒正好最容易撞上：时长问不出来（= 不可信）→ 掉进这个分支。
+                    // 网络问题本来就该重试，所以这里改成"留着原因 + 10 秒重试"。
+                    Log.w(TAG, "时长不可信，不自动跳集：改成挂着原因重试")
+                    showFault(friendlyMessage, retry = true)
                 }
             }, 3000)
         } else {
@@ -1858,6 +2176,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     override fun onFirstFrame() {
         gotFirstFrame = true
         main.removeCallbacks(stallWatchdog)
+        // 真的出画面了，启动兜底看门狗可以撤了
+        disarmStartupWatchdog()
         showFault(null)
         // 首帧之后换成「存活看门狗」：上面的 stallWatchdog 只管首帧之前，
         // 而用户实测的「卡住」发生在播放中（见 livenessWatchdog 的说明）
@@ -1925,6 +2245,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // DESIGN §7 防泄漏硬要求，逐条来
         main.removeCallbacksAndMessages(null)
         ioHandler.removeCallbacksAndMessages(null)
+        // 播放器那条线程也要收掉：它上面挂着 ijkplayer 的事件队列
+        runCatching { playerHandler.removeCallbacksAndMessages(null) }
         runCatching { hud.dismiss() }
         runCatching { main.removeCallbacks(stallWatchdog) }
         runCatching { disarmLivenessWatchdog() }
@@ -1935,6 +2257,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         configScreen.recycle()
         runCatching { SmbStore.drop() }
         runCatching { io.quitSafely() }
+        runCatching { playerThread.quitSafely() }
         super.onDestroy()
     }
 
@@ -1943,14 +2266,22 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         private const val TAG_TRACE = "FireflyTrace"
 
         /**
-         * 排查切库/按键问题时改成 true，用 `adb logcat -s FireflyTrace` 看调用链。
+         * 调用链日志开关。**正式包保持 false**（消息量小，但没必要天天写）。
          *
-         * 默认关：电视上没有 adb，开着只会白刷 logcat；[trace] 的调用点全都留着，
-         * 下次排查改这一个常量就够了。
+         * 排查实机问题时把它改成 true 重打一次包即可；日志走 `Log.w`，
+         * 所以**正式包里也留得下来**（R8 只去 v/d/i，见 [trace]）。
          */
         private const val DEBUG_TRACE = false
         private const val OVERLAY_MS = 10_000L
         private const val RETRY_MS = 10_000L
+
+        /**
+         * 上一次的故障原因在屏幕上保留多久（见 [startPlayback] 的 `showingReason`）。
+         *
+         * 取 60 秒：重试是每 10 秒一轮，取一个周期会在边界上抖动（实测踩过）；
+         * 而只要还在连续重试，用户就该一直看得见原因。
+         */
+        private const val REASON_KEEP_MS = 60_000L
         private const val POSITION_INTERVAL_MS = 5_000L
 
         // 写盘的防抖与「进度不前进就不写」的判据都在 WatchHistory.shouldStore 里
@@ -1981,6 +2312,29 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 等 Surface 的最长时间；超过就报故障，不无声地卡住。 */
         private const val SURFACE_WAIT_MS = 8_000L
+
+        /**
+         * 等 Surface 超时后的重问退避（毫秒）。
+         *
+         * 取"越等越久"而不是固定 500ms：Surface 迟迟不来通常是开机时系统还忙，
+         * 高频轮询没有意义；但**绝不能放弃** —— 老实现是超时就丢掉排队的那一集
+         * 并且不重试，屏幕就永远停在那儿了。
+         */
+        private val SURFACE_RETRY_BACKOFF_MS = longArrayOf(3_000L, 6_000L, 10_000L, 15_000L, 20_000L)
+
+        /**
+         * 从「决定要播」到「真的在播」最多允许多久，超了就自动重启一轮（见 [startupWatchdog]）。
+         *
+         * 取 40 秒：要盖得过后台列表刷新碰上的慢 NAS，又要明显早于
+         * SwitchHud 那条 60 秒的提示期限，这样自动重启发生在提示自己退场之前。
+         */
+        private const val STARTUP_TIMEOUT_MS = 40_000L
+
+        /** 启动兜底最多自动重启几轮；再不行就出故障页（带 10 秒重试），不无限重启。 */
+        private const val MAX_STARTUP_RECOVER = 3
+
+        /** 距离上次自动重启超过这么久，就把重启额度还回去（见 [startupWatchdog]）。 */
+        private const val STARTUP_RECOVER_COOLDOWN_MS = 5 * 60 * 1000L
 
         /** 等 Surface 时的问询间隔。 */
         private const val SURFACE_POLL_MS = 500L

@@ -23,7 +23,7 @@ class SwitchHudTest {
     @Test
     fun `换库立刻显示正在打开`() {
         val hud = SwitchHud()
-        hud.onLibrarySwitch("电视剧")
+        hud.onLibrarySwitch("电视剧", t0)
 
         val s = hud.peek(t0)
         assertNotNull("切库必须立刻有东西上屏，否则看起来就是卡死", s)
@@ -32,18 +32,27 @@ class SwitchHudTest {
         assertEquals("正在打开…", s.subtitle)
     }
 
+    /**
+     * 这条原来是「加载提示**不会**自己超时消失」（`deadline = 0L`，永不超时）。
+     *
+     * 那个设计就是「刚开机卡在加载不动」的成因之一：提示没有出口，后面那条链子一旦断在
+     * 半路，屏幕上就永远挂着这句话，用户只能重开应用。现在改成"很宽但有限"：
+     * SMB 慢的几十秒照样留着，但真出事了要让位给故障页。
+     */
     @Test
-    fun `加载提示不会自己超时消失`() {
+    fun `加载提示留得够久但不会永远挂着`() {
         val hud = SwitchHud(briefMs = 1_000L)
-        hud.onLibrarySwitch("电视剧")
+        hud.onLibrarySwitch("电视剧", t0)
         // SMB 慢的时候可能几十秒；这段时间提示必须一直在
-        assertNotNull(hud.peek(t0 + 60_000L))
+        assertNotNull("等了 30 秒还在加载，提示不能提前消失", hud.peek(t0 + 30_000L))
+        assertNotNull("刚好到期限时还在", hud.peek(t0 + SwitchHud.LOADING_MS - 1))
+        assertNull("超过期限必须让位给故障页，不能永远挂着", hud.peek(t0 + SwitchHud.LOADING_MS))
     }
 
     @Test
     fun `内容出来后换成内容名并开始倒计时`() {
         val hud = SwitchHud(briefMs = 1_000L)
-        hud.onLibrarySwitch("电视剧")
+        hud.onLibrarySwitch("电视剧", t0)
         hud.onPlaying("娘道", t0)
 
         val s = hud.peek(t0 + 10L)!!
@@ -83,11 +92,29 @@ class SwitchHudTest {
     @Test
     fun `出错时立刻收起让故障页独占屏幕`() {
         val hud = SwitchHud()
-        hud.onLibrarySwitch("电视剧")
+        hud.onLibrarySwitch("电视剧", t0)
         assertNotNull(hud.peek(t0))
 
         hud.dismiss()
         assertNull(hud.peek(t0))
+    }
+
+    /**
+     * 加载提示到期限自己退场之后，内容才姗姗来迟 —— 这时**仍然要出一下名字**。
+     *
+     * 换库/换台真的成功了，屏幕上却一点确认都没有，用户会以为键没生效。
+     */
+    @Test
+    fun `加载提示过期后内容才到也要报出名字`() {
+        val hud = SwitchHud(briefMs = 1_000L)
+        hud.onLibrarySwitch("电视剧", t0)
+        assertNull(hud.peek(t0 + SwitchHud.LOADING_MS))
+
+        hud.onPlaying("娘道", t0 + SwitchHud.LOADING_MS + 1)
+        val s = hud.peek(t0 + SwitchHud.LOADING_MS + 2)
+        assertNotNull("内容起来了就该出名字，哪怕加载条已经过期退场", s)
+        assertEquals(SwitchHud.Style.BRIEF, s!!.style)
+        assertEquals("娘道", s.title)
     }
 
     @Test
@@ -95,6 +122,26 @@ class SwitchHudTest {
         val hud = SwitchHud()
         hud.onPlaying("娘道", t0)
         assertNull("没按过键就不该弹东西出来", hud.peek(t0))
+    }
+
+    /**
+     * 冷启动还没定位到库名时也要有东西在屏幕上。
+     *
+     * `startPlayback()` 先清故障页、再去列库，而"是哪个库"要列完才知道 ——
+     * 这一段（没有缓存时尤其明显）以前是一片黑。
+     */
+    @Test
+    fun `恢复播放时先出一句正在连接`() {
+        val hud = SwitchHud()
+        hud.onRestoring(t0)
+
+        val s = hud.peek(t0)!!
+        assertEquals(SwitchHud.Style.LOADING, s.style)
+        assertEquals(SwitchHud.RESTORING, s.title)
+
+        // 定位到库之后会被换库提示顶掉
+        hud.onLibrarySwitch("电视剧", t0 + 10L)
+        assertEquals("电视剧", hud.peek(t0 + 11L)!!.title)
     }
 
     @Test

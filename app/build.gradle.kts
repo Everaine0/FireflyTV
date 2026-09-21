@@ -21,6 +21,24 @@ val localSecrets: Map<String, String> = rootProject.file("local.properties")
     ?.toMap()
     ?: emptyMap()
 
+/**
+ * 同一批私密配置也可以从**环境变量**给（`ff.smb.host` → `FF_SMB_HOST`）。
+ *
+ * 为什么留这条路：临时借来的凭据不该落到任何文件里 —— 设一次环境变量、用完即散，
+ * 既不会进 local.properties，也不会被别的脚本顺手读走。
+ *
+ * ```
+ * $env:FF_SMB_HOST='...'; $env:FF_SMB_SHARE='...'
+ * ```
+ *
+ * 优先级：环境变量赢过 local.properties（临时借用时应该能盖住本机常驻那份）。
+ */
+val envSecrets: Map<String, String> = System.getenv()
+    .filterKeys { it.startsWith("FF_") }
+    .mapKeys { (k, _) -> "ff." + k.removePrefix("FF_").lowercase().replace('_', '.') }
+
+val testSecrets: Map<String, String> = localSecrets + envSecrets
+
 android {
     namespace = "com.firefly.tv"
     compileSdk = 34
@@ -43,7 +61,7 @@ android {
             // 直播源探测目标（NetworkDiagTest）：host:port,host:port —— 因运营商而异
             "ff.live.targets",
         ).forEach { key ->
-            localSecrets[key]?.let { testInstrumentationRunnerArguments[key] = it }
+            testSecrets[key]?.let { testInstrumentationRunnerArguments[key] = it }
         }
 
         ndk {
