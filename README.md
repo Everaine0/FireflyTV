@@ -267,3 +267,11 @@ python .\scripts\smb-diag.py --limit 10 --probe 8
 ## 明确不做
 
 刮削、海报墙、选集界面、进度条/暂停界面、返回键功能。
+
+## 许可证
+
+[Apache License 2.0](LICENSE)，版权行见 [NOTICE](NOTICE)。
+
+第三方组件（ijkplayer / FFmpeg / OpenSSL / SDL / libyuv / SoundTouch / smbj / zxing / AndroidX 等）
+按各自的协议授权，与 Apache-2.0 无关 —— 完整清单与 LGPL 合规说明见
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
