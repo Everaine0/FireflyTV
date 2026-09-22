@@ -25,7 +25,7 @@
 | 农历 | `android.icu.util.ChineseCalendar` | **自带 1900–2100 农历表** | `android.icu` 是 API 24+，且 Kotlin 下引用不到；自带表反而少一个兼容风险 |
 | 节气 | （未提） | **太阳视黄经迭代计算** | 不用「几月几日」口诀表，那种表会差一天 |
 | 播放来源 | 直接 SMB | **`RandomAccessSource` 抽象 + `SmbMediaDataSource`** | 抽出字节源后可在模拟器上用本地文件跑插桩测试 |
-| ijkplayer 产物 | 未定 | **`tv.danmaku.ijk.media:ijkplayer-*:0.8.8`（阿里云镜像）** | GitHub 上 befovy 的 release 只有 iOS framework，Android 产物不存在；bilibili 版即 §6 所说的参考基线 |
+| ijkplayer 产物 | 未定 | **自编内核 `app/libs/ijkplayer-full-0.8.8.aar`**（官方 `tv.danmaku.ijk.media:ijkplayer-*:0.8.8` 只用来取 Java 类与清单） | 官方包的 `libijkffmpeg.so` 只编进 23 个解码器：没有 AC-3/E-AC-3/MP2/DTS，也没编 OpenSSL —— 表现就是「有画面没声音」和 `https://` 直播源起不来。重建方式见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh`；bilibili 版即 §6 所说的参考基线 |
 
 ## 1. 目标
 
@@ -133,14 +133,14 @@ Kotlin + **原生 View**（不用 Compose：API 21 不可用，且 TV 焦点更�
 必须自己桥接数据，且 `readAt()` 要实现**随机读**，否则拖进度与续播会失灵：
 
 ```
-SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlayer
+SMB 文件 (smbj) → 实现 readAt() → IMediaDataSource → IjkMediaPlayer
 ```
 
-### 和风天气需填三项
+### 天气接口：初稿和风 → 实际心知（历史，已不适用）
 
-**自 2026 年起和风废弃共享域名**，每账号有专属 API Host，配置页必须单独收集：
-
-- API Key、**API Host**（形如 `<你的子域>.xy.qweatherapi.com`）、城市
+> **这一段是初稿方案，落地时没有采用**：和风自 2026 年起废弃共享域名，每账号一个专属
+> API Host（形如 `<你的子域>.xy.qweatherapi.com`），配置页要多填一栏 —— 老人填不对。
+> 实际实现换成了心知天气，只要「私钥 + 地点」两栏，见「风险 20：天气换成心知」。
 
 ## 7. 适配与性能
 
@@ -186,13 +186,16 @@ SMB 文件 (jcifs-ng) → 实现 readAt() → IMediaDataSource → IjkMediaPlaye
 
 ## 9. 风险清单
 
+> 编号按**追加顺序**保留（18/19/20 与 23/24 是后来补进去的，所以顺序不递增）——
+> 正文里的「见风险 N」都按这张表的编号引用，重新编号会打断全文所有引用。
+
 | # | 风险 | 应对 |
 | :--- | :--- | :--- |
 | 1 | 长虹「虹领金系统」拦截 `CATEGORY_HOME`，抢不到主屏 | 开机自启兜底，双保险；抢主屏效果要在长虹系统上确认 |
 | 2 | 电视无中文 TTS 引擎 | **提前验证**；退化为仅文字显示 |
 | 3 | ijkplayer 停更、来源不确定 | 以官方 `befovy` 版为基；保留 `PlaybackEngine` 换回 Media3 的退路 |
 | 4 | SMB 兼容性（SMB1/2/3、字符编码） | 配置建议填 IP 避免 DNS；SMB 层强制走 smbj 的 Unicode 协商 |
-| 5 | 和风天气 TLS 握手在 Android 5.1 失败 | 留降级开关；TLS 握手要在 Android 5.1 设备上实测 |
+| 5 | ~~和风天气 TLS 握手在 Android 5.1 失败~~（**已作废**：天气已换心知，走标准 HTTPS） | 心知同样是 HTTPS，TLS 握手仍要在 Android 5.1 设备上实测 |
 | 6 | 遥控器键值差异 | `logcat` 查实际 keyCode；同时处理 `DPAD_*` 与 `ENTER` |
 | 7 | **4K 面板 + density 撒谎**：逻辑分辨率 3840×2160 却仍报 dpi 320 → 浮层只占半屏，「按 OK 只有中间一小块有内容」 | ✅ **已修**：`UiScale` 按「短边 ÷ (6 × densityDpi)」校正。见风险 21 |
 | 8 | **非 faststart 的 mp4 播不了**（moov 在文件尾） | ✅ **已修**：`MoovRelocatingSource` 在 Java 侧把 moov 搬到虚拟文件头。见下节 |
@@ -1201,7 +1204,12 @@ H.264 的 4K 跑到 381 Mpx/秒，说明显示通路和 BufferQueue 消费者都
 
 （下面这张表是当时列的三个猜想，方向都被同一个错误前提带偏了 —— 保留作为记录。）
 
-#### 实验台：局域网 HTTP + 旋钮（这一轮的主要交付）
+#### 实验台：局域网 HTTP + 旋钮（当时的交付，**已从主线移除**）
+
+> **这套工装已经不在主线里**：`DiagHub`、`com.firefly.tv.diag.Knobs`、`scripts/tvprobe.py`
+> 和 12 档预设都已在「清理版」里删掉（结论已经拿到，见本节末的 A/B/A 定案）。
+> 完整实现留在 git 分支 **`diag-experiment-snapshot`**，下次要「换一个变量量一次数字」时
+> 从那个分支捡回来即可；下面这一节是当时的用法记录，照着跑要先切回那个分支。
 
 电视在用户家里、没有 adb，而这件事必须「换一个变量、量一次数字」。
 所以应用在 **debug 包里**开了一个局域网 HTTP 口（`DiagHub`，端口 **8642**，无鉴权 —— 怎么简单
@@ -1370,7 +1378,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | 硬解真值 | 模拟器测不出，看诊断页的「解码」行 | 模拟器上只有 `OMX.google.*`（`RANK_SOFTWARE=200`，被 ijkplayer 拒掉），所以**「选中硬解 → 真的建成」这条路在模拟器上跑不到**。真机要看诊断页的「解码」行或日志 `解码通路确认：硬解 OMX.xxx（vdec_type=2）`。若出现 `硬解没建成：选中的 … 实际没接上`，说明这台电视的 MediaCodec 建得出来却接不上，代码会自动拉黑它换下一个候选 |
 | 键值差异（风险 6） | 用 logcat 查实际 keyCode | 代码同时处理 `DPAD_*` 与 `ENTER`，但**设置键的 keyCode 尚未在真机上确认**；模拟器遥控器没有设置键 |
 | 中文 TTS（风险 2） | 看目标电视运行时探测的结果 | 运行时探测、失败退化为纯文字，逻辑已写；模拟器没有中文 TTS 引擎，**要在目标电视上实测** |
-| 天气接口（风险 5） | 在 Android 5.1 设备上实测 TLS | 接口形态已按和风 v7 确认（`X-QW-Api-Key` + `lang=zh`），但 Android 5.1 的 TLS 握手只能在目标设备上实测 |
+| 天气接口（风险 5） | 在 Android 5.1 设备上实测 TLS | 接口形态已按**心知 v3** 确认（`https://api.seniverse.com/v3/weather/…?key=<私钥>&location=<地点>`，见「风险 20：天气换成心知」）；Android 5.1 的 TLS 握手只能在目标设备上实测 |
 | `CATEGORY_HOME`（风险 1） | 在长虹系统上试抢主屏 | 开机自启已写；抢主屏需在长虹系统上试 |
 | 「这台电视不支持 AC-3」这句话 | 看设备能力查询结果 | 判据走设备能力查询，模拟器（纯软件解码器）上没有 AC-3；目标电视是 Amlogic 方案，**系统可能自带**，要在目标机上确认 |
 | 直播重连 | ✅ **已造过真实断流并验证自愈** | 用包过滤（`iptables -I INPUT -s <边缘服务器IP> -j DROP`）造出与真实故障同形的断流：**TCP 连着、对端不再发数据**。旧判据（送显帧率）在画面冻住 3 分钟里一次都没触发（帧率停在 25.00）；新判据 21 秒内完成「判定 → 重连 → 画面回来」，且换台/静置期间不误判。另观察到该网络**本身就会频繁断流**（同一轮测试里 4 分钟内自然断了 3 次，落在不同边缘服务器上），所以这条自愈不是纸面功能 |

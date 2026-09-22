@@ -137,14 +137,14 @@
 > 并把产物拷回 `build/apk/`。用法见脚本头部注释。
 
 ```powershell
-# 本机（访问不到 services.gradle.org，脚本直接用缓存的 Gradle 8.11.1）
+# 离线 / 受限网络下直接用本地缓存的 Gradle 8.11.1（能联网时用 .\gradlew 即可）
 .\build.ps1                      # 打 debug APK（模拟器用）
 .\build.ps1 assembleRelease      # 打正式包（电视用）
 .\build.ps1 testDebugUnitTest    # 单元测试（248 项：农历/节气/缓存/导航/按键反馈/格式判定/解码策略/渲染通路/moov 改写/数据源约定/观看记录/天气策略/界面缩放/选码与 10bit 防线/帧率归因/媒体库结构/直播断流判据）
 .\build.ps1 connectedDebugAndroidTest   # 插桩测试（60 项：播放桥接/硬解通路/解码真值/编解码能力探测/轨道探针/配置页/真 NAS 联调/格式实测/SMB 吞吐/直播失败可见性/天气解析）
 ```
 
-联网机器上标准的 `.\gradlew assembleDebug` 同样可用。
+仓库自带 Gradle Wrapper（8.11.1）：联网机器上标准的 `.\gradlew assembleDebug`（Linux / macOS 用 `./gradlew assembleDebug`）同样可用。
 
 > Android SDK 的位置由 `ANDROID_HOME` / `ANDROID_SDK_ROOT` 指定，或在根目录
 > `local.properties` 里写一行 `sdk.dir=…`。`build.ps1` 找不到 SDK 时会给出提示。
@@ -234,6 +234,16 @@ $env:FF_SMB_USER='...'; $env:FF_SMB_PASS='...'
 python .\scripts\smb-diag.py --limit 10 --probe 8
 ```
 
+## 安全与隐私
+
+- **只在局域网内跑**：片源走你自己的 SMB 共享；可选的心知天气接口是唯一的公网请求（HTTPS，只带私钥与地点）。
+- **没有遥测、没有账号、没有广告**，不上传任何使用数据。
+- **NAS 账号密码只存在电视本机**（`SharedPreferences`，`MODE_PRIVATE`，**明文、未加密**；只用于登录你自己填的 SMB 共享，不会上传到任何地方）。
+  配置页只在「还没配置」时开服，地址里带一次性随机 token（`SecureRandom`），保存成功后立即关服。
+- **正式包复用 debug 签名**（原因见「构建」一节）：debug keystore 是公开的，任何人都能签一个同签名的包。
+  请只从本仓库的 Release 安装，或者自己编。
+- 本仓库**不含任何影视资源、播放列表或直播源**；片源与直播源请自备，并自行确认来源合法。
+
 ## 项目信息
 
 | 项 | 值 |
@@ -249,7 +259,8 @@ python .\scripts\smb-diag.py --limit 10 --probe 8
 - [开发记录](docs/DEVLOG.md) —— 每个真实故障的复现过程、实测数据、源码核对结论（**想知道「为什么这么写」看这里**）
 - [方案设计](docs/DESIGN.md) —— 按键、媒体库结构、技术选型、风险清单、实施阶段
 - [调研：4K 电视上的 UI 缩放](docs/RESEARCH-4K-TV-SCALING.md) —— 真机上 DisplayMetrics 到底报什么、
-  `config_maxUiWidth` 的版本沿革、四种缩放方案对比、官方 10 英尺可读性建议（每条都带来源链接）
+  `config_maxUiWidth` 的版本沿革、四种缩放方案对比、官方 10 英尺可读性建议（每条都带来源链接）；
+  未经逐条复核的原始材料与更正记录在 [`docs/research/4K-DISPLAY-METRICS-REPORT.md`](docs/research/4K-DISPLAY-METRICS-REPORT.md)
 - [调研：ijkplayer 0.8.8 硬解通路](docs/research/ijkplayer-0.8.8-mediacodec-mtk-report.md) ——
   逐行核对源码的选码五道闸、13 种失效模式、完整选项默认值表、哪些选项其实是**空操作**
 

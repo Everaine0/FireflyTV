@@ -92,8 +92,8 @@ bash scripts/swap-ffmpeg-so.sh x86 \
 
 ### 补齐官方包（只在需要重新打包时用）
 
-`app/libs/stock-aar/` 下放着官方包，`pack-ijkplayer-aar.sh` 需要从
-`ijkplayer-java-0.8.8.aar` 里取 Java 类和清单。重新下载：
+`pack-ijkplayer-aar.sh` 需要从官方 `ijkplayer-java-0.8.8.aar` 里取 Java 类和清单；
+**`app/libs/stock-aar/` 不在仓库里**（AAR 已被 gitignore），第一次用先下到这里：
 
 ```powershell
 $base = 'https://maven.aliyun.com/repository/public/tv/danmaku/ijk/media'
