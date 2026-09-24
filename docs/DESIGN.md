@@ -1439,7 +1439,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | 环境 | Android SDK + JDK 17 + Gradle 8.11.1（本机路径不入库，构建脚本会自己找） |
 | **ABI** | 必须含 `armeabi-v7a` + `arm64-v8a`（电视）+ **`x86`**（模拟器，缺了会直接崩） |
 | 正式包 | `.\build.ps1 assembleRelease` → `app-release.apk`（~25MB，debug 包 ~30MB）：R8 压缩 + 资源裁剪 + 去掉 `v/d/i` 日志（规则见 `app/proguard-rules.pro`）。**签名复用 debug keystore**，否则装不上电视上现有的包（换签名 = `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，卸载会清配置） |
-| **版本号** | `app/build.gradle.kts` 的 `versionCode` / `versionName`：**每次发版 versionCode +1**（安卓靠它判断能否覆盖安装），`versionName` 走 `x.y.z`（修 bug 动 z、加功能动 y、不兼容动 x）。当前 `2` / `1.0.1`。电视上没有 adb，「用户手上是哪个包」只能靠这两个数：**诊断页标题**（双击「设置 / 信息」）与**配置页底部**都写着版本号；GitHub Release 的资产名也带版本（`FireflyTV-v1.0.1.apk`）。一直写死 `1` / `1.0` 的话，出了问题连「是不是已经修过的那版」都判断不了 |
+| **版本号** | `app/build.gradle.kts` 的 `versionCode` / `versionName`：**每次发版 versionCode +1**（安卓靠它判断能否覆盖安装），`versionName` 走 `x.y.z`（修 bug 动 z、加功能动 y、不兼容动 x）。当前 `2` / `1.0.1`。电视上没有 adb，「用户手上是哪个包」只能靠这两个数：**诊断页标题**（双击「设置 / 信息」）与**配置页底部**都写着版本号；GitHub Release 的资产就叫 `app-release.apk`（不为每个版本另起一个文件名，版本看 Release 的 tag 即可）。一直写死 `1` / `1.0` 的话，出了问题连「是不是已经修过的那版」都判断不了 |
 | R8 两个坑 | ①`net.engio.mbassy` 被写成 `net.engio.mbassador`（keep 规则等于没写，debug 包不压缩所以一直没症状）；②`javax.el.**` / `org.ietf.jgss.**` 是 Java SE 专有依赖，必须 `-dontwarn`，否则 R8 直接失败。**开 R8 的价值一半在这里** —— 它把「装上能开、一连 NAS 就崩」这类问题提到了构建期 |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
