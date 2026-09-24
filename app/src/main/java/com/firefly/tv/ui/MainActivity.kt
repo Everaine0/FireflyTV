@@ -15,6 +15,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.FrameLayout
 import androidx.appcompat.app.AppCompatActivity
+import com.firefly.tv.BuildConfig
 import com.firefly.tv.config.ConfigServer
 import com.firefly.tv.core.Config
 import com.firefly.tv.core.Lunar
@@ -2035,7 +2036,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     }
 
     private fun renderDiag() {
-        diagScreen.show("播放诊断", diagRows(), "OK 键关闭（30 秒后自动关闭）")
+        // 标题带上版本号：电视上没有 adb，「用户手上是哪个包」只能靠这一行问出来
+        diagScreen.show(
+            "播放诊断 v${BuildConfig.VERSION_NAME}",
+            diagRows(),
+            "OK 键关闭（30 秒后自动关闭）",
+        )
     }
 
     private var lastWeather: WeatherClient.Now? = null

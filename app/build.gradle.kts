@@ -47,8 +47,17 @@ android {
         applicationId = "com.firefly.tv"
         minSdk = 21
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // ---- 版本号规则 ----
+        // versionCode 每次发版 +1（安卓用它判断「能不能覆盖安装」），
+        // versionName 用 x.y.z：修 bug 只动 z，加功能动 y，不兼容的改动动 x。
+        //
+        // 为什么要较真：同一台电视上装过哪个包、用户报障时手上是哪个版本，
+        // 全靠这两个数说话。一直写 1 / 1.0 的话，出了问题连「是不是已经修过的那版」
+        // 都判断不了 —— 而这台电视上没有 adb，问不到别的。
+        //
+        // 版本号在电视上**看得见**：诊断页标题、配置页底部（见 DiagScreen / ConfigServer）。
+        versionCode = 2
+        versionName = "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

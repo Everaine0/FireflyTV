@@ -1,5 +1,6 @@
 package com.firefly.tv.config
 
+import com.firefly.tv.BuildConfig
 import com.firefly.tv.core.Config
 import com.firefly.tv.net.WeatherClient
 import com.firefly.tv.smb.SmbClient
@@ -431,6 +432,10 @@ class ConfigServer(
 <button id="btnSave" type="button"><span id="spin"></span>保存并开始使用</button>
 <div id="bar"></div>
 <div class="msg" id="msg"></div>
+
+<!-- 版本号：用户报障时第一句要问的就是它，而电视上没有 adb，
+     所以配置页（手机上看得到的这一页）底部直接写出来。 -->
+<div class="hint" style="text-align:center;margin-top:26px">萤火照夜 v${BuildConfig.VERSION_NAME}（build ${BuildConfig.VERSION_CODE}）</div>
 
 <script>
 const ids = ['host','share','root','user','domain','pass','wkey','wloc'];
