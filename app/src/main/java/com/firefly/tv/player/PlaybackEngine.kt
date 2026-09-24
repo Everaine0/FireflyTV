@@ -513,9 +513,31 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
     override fun playSmb(cfg: Config.Smb, relativePath: String, startMs: Long) {
         kind = PlaybackMode.Kind.ON_DEMAND
+        stopLiveReconnect()
         lastRequest = LastRequest.Smb(cfg, relativePath, startMs)
         noteContent("smb:$relativePath")
         startPlayback(wantHardware())
+    }
+
+    /**
+     * 切到点播内容时，把「直播断流自动重连」彻底关掉（连地址提供者一起清空）。
+     *
+     * ## 为什么必须由引擎自己做
+     *
+     * `liveReconnect` 是界面层换到直播时打开的，而它以前**从来没有被关掉过**：
+     * 于是「先看直播、再回电视剧」之后，点播的一集播完会被当成直播断流
+     * （见 [PlaybackMode.onCompletion] 与 [newPlayer] 里的完成回调）。
+     * 界面层可以自己记得关，但漏一处就是一次黑屏 —— 状态跟着内容类型走，
+     * 放在这里从结构上不会漏。
+     *
+     * 顺带把 [liveUrlProvider] 清掉还有第二个作用：万一有一个直播重连的 Runnable
+     * 已经排在主线程队列里（切换过程中很常见），它醒来时拿不到地址就不会去抢画面。
+     */
+    private fun stopLiveReconnect() {
+        if (liveReconnect || liveUrlProvider != null) {
+            Log.i(TAG, "切到点播内容：关掉直播重连")
+        }
+        setLiveReconnect(false, null)
     }
 
     override fun setMode(kind: PlaybackMode.Kind) {
@@ -526,6 +548,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         playSource({ source }, startMs)
 
     override fun playSource(open: () -> RandomAccessSource, startMs: Long) {
+        stopLiveReconnect()
         lastRequest = LastRequest.Source(open, startMs)
         noteContent("src:$startMs")
         startPlayback(wantHardware())
@@ -557,34 +580,52 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         // （playEpisode 会先查 surfaceUsable），这里只是把顺序钉死。
         surface?.let { p.setSurface(it) }
 
-        when (req) {
-            is LastRequest.Url -> {
-                pendingSeekMs = 0
-                p.setDataSource(req.url)
-            }
+        // ⚠️ 从这里到 `prepareAsync()` 之间会**阻塞**：打开 SMB 字节源要读 NAS，
+        // 硬盘休眠时一次请求就要等满 20 秒超时（`SmbStore` 还会自己再试一次）。
+        // 这段时间用 [starting] 标出来，让界面层的「起播卡死 → 退回软解重播」先别插队 ——
+        // 那种重播走的是**另一条线程**，会和这一次同时建出两个播放器，两个都挂在同一个
+        // Surface 上，而界面层只跟其中一个；真正的瓶颈又在 NAS 读取上，重播一次也救不了。
+        starting = true
+        try {
+            when (req) {
+                is LastRequest.Url -> {
+                    pendingSeekMs = 0
+                    p.setDataSource(req.url)
+                }
 
-            is LastRequest.Smb -> {
-                // 非 faststart 的 mp4 由 SmbMediaDataSource 内部负责把 moov 搬到头部（DESIGN 风险 8）
-                val src = openOrReport("打不开这一集") {
-                    SmbMediaDataSource(SmbRandomAccessSource(req.cfg, req.path))
-                } ?: return
-                dataSource = src
-                // 直播的进度没有意义，绝不能拿着一个假的毫秒数去 seek（见 PlaybackMode 注释）
-                pendingSeekMs = PlaybackMode.startPositionMs(kind, req.startMs)
-                p.setDataSource(src)
-            }
+                is LastRequest.Smb -> {
+                    // 非 faststart 的 mp4 由 SmbMediaDataSource 内部负责把 moov 搬到头部（DESIGN 风险 8）
+                    val src = openOrReport("打不开这一集") {
+                        SmbMediaDataSource(SmbRandomAccessSource(req.cfg, req.path))
+                    } ?: return
+                    dataSource = src
+                    // 直播的进度没有意义，绝不能拿着一个假的毫秒数去 seek（见 PlaybackMode 注释）
+                    pendingSeekMs = PlaybackMode.startPositionMs(kind, req.startMs)
+                    p.setDataSource(src)
+                }
 
-            is LastRequest.Source -> {
-                val src = openOrReport("打不开这个文件") {
-                    SmbMediaDataSource(req.factory())
-                } ?: return
-                dataSource = src
-                pendingSeekMs = PlaybackMode.startPositionMs(kind, req.startMs)
-                p.setDataSource(src)
+                is LastRequest.Source -> {
+                    val src = openOrReport("打不开这个文件") {
+                        SmbMediaDataSource(req.factory())
+                    } ?: return
+                    dataSource = src
+                    pendingSeekMs = PlaybackMode.startPositionMs(kind, req.startMs)
+                    p.setDataSource(src)
+                }
             }
+            p.prepareAsync()
+        } finally {
+            starting = false
         }
-        p.prepareAsync()
     }
+
+    /**
+     * 正在**打开字节源**（`startPlayback` 里唯一会长时间阻塞的一段）。
+     *
+     * 写在播放器线程、读在主线程的起播看门狗里，所以 `@Volatile`。
+     */
+    @Volatile
+    private var starting = false
 
     /**
      * 建字节源时抛异常 → 走故障页，**不要让它冒到调用方**。
@@ -645,11 +686,15 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
             }
         })
         p.setOnCompletionListener {
-            if (liveReconnect) {
+            // ⚠️ 判据必须带上 kind。只看 liveReconnect 会导致「先看直播、再回电视剧」以后，
+            // 每一集播完都被当成直播断流：引擎先 release 播放器（画面当场变黑），
+            // 再按 provider 去重连一个根本没在播的频道地址 —— 而那个地址在换库时
+            // 已经被清掉了（provider 返回 null），于是黑屏永远停在那儿。
+            // 这就是用户报的「上一集播完，下一集直接黑屏」（见 [PlaybackMode.onCompletion]）。
+            when (PlaybackMode.onCompletion(kind, liveReconnect)) {
                 // 直播"完成"通常是断流
-                scheduleLiveRetry()
-            } else {
-                onMain { listener?.onCompletion() }
+                PlaybackMode.OnCompletion.LIVE_RETRY -> scheduleLiveRetry()
+                PlaybackMode.OnCompletion.NEXT -> onMain { listener?.onCompletion() }
             }
         }
         p.setOnErrorListener { _, what, extra ->
@@ -972,7 +1017,17 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
     override fun canFallbackToSoftware(): Boolean = usingHardware && lastRequest != null
 
-    override fun retryInSoftware(): Boolean = fallbackToSoftware("界面层判定起播卡死", hard = true)
+    override fun retryInSoftware(): Boolean {
+        // 正在打开字节源（NAS 慢时可能几十秒）就先别插队：这时候再起一个播放器，
+        // 两个会同时挂在同一个 Surface 上，界面层却只跟其中一个 —— 表现就是黑屏。
+        // 而且瓶颈在 NAS 读取，退回软解也救不了；让这一次走完，失败它会自己报错，
+        // 界面层的起播宽限会接着重试（见 MainActivity 的 [StartupGrace]）。
+        if (starting) {
+            Log.w(TAG, "起播还在打开字节源（NAS 慢），先不让软解重播插队")
+            return false
+        }
+        return fallbackToSoftware("界面层判定起播卡死", hard = true)
+    }
 
     /**
      * 所有对外回调都必须回到主线程。
@@ -1266,6 +1321,9 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     }
 
     private fun releaseInternal() {
+        // 起播被打断（换内容 / 重播 / 退出）时这个标记必须一起清掉，
+        // 否则它会一直挂着，界面层的软解重播永远插不进来
+        starting = false
         cancelHardwareWatchdog()
         cancelHardwareTruthCheck()
         cancelStallWatchdog()

@@ -41,6 +41,38 @@ object PlaybackMode {
     fun startPositionMs(kind: Kind, requested: Long): Long =
         if (remembersPosition(kind)) requested.coerceAtLeast(0L) else 0L
 
+    /**
+     * 播放器报「播完了」时，引擎该做什么。
+     *
+     * ## 为什么要单独一条规则（这是「上一集播完，下一集直接黑屏」的根因）
+     *
+     * 引擎原来只看 `liveReconnect` 这个开关决定「播完 = 断流，去重连频道」还是
+     * 「播完 = 这一集看完了，通知界面跳下一集」。而那个开关是界面层**换到直播时**
+     * 置 true 的，**从来没有被置回 false**。
+     *
+     * 于是「先看直播、再回电视剧」以后，每一集播完都会被当成直播断流：
+     * 引擎 release 掉点播播放器（画面当场变黑），两秒后去重连一个根本没在播的
+     * 频道地址 —— 而那个地址在换库时已经被清掉了（界面层的 provider 返回 null），
+     * 于是黑屏永远停在那儿：没有报错、也没有看门狗（起播看门狗早在上一集首帧时就撤了）。
+     * 用户实测就是这个：「上一集播完，下一集直接黑屏」。
+     *
+     * 所以判据必须**两个一起看**：只有在「正看着直播」而且开着重连时，
+     * 「播完」才等于断流。少了 [Kind] 这一半，点播的一集播完就会被误判。
+     *
+     * 抽成纯函数是为了能用单元测试钉住 —— 这条规则错了，表现是黑屏而不是报错，
+     * 肉眼很难定位。
+     */
+    enum class OnCompletion {
+        /** 点播：这一集看完了，交给界面层去跳下一集。 */
+        NEXT,
+
+        /** 直播："播完了"通常就是断流，走自动重连。 */
+        LIVE_RETRY,
+    }
+
+    fun onCompletion(kind: Kind, liveReconnect: Boolean): OnCompletion =
+        if (liveReconnect && kind == Kind.LIVE) OnCompletion.LIVE_RETRY else OnCompletion.NEXT
+
     /** 播放器的微调参数（DESIGN §6）。 */
     class Tuning(
         val packetBuffering: Boolean,

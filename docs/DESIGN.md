@@ -161,7 +161,7 @@ SMB 文件 (smbj) → 实现 readAt() → IMediaDataSource → IjkMediaPlayer
 
 **按键反馈必须有**：实测按了左键画面还是 IPTV，分不清键有没有生效，只能按 OK 去确认。
 现在换库立刻出「《库名》正在打开…」，内容出来后再换成内容名，1.6 秒后收起。
-规则由 `SwitchHud` 承担，有 11 项单元测试钉住。
+规则由 `SwitchHud` 承担（换库「正在打开…」、起播「正在加载…」两种），14 项单元测试钉住。
 
 > 加载提示的期限是 **60 秒（`SwitchHud.LOADING_MS`）**，**不是**永不超时。
 > 早先写的是 `deadline = 0L`（"SMB 慢就一直留着"），但那条提示没有任何出口兜底：
@@ -182,6 +182,7 @@ SMB 文件 (smbj) → 实现 readAt() → IMediaDataSource → IjkMediaPlayer
 | NAS 连不上 / 断网 | 无法连接 NAS，请检查网络 | 每 10 秒重试，恢复后回播放 |
 | m3u 拉取失败 | 直播源暂时无法加载 | 每 10 秒重试 |
 | 单集文件损坏 | 这个视频无法播放 | 3 秒后跳下一个 |
+| NAS 硬盘休眠 / 起播慢（**没出过画面**） | 先出「正在加载…」，**不报故障** | 自动重试（窗口 40 秒、最多 3 次、退避 3/8/15 秒，`StartupGrace`）；超过窗口才把原因摆出来 |
 | 天气接口失败 | 天气获取失败 | 静默重试，不阻塞浮层其他内容 |
 
 ## 9. 风险清单
@@ -817,7 +818,7 @@ ffmpeg 3.4 本有一条回退（`rtspdec.c`：`ret == AVERROR(ETIMEDOUT) && !rt-
   「**直播断流后画面永远冻着（本次修）**」。
 
 回归防线：`PlaybackModeTest` 钉住协议识别、认不出时退回 HTTP 老行为、
-以及各档参数的大小关系（单测 248 项全过，含 `LiveStallTest` 的 8 项断流判据）。
+以及各档参数的大小关系（单测 259 项全过，含 `LiveStallTest` 的断流判据）。
 
 #### 「没声音」有两个完全不同的根因，现象一模一样
 
@@ -1390,6 +1391,8 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 
 | 项 | 说明 |
 | :--- | :--- |
+| **起播慢就报「这个视频无法播放」（本次修）** | 用户报「偶尔打开会显示这个视频无法播放，等一段时间正常」，并猜是 NAS 硬盘休眠 —— 猜对了。链路：硬盘休眠 → 播放器第一次读撞上 SMB 的 20 秒请求超时 → `TimeoutException` → ijkplayer 报成播放错误 → 界面层**立刻**弹故障页，而十几秒后盘转起来同一集明明能播。修法两件：① 起播先挂「正在加载…」（`SwitchHud.onStarting`），首帧上屏才换成内容名 —— 这段时间原来屏幕上一个字都没有；② 没出过画面的失败不再立刻报故障，先自动重试（纯函数 `StartupGrace`：窗口 40 秒 / 最多 3 次 / 退避 3、8、15 秒），超窗口才把原因摆出来。已在放的内容中途断了不走这条路（用户需要立刻知道原因）。顺手封掉 `onCompletion` 里「时长不可信」那条**只写日志就 return** 的死路（此刻播放器停在文件结尾、屏幕全黑，起播看门狗早撤了）|
+| **上一集播完，下一集直接黑屏（本次修）** | 用户报「铁梨花播放偶尔会出现上一集播完，下一集直接黑屏。原因未知」—— 不是原因未知，是**状态串了**：`liveReconnect` 是换到直播时打开的，而全工程没有一处把它置回 false。于是「先看直播、再回电视剧」以后，点播的一集播完被当成直播断流：`scheduleLiveRetry()` 先 `releaseInternal()`（画面当场变黑），两秒后去取频道地址重连，而 `channels` 在切库时已被清空、provider 返回 null → 黑屏永远停在那儿（无报错、无看门狗，起播看门狗在上一集首帧时就撤了）。修法：① 判据加另一半 `PlaybackMode.onCompletion(kind, liveReconnect)`（纯函数 + 3 项单测，这条规则错了不报错只黑屏）；② 引擎切到点播内容时自己 `stopLiveReconnect()`，并清掉 provider（顺带让已排队的直播重连 Runnable 拿不到地址、不会抢画面）。同类死路 `advanceToNextShow` 未回写 `shows` 字段也一并封掉 |
 | **崩溃闪退** | ijkplayer 的 `onPrepared/onError/onCompletion/onInfo` 回调**不在它自己的线程上**：`IjkMediaPlayer.initPlayer` 是 `Looper.myLooper()` 优先、`getMainLooper()` 兜底（核对了 AAR 字节码），即「谁 new 的播放器就排谁的队列」。之前直接透传给界面层，界面在非 UI 线程碰 View，抛 `CalledFromWrongThreadException` 当场崩；Activity 重建后又立刻报同样的错，于是「闪退之后再也打不开」。现在 `IjkPlaybackEngine` 用 `onMain{}` 统一把回调切回主线程 |
 | **直播断流后画面永远冻着（本次修）** | 用户报的「看着看着卡住不动，得重进软件才好」。模拟器上抓到现场：直播流断掉（TCP 连着、对端不再发数据）后画面冻在最后一帧，`ff_read` 之类的原生线程还在、`isPlaying` 仍是 true、**既无 `onError` 也无 `onCompletion`**，于是永远冻着 —— 界面层的起播看门狗首帧时就撤了，引擎那道存活看门狗的判据（送显帧率）实测**根本不会掉**（画面冻住 3 分钟它一直显示 25.00 帧/秒）。修法：判据换成播放器**自己报的** `BUFFERING_START` —— 实测丢包后 **0 毫秒**就到，「持续缓冲 10 秒」即判断流，3 次巡检后走既有的直播重连。**实测（`iptables` 丢包造断流）**：21 秒完成「判定 → 重连 → 画面回来」，同一轮里连救两次真实断流；随后 3 分多钟正常播放零误判。判据抽成纯函数 `LiveStall`（8 项单测钉住「真断流必判」与「正常播放/暂停不判」）。⚠️ 被否掉的两个候选量记在 `LiveStall` 类注释里（`outputFps` 停住不归零、`trafficStatisticByteCount` 在 RTSP 上恒为 0），别再试 |
 | **刚开机卡住加载不动（本次修）** | 播放器原来在 `firefly-io` 上构造，而那条队列上同时排着 NAS 扫描 / 剧集列目录 / 音频探测 —— 于是**画面早就上屏了，撤掉「正在打开…」的那条回调还堵在后面**，屏幕永远停在加载条上；而那条加载提示当时还是"永不超时"。四处一起改：① 播放器独立到 `firefly-player` 线程；② `SwitchHud` 的加载提示有 60 秒期限；③ 新增 40 秒**启动兜底看门狗**（覆盖"决定要播 → 列库 → 列剧 → 列集"这段原本无人看管的窗口，到点自动重启，额度 3 次 + 5 分钟冷却）；④ 报故障时顺手收掉加载条（它原来画在故障页**上面**） |
@@ -1411,7 +1414,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | **首帧判据假绿导致看门狗被提前撤销** | `onFirstFrame` 同时挂在 `VIDEO_RENDERING_START` 和 **`VIDEO_SIZE_CHANGED`** 上，而后者在**准备阶段**就触发（解码器刚拿到分辨率就报，一帧都没解出来）。`onFirstFrame` 的第一件事是撤掉起播看门狗，于是**看门狗在画面真正出来之前就被撤了**，解码器随后卡住就再也没人报故障。现在首帧只由 `VIDEO_RENDERING_START` 触发并去重。这条在**所有设备**上都成立 |
 | **`MoovRelocatingSource` 跨段短读** | 重排后的虚拟文件由物理上不连续的段拼成，`read` 很容易跨段。旧实现遇到边界就只返回当前段剩下的字节 —— 上层会把这个短读当成「文件到这儿就没了」。**只有 moov 在尾部、需要重排的片源才会复现**，表现为播到一半「播完」或画面花掉。已补循环填满，并加了**用大块读**的回归测试（旧的测试用 7 字节零碎读，永远不跨段，所以一直没发现） |
 | **按上键跳回 CCTV5** | 切库时没清掉上一个库的缓存，于是拿 IPTV 遗留的频道列表去换台。现在切库整体清空，并把决策抽成 `Navigator`（类型 + 缓存归属），11 项单元测试钉住 |
-| **切库看起来像卡死** | 切库要等 SMB 列目录，这段时间屏幕上什么都不变。现在任何一次按键都立刻出反馈条（`SwitchHud`，11 项测试） |
+| **切库看起来像卡死** | 切库要等 SMB 列目录，这段时间屏幕上什么都不变。现在任何一次按键都立刻出反馈条（`SwitchHud`，14 项测试） |
 | **切换很慢** | 每按一次上下键都要重新列一遍剧和集。现在剧列表按库缓存、集列表落盘缓存，实测冷启动不再等 NAS |
 | **切剧后永远卡住不出画面** | 起播时若 Surface 还没建好就排进等待队列，代码假设 `surfaceCreated` 会再来一次 —— 实测不成立（从后台回前台时按键能触发，但 Surface 早建好了）。那一集就永远躺在队列里。改成按状态查询 `surface.isValid` + 500ms 轮询 + 8 秒超时 |
 | **直播也在写续播进度** | IPTV 的 `currentPosition` 是从开播算起的毫秒数，被当成进度存下来，下次拿它去 seek 一条直播流 —— 这就是「IPTV 音画不同步」的确定成因。现在 `PlaybackMode` 写死「只有点播配拥有进度」，6 项测试钉住 |
@@ -1439,7 +1442,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | R8 两个坑 | ①`net.engio.mbassy` 被写成 `net.engio.mbassador`（keep 规则等于没写，debug 包不压缩所以一直没症状）；②`javax.el.**` / `org.ietf.jgss.**` 是 Java SE 专有依赖，必须 `-dontwarn`，否则 R8 直接失败。**开 R8 的价值一半在这里** —— 它把「装上能开、一连 NAS 就崩」这类问题提到了构建期 |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**248 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**259 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
 | 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
 | 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |

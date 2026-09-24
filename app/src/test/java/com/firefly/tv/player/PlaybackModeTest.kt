@@ -135,6 +135,41 @@ class PlaybackModeTest {
         assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.LIVE, 3_600_000L))
     }
 
+    // ---- 「播完了」到底该干什么 ----
+    //
+    // 这条规则错了**不会报错，只会黑屏**，所以必须用测试钉住。
+    // 用户报的「上一集播完，下一集直接黑屏」就是它：界面层换到直播时打开的
+    // `liveReconnect` 从来没有被关掉，于是「先看直播、再回电视剧」以后，
+    // 点播的一集播完会被当成直播断流 —— 引擎先 release 播放器（画面立刻变黑），
+    // 再去重连一个换库时就已经清掉的频道地址（界面层的 provider 返回 null），
+    // 黑屏就永远停在那儿了。
+
+    @Test
+    fun `点播播完就是跳下一集哪怕直播开关还开着`() {
+        assertEquals(
+            PlaybackMode.OnCompletion.NEXT,
+            PlaybackMode.onCompletion(PlaybackMode.Kind.ON_DEMAND, liveReconnect = false),
+        )
+        assertEquals(
+            "看直播时打开的开关没关掉，但当前播的是点播 —— 绝不能当成断流",
+            PlaybackMode.OnCompletion.NEXT,
+            PlaybackMode.onCompletion(PlaybackMode.Kind.ON_DEMAND, liveReconnect = true),
+        )
+    }
+
+    @Test
+    fun `只有正在播直播时才把播完当断流`() {
+        assertEquals(
+            PlaybackMode.OnCompletion.LIVE_RETRY,
+            PlaybackMode.onCompletion(PlaybackMode.Kind.LIVE, liveReconnect = true),
+        )
+        assertEquals(
+            "没开重连就交给界面层处理",
+            PlaybackMode.OnCompletion.NEXT,
+            PlaybackMode.onCompletion(PlaybackMode.Kind.LIVE, liveReconnect = false),
+        )
+    }
+
     @Test
     fun `门槛是十秒`() {
         assertFalse(PlaybackMode.canAutoAdvance(PlaybackMode.Kind.ON_DEMAND, 9_999L))

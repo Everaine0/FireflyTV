@@ -71,8 +71,26 @@ class SwitchHud(private val briefMs: Long = BRIEF_MS) {
      * 说明不是"慢"而是出事了，让提示自己退场，把屏幕交给故障页或启动看门狗
      * （`MainActivity.startupWatchdog` 会在更早的时候接手并自动重启）。
      */
-    fun onLibrarySwitch(libName: String, now: Long) {
-        current = State(Style.LOADING, libName, SUBTITLE_LOADING)
+    fun onLibrarySwitch(libName: String, now: Long) =
+        onLoading(libName, SUBTITLE_LOADING, now)
+
+    /**
+     * 起播一集（或一路直播）：显示「正在加载…」，直到首帧上屏（[onPlaying]）或故障页接管（[dismiss]）。
+     *
+     * ## 为什么和 [onLibrarySwitch] 分开
+     *
+     * 副标题不一样：换库是在等 NAS 列目录（「正在打开…」），而起播是在等播放器出首帧 ——
+     * 这段时间屏幕上就是**黑的**。用户实测「偶尔打开会显示这个视频无法播放」，
+     * 而在此之前那几秒（NAS 硬盘休眠、要等它转起来）屏幕上一个字都没有，
+     * 老人分不清"在加载"和"坏了"。所以起播必须有一句在动的话。
+     *
+     * 期限仍然走 [LOADING_MS]（60 秒）：真慢到这个数说明不是"慢"而是出事了，
+     * 提示自己退场，把屏幕交给故障页。
+     */
+    fun onStarting(title: String, now: Long) = onLoading(title, SUBTITLE_STARTING, now)
+
+    private fun onLoading(title: String, subtitle: String, now: Long) {
+        current = State(Style.LOADING, title, subtitle)
         pending = true
         deadline = now + LOADING_MS
     }
@@ -136,6 +154,14 @@ class SwitchHud(private val briefMs: Long = BRIEF_MS) {
          * 加上书名号之后用户一眼就知道「这是这个库」。
          */
         const val SUBTITLE_LOADING = "正在打开…"
+
+        /**
+         * 起播一集/一路时的副标题（见 [SwitchHud.onStarting]）。
+         *
+         * 用「正在加载…」而不是「正在打开…」：打开是"在找这个文件"，
+         * 加载是"文件找到了，正在读出画面" —— 后者正是 NAS 硬盘休眠时用户在等的那件事。
+         */
+        const val SUBTITLE_STARTING = "正在加载…"
 
         /** 还没定位到库名时的过渡标题/副标题（见 [onRestoring]）。 */
         const val RESTORING = "正在连接 NAS"

@@ -545,6 +545,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         prepared = false
         audioStarted = false
         armStallWatchdog()
+        // 起播宽限的窗口从这一刻算起；同一集的重试不重新计时（见 [beginStartGrace]）
+        beginStartGrace("ep:$path")
+        // 从这一刻到首帧之间屏幕是黑的：先出一句「正在加载…」，
+        // 别让老人分不清"在加载"和"坏了"（见 [StartupGrace]）
+        showStarting(s.show)
         // 记下"这一集是什么时候排上队的"：下面这条工作一旦排在别的活后面（例如上一集的
         // 硬解兜底重播、或者 SMB 连接还在忙着），等待时间要能从起播超时里扣掉，
         // 否则排队的时间会被算成播放器卡死，冤枉它一次。
@@ -564,6 +569,75 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private var startedAt = 0L
     private var gotFirstFrame = false
+
+    // ---- 起播宽限（见 [StartupGrace]）----
+    //
+    // 「偶尔打开会显示这个视频无法播放，等一会儿又正常」的修复点：
+    // NAS 硬盘休眠时第一次读要等盘转起来，SMB 的读请求会超时，ijkplayer 把它
+    // 报成一次播放错误（`onError`）—— 界面层原来立刻把「无法播放」摆出来，
+    // 而十几秒后它明明能播。
+    // 现在没出过画面之前的失败先重试几次，超过宽限窗口才把原因说出来。
+
+    /**
+     * 这次起播的**身份**（一集的路径 / 一路直播的地址）。
+     *
+     * 宽限按内容算：同一集的重试不重新计时，换了内容才归零。不这么做的话，
+     * 「失败 → 重试 → 又失败」会一次次把计时器清零，故障页永远出不来。
+     */
+    private var graceKey: String = ""
+
+    /** 这次起播已经自动重试过几次。 */
+    private var graceAttempts = 0
+
+    /** 这次起播是什么时候开始的（宽限窗口的起点）。 */
+    private var graceAt = 0L
+
+    /** 已经排上队的那次重试是给谁的（null = 没有排队的重试）。 */
+    private var startRetryFor: String? = null
+
+    /**
+     * 同内容重新起播一次（起播宽限用）。
+     *
+     * 到点先对一下身份：这期间用户可能已经换了剧/换了台，那次重试就该作废 ——
+     * 否则会把用户正在看的东西无故重启一遍。
+     */
+    private val startRetry = Runnable {
+        val key = startRetryFor ?: return@Runnable
+        startRetryFor = null
+        if (key != graceKey) {
+            trace("起播重试：内容已经换成「$graceKey」，这次重试作废")
+            return@Runnable
+        }
+        trace("起播宽限：自动重试《$currentTitle》（第 $graceAttempts 次）")
+        replayCurrent(lastKnownPos())
+    }
+
+    /**
+     * 开一次新的起播宽限。
+     *
+     * @param key 这次起播的身份（同一集的重试必须传同一个 key，见 [graceKey]）
+     */
+    private fun beginStartGrace(key: String) {
+        main.removeCallbacks(startRetry)
+        startRetryFor = null
+        if (key == graceKey) return
+        graceKey = key
+        graceAttempts = 0
+        graceAt = System.currentTimeMillis()
+    }
+
+    /** 排一次「同一内容再过一会儿重试」（见 [StartupGrace]）。 */
+    private fun scheduleStartRetry() {
+        startRetryFor = graceKey
+        main.removeCallbacks(startRetry)
+        main.postDelayed(startRetry, StartupGrace.backoffMs(graceAttempts))
+    }
+
+    /** 屏幕上先出一句「正在加载…」（见 [SwitchHud.onStarting]）。 */
+    private fun showStarting(title: String) {
+        hud.onStarting(title, System.currentTimeMillis())
+        postHudTick()
+    }
 
     /**
      * 这一集**排上队**的时刻（见 [playEpisodeNow]）。
@@ -640,6 +714,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 gotFirstFrame = true
                 Log.w(TAG, "起播 ${waitedPlaying}ms 没收到渲染事件，但帧率非 0：按已出画面处理")
                 trace("stallWatchdog：无渲染事件但帧率非 0，撤哨")
+                // ⚠️ 这条路上 `VIDEO_RENDERING_START` 不会来（原因见上），所以首帧该做的事
+                // 得在这里补一遍：撤掉「正在加载…」、挂上播放中存活看门狗、
+                // 并把起播宽限排的那次重试作废。少了这一段，画面明明在放，
+                // 左下角却会一直挂着「正在加载…」到 60 秒期限。
+                main.removeCallbacks(startRetry)
+                startRetryFor = null
+                onContentPicked(currentTitle)
+                armLivenessWatchdog()
                 return
             }
             if (engine.canFallbackToSoftware() && engine.retryInSoftware()) {
@@ -1643,6 +1725,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             playEpisode(autoAdvanceStartMs(lib.name, showName, episodeIndex))
             return
         }
+        // ⚠️ 先把列表落到 [shows] 上：`playShow` 是按 [shows] 找剧的，而这条路可能是
+        // IO 线程现扫出来的（[onEpisodeFinished] 里那条），以前没有回写字段 ——
+        // 字段为空时 `playShow` 第一行就 return，屏幕上什么都不发生：
+        // 「上一集播完，下一集直接黑屏」的又一条静默死路。
+        shows = list
+        cachedShowsLib = lib.name
         val cur = list.indexOf(showName)
         val next = if (cur < 0) 0 else (cur + 1) % list.size
         // 下一部剧也接着**它自己的**记录看。原来这里写死 `(0, 0L)`，
@@ -1748,6 +1836,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 直播没有首帧之前也得有人盯着：引擎的存活看门狗是首帧之后才挂的
         // （见 PlaybackEngine.fireFirstFrame），这段空档由启动兜底看门狗兜住。
         armStartupWatchdog()
+        // 换台也走同一条起播宽限：连不上/还没出画面之前先重试，别急着说看不了
+        beginStartGrace("live:$url")
+        showStarting(name)
         engine.setMode(PlaybackMode.Kind.LIVE)
         engine.setLiveReconnect(true) { channels.getOrNull(channelIndex)?.url }
         engine.playUrl(url)
@@ -2207,8 +2298,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // （真正的首帧判据是 [onFirstFrame]，但播放器都说准备好了，
         //   再自动重启一遍只会把刚起来的画面打断。）
         disarmStartupWatchdog()
-        // 「正在打开…」换成内容名，1.6 秒后收起 —— 这一刻用户才算确认换台/换剧成功
-        onContentPicked(currentTitle)
+        // ⚠️ 这里**不撤**「正在加载…」。`onPrepared` 只说明解码器建好了，
+        // 画面还没上屏 —— 硬解建得出来却一帧不吐的电视上，这两件事能差十几秒。
+        // 撤提示的时机是 [onFirstFrame]（那条路上补了同样一句话）。
     }
 
     override fun onAudioStarted() {
@@ -2223,13 +2315,48 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 时长不可信时绝不自动跳集：那种流（AC-3 的 TS）会被内核误判成「已经播完」，
         // 一集接一集地自己往前跑，用户什么都没按却停在了别的剧上。
         if (!PlaybackMode.canAutoAdvance(kind, dur)) {
-            Log.w(TAG, "时长不可信（${dur}ms），不自动跳集，原地接着播")
+            // ⚠️ 这里原来只有一行日志就 return —— 而此刻播放器已经停在文件结尾，
+            // 屏幕上就是一片黑，而且永远不会自己好（起播看门狗早在这一集开头就撤了）。
+            // 「不跳集」是对的（跳了会把整部剧一路跑掉），但"什么都不做"不行：
+            // 像别的故障一样留一句人话 + 10 秒重试。
+            Log.w(TAG, "时长不可信（${dur}ms），不自动跳集：挂着原因重试")
+            trace("onCompletion 时长不可信（${dur}ms）-> 故障页重试")
+            showFault("这一集播放异常，正在重试", retry = true)
             return
         }
         onEpisodeFinished()
     }
 
     override fun onError(friendlyMessage: String, fatal: Boolean) {
+        // ⚠️ 起播阶段（这一集/这一路还没出过画面）先别急着说「无法播放」。
+        //
+        // 用户实测的原话是「偶尔打开会显示这个视频无法播放，等一段时间正常」。
+        // 现场是 NAS 硬盘休眠：第一次打开要等盘转起来，这期间 SMB 的读请求会超时
+        // （20 秒一刀），ijkplayer 把这个读失败报成一次播放错误（`onError`）——
+        // 而十几秒后同一集明明能播。
+        // 立刻把「无法播放」摆出来是最糟的反馈：老人会直接放弃这一集。
+        //
+        // 判据交给 [StartupGrace]（纯函数 + 单测）：还在宽限窗口里就保持「正在加载…」
+        // 并自动重试；超过窗口才把原因摆到屏幕上，走下面那套原来的处置
+        // （跳下一集 / 挂着原因 10 秒重试）。已经在放的片子中途断了不走这条路 ——
+        // `gotFirstFrame` 为 true，用户需要立刻知道原因。
+        val elapsed = System.currentTimeMillis() - graceAt
+        if (StartupGrace.shouldRetry(!gotFirstFrame, graceAttempts, elapsed)) {
+            graceAttempts++
+            Log.w(
+                TAG,
+                "起播失败（$friendlyMessage）但还没出过画面：" +
+                    "已等 ${elapsed / 1000} 秒，第 $graceAttempts 次自动重试（不报故障）",
+            )
+            trace("onError 走起播宽限：$friendlyMessage（第 $graceAttempts 次）")
+            // 宽限期内保持「正在加载…」；故障页和它的 10 秒重试都让开
+            // （那条重试走的是整条启动链路：列库→列剧→列集，比这里重得多）
+            main.removeCallbacks(retryTick)
+            showFault(null)
+            showStarting(currentTitle)
+            scheduleStartRetry()
+            return
+        }
         hud.dismiss()
         renderHud()
         if (fatal) {
@@ -2266,6 +2393,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 首帧之后换成「存活看门狗」：上面的 stallWatchdog 只管首帧之前，
         // 而用户实测的「卡住」发生在播放中（见 livenessWatchdog 的说明）
         armLivenessWatchdog()
+        // 画面真的出来了：起播宽限排的那次重试没有意义了，撤掉
+        main.removeCallbacks(startRetry)
+        startRetryFor = null
+        // 「正在加载…」换成内容名，1.6 秒后收起 —— 这一刻用户才算确认换台/换剧成功
+        onContentPicked(currentTitle)
         // 画面已经出来了，「正在打开…」的过渡页就没必要再占着屏幕
         main.removeCallbacks(configStartingTick)
         configStartingTick.run()

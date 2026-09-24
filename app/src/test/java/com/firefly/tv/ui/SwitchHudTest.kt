@@ -64,6 +64,48 @@ class SwitchHudTest {
         assertNull("到点必须自己消失", hud.peek(t0 + 1_000L))
     }
 
+    /**
+     * 起播一集/一路时要显示「正在加载…」。
+     *
+     * 用户实测：「偶尔打开会显示这个视频无法播放，等一段时间正常」——
+     * 那段时间（NAS 硬盘休眠，要等盘转起来）屏幕上原来**一个字都没有**，
+     * 老人分不清"在加载"和"坏了"。首帧出来之前必须有东西在动。
+     */
+    @Test
+    fun `起播时显示正在加载`() {
+        val hud = SwitchHud()
+        hud.onStarting("娘道", t0)
+
+        val s = hud.peek(t0)!!
+        assertEquals(SwitchHud.Style.LOADING, s.style)
+        assertEquals("娘道", s.title)
+        assertEquals("正在加载…", s.subtitle)
+    }
+
+    @Test
+    fun `正在加载在首帧出来之前不会自己消失`() {
+        val hud = SwitchHud(briefMs = 1_000L)
+        hud.onStarting("娘道", t0)
+        // 硬盘休眠时十几秒是常态，30 秒也见过：这段时间提示必须在
+        assertNotNull("等了 30 秒还在起播，提示不能提前消失", hud.peek(t0 + 30_000L))
+
+        // 首帧上屏（onPlaying）之后才换成内容名，并开始 1.6 秒倒计时
+        hud.onPlaying("娘道", t0 + 30_100L)
+        val s = hud.peek(t0 + 30_200L)!!
+        assertEquals(SwitchHud.Style.BRIEF, s.style)
+        assertEquals("娘道", s.title)
+    }
+
+    @Test
+    fun `加载提示过期后首帧才到也要报出名字`() {
+        val hud = SwitchHud(briefMs = 1_000L)
+        hud.onStarting("娘道", t0)
+        assertNull(hud.peek(t0 + SwitchHud.LOADING_MS))
+
+        hud.onPlaying("娘道", t0 + SwitchHud.LOADING_MS + 1)
+        assertNotNull("首帧晚到也要出一下名字，否则用户以为换台没成功", hud.peek(t0 + SwitchHud.LOADING_MS + 2))
+    }
+
     @Test
     fun `换剧换台直接出名字`() {
         val hud = SwitchHud(briefMs = 1_000L)
