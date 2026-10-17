@@ -44,8 +44,15 @@ __pycache__/
 *.pyc
 
 # 本机（WSL）构建用的 Linux 工具链：JDK、Gradle 缓存、Linux 版 Android SDK。
-# 机器相关且体积大，不入库。重建：装一个 Linux JDK 17 + Linux 版 build-tools/platform，
-# 用仓库外的 Gradle 8.11.1 发行版跑 `gradle testDebugUnitTest` 即可（README「构建」一节）。
+# 机器相关且体积大，不入库，任务完成后可整个删掉。重建：装一个 Linux JDK 17 +
+# Linux 版 build-tools/platform，用仓库外的 Gradle 8.11.1 发行版跑
+# `gradle testDebugUnitTest assembleRelease` 即可（README「构建」一节）。
+#
+# ⚠️ 这套环境用 `ANDROID_USER_HOME=<仓库内目录>` 时，AGP 会在那里**新生成一把
+# debug 签名**，和电视上装的那把（Windows 的 ~/.android/debug.keystore）不是同一把，
+# 装上电视会 INSTALL_FAILED_UPDATE_INCOMPATIBLE。WSL 构建前先把
+# `~/.android/debug.keystore`（Windows 侧）拷到 `ANDROID_USER_HOME/debug.keystore`；
+# 或者干脆在 Windows 侧用 build.ps1 构建。
 .toolchain/
 .gradle-linux/
 .android-home/
