@@ -53,13 +53,21 @@ class StartupGraceTest {
     }
 
     @Test
-    fun `宽限窗口至少容得下一次SMB读超时`() {
-        // 读超时是 20 秒一刀（SmbClient 的 SmbConfig.withTimeout）。
-        // 窗口要是比它短，第一次超时就直接报故障了，这个宽限等于没做。
+    fun `宽限窗口要容得下两次SMB读超时`() {
+        // 读超时是 20 秒一刀（SmbClient 的 SmbConfig.withTimeout），而 SmbStore
+        // 超时后还会丢掉连接再试一遍 —— 一次打开最长约 40 秒。
+        // 窗口要是只够一次，第二次报错时就已经过期，等于白等。
         assertTrue(
-            "窗口必须大于 20 秒的读超时，否则等不到第二次机会",
-            StartupGrace.WINDOW_MS > 20_000L,
+            "窗口必须容得下「20 秒超时 + 自动重试一次」这 40 秒，否则等不到第二次机会",
+            StartupGrace.WINDOW_MS > 40_000L,
         )
+    }
+
+    @Test
+    fun `重试次数要能覆盖硬盘唤醒的整个过程`() {
+        // 旧窗口 40 秒 + 3 次，会在「20 秒超时、退避 3 秒、再 20 秒超时」之后
+        // 刚好过期 —— 用户看到的就是「首次打开偶尔说无法播放」。现在必须留出更多次。
+        assertTrue(StartupGrace.MAX_ATTEMPTS >= 4)
     }
 
     @Test

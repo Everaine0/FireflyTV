@@ -124,7 +124,7 @@ Kotlin + **原生 View**（不用 Compose：API 21 不可用，且 TV 焦点更�
 对播 NAS 老剧、给老人用的软件，**"什么都能播"比"版本新"重要**。电视原生就支持 H.265/RMVB/DTS，说明片源里真有这些格式。
 
 解码策略是**硬解优先、软解兜底**：默认交给电视的 MediaCodec（4K H.265 只能靠它），
-硬解失败或 15 秒不出首帧就自动用软解重播（风险 9）。
+硬解失败、或 15 秒不出首帧**且缓存已攒够却不再增长**时，才自动用软解重播（风险 9 / 22）。
 
 播放层抽象为 `PlaybackEngine` 接口，换回 Media3 只需新增一个实现类。基线取 `befovy/ijkplayer`，必要时参考 `bilibili/ijkplayer`。
 
@@ -182,7 +182,8 @@ SMB 文件 (smbj) → 实现 readAt() → IMediaDataSource → IjkMediaPlayer
 | NAS 连不上 / 断网 | 无法连接 NAS，请检查网络 | 每 10 秒重试，恢复后回播放 |
 | m3u 拉取失败 | 直播源暂时无法加载 | 每 10 秒重试 |
 | 单集文件损坏 | 这个视频无法播放 | 3 秒后跳下一个 |
-| NAS 硬盘休眠 / 起播慢（**没出过画面**） | 先出「正在加载…」，**不报故障** | 自动重试（窗口 40 秒、最多 3 次、退避 3/8/15 秒，`StartupGrace`）；超过窗口才把原因摆出来 |
+| NAS 硬盘休眠 / 起播慢（**没出过画面**） | 先出「正在加载…」，**不报故障** | 自动重试（窗口 90 秒、最多 4 次、退避 3/8/15/20 秒，`StartupGrace`）；超过窗口才把原因摆出来。打开文件期间与硬解等首帧期间另有宽限，见风险 22 |
+| NAS 读取中断（已出过画面） | NAS 读取中断，正在重试 | `MEDIA_ERROR_IO` 不再当 fatal，**不跳集**，每 10 秒重试 |
 | 天气接口失败 | 天气获取失败 | 静默重试，不阻塞浮层其他内容 |
 
 ## 9. 风险清单
@@ -213,7 +214,7 @@ SMB 文件 (smbj) → 实现 readAt() → IMediaDataSource → IjkMediaPlayer
 | 20 | **天气换成心知**：和风的专属 Host 老人填不对；地名没权限、频率要省着用 | ✅ **已改**：私钥 + 坐标两栏，30 分钟保鲜 / 5 分钟冷却 / 结果落盘。见风险 20 |
 | 18 | **字节源打开失败会把进程带走**：`FileRandomAccessSource` 在构造函数里开句柄，异常直接冒到 Handler/主线程 | ✅ **已修**：`startPlayback` 里统一 `openOrReport` 兜住，出故障页而不是崩。见风险 18 |
 | 21 | **硬解失败是「静默回落软解」**：ijkplayer 建 MediaCodec 失败只在 native 打一行日志就换 FFmpeg，Java 层收不到任何回调；界面还以为在硬解 | ✅ **已修**：用 `stat.vdec_type` 真值判定 + 拉黑换候选 + 屏幕上的诊断页。见风险 21 |
-| 22 | **首帧超时会误杀硬解**：SMB 打开慢 / 探流 16MB 都会被算进「硬解 15 秒没出首帧」，两次误判就把硬解永久关掉 | ✅ **已修**：拿到数据就宽限（最多 2 次）+ 超时与硬失败分开计数 + 换内容重置。见风险 22 |
+| 22 | **首帧超时会误杀硬解**：SMB 打开慢 / 探流 16MB 都会被算进「硬解 15 秒没出首帧」，两次误判就把硬解永久关掉 | ✅ **已修**：按「数据有没有继续流入」宽限（最多 2 次）；只有缓存攒够 3 秒/2MB 且不再增长才退软解，否则原样重试、保留硬解；超时不再拉黑解码器；`arm`/`schedule` 拆开（原来宽限时把计数清零 = 无限宽限）。见风险 22 |
 | 24 | **4K HEVC 片源送显只有 17~18 帧/秒**（H.264 的 4K 却能满帧） | ✅ **已定案（2026-09-12 更正）**：瓶颈是 HEVC 解码块 ~150 Mpx/秒，与「4K 显示通路」无关；结论与文档已按编码分开重写。见风险 24 |
 | 23 | **切显示模式后字号不重排**：`setTextSize` 的像素值缓存在 TextPaint 里，Activity 又声明了 `configChanges` 不重建 → 卡片按新尺寸重排、字还是旧字号 | ✅ **已修**：每次显示都 `Ui.refresh()` 并整棵重建（含重设字号）。见风险 23 |
 
@@ -484,7 +485,8 @@ OpenSSL_1_0_2n），`do-compile-ffmpeg.sh` 里有
 所以配置页两种写法都收，**不留默认地点**：写死一个坐标既泄露隐私，
 也等于替用户决定看哪儿的天气。两项要么都填、要么都留空（留空 = 电视上不显示天气）。
 
-**频率**：免费套餐按次计费，超了回 `AP010014`。
+**频率**：免费版是固定免费额度、**不按次计费** —— 额度用完回 `AP010013`，
+请求太密回 `AP010014`。
 `WeatherClient.shouldFetch` 是纯函数（有单测）：成功 30 分钟保鲜、失败 5 分钟冷却、
 结果落盘（重开电视不算新的一次查询）。一天最多几十次。
 
@@ -818,7 +820,7 @@ ffmpeg 3.4 本有一条回退（`rtspdec.c`：`ret == AVERROR(ETIMEDOUT) && !rt-
   「**直播断流后画面永远冻着（本次修）**」。
 
 回归防线：`PlaybackModeTest` 钉住协议识别、认不出时退回 HTTP 老行为、
-以及各档参数的大小关系（单测 259 项全过，含 `LiveStallTest` 的断流判据）。
+以及各档参数的大小关系（单测 265 项全过，含 `LiveStallTest` 的断流判据与 `DecodeStartupTest` 的硬解起播判据）。
 
 #### 「没声音」有两个完全不同的根因，现象一模一样
 
@@ -1017,10 +1019,17 @@ density 留在 320 —— 这就是电视的可疑组合。修复前浮层的时
 **第二件：超时误杀。** 原来的策略是「硬解 15 秒没出首帧 → 判定硬解不行」，
 连续 2 次就**本次运行再也不试硬解**。问题在于这 15 秒里可能根本没数据：
 SMB 打开 + 探流（`probesize` 16MB）+ 搬 moov 都可能占掉大半。一次网络抖动就能把硬解判死，
-而硬解是这台电视上看 4K 的唯一活路。现在：
-- 看门狗到点时如果**解码器还没拿到数据**（`videoCachedBytes/Duration` 为 0）就**宽限**一次，最多 2 次；
+而硬解是这台电视上看 4K 的唯一活路。现在（2026-10-07 又收紧了一轮，见 DEVLOG
+「首次打开的两类偶发故障」）：
+- **数据还在流入、或根本没读到数据**（`videoCachedBytes/Duration` 为 0）就**宽限**，最多 2 次；
+- 到点仍无首帧再看缓存：**攒够 3 秒 / 2MB 且不再增长**才判定解码器卡住、退软解；
+  缓存很少或还在涨 → 判定为 NAS/读取慢，**不降级软解**（软解救不了读取，只会把 4K 变成幻灯片），
+  交回界面层用硬解重试；
+- **超时不再拉黑解码器**：超时可能只是 NAS 慢，不证明解码器坏；只有解码器真报错才拉黑；
 - **超时**与**硬失败**（解码器报错 / 界面判定卡死）分开计数：超时只对当前内容生效，
-  换内容（下一集 / 换剧 / 换台）就归零重新给机会；硬失败才是累计 2 次关掉硬解。
+  换内容（下一集 / 换剧 / 换台）就归零重新给机会；硬失败才是累计 2 次关掉硬解；
+- ⚠️ `armHardwareWatchdog()` 会把宽限计数清零，宽限路径必须走 `scheduleHardwareWatchdog()`
+  —— 混用会让「宽限 2 次」变成无限宽限。
 
 **排查入口**：双击遥控器的「设置 / 信息」键打开诊断页，「解码」那一行直接写着
 `硬解 OMX.xxx` / `软解（硬解没建成！）` / `这台设备没有可用的硬解解码器`。
@@ -1391,6 +1400,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 
 | 项 | 说明 |
 | :--- | :--- |
+| **首次打开偶发卡顿 / 又说无法播放（2026-10-07 修）** | 用户报「打开电视先异常卡顿、重进恢复」和「首次打开偶尔无法播放、重进或等一会正常」。两个根因：① 硬解看门狗只看「有没有数据」，NAS 慢但已读到一点缓存时就退软解 —— 4K H.265 立刻变幻灯片；而且宽限路径误调 `armHardwareWatchdog()`，把宽限计数清零成了无限宽限。改成按数据流动判断（`DecodeStartup`）：数据在涨/没数据先宽限，只有缓存攒够 3 秒/2MB 且不再涨才退软解，否则交回界面层原样重试；超时也不再拉黑解码器。② 起播宽限只有 40 秒，正好被「20 秒超时 + 退避 3 秒 + 再 20 秒超时」吃掉，第三次本来能成功却先报了无法播放。窗口放到 90 秒 / 4 次；同时把后台 NAS 扫描（列库/列剧/列集）在有缓存时延后 3 秒，先让播放器拿到那条唯一的 SMB 连接；启动兜底看门狗在内容交给播放器后不再推倒重来；起播看门狗不再把「正在打开文件」「硬解等首帧」算成卡死。顺手修掉 `MEDIA_ERROR_IO` 被当成 fatal 会**跳下一集**的问题 |
 | **起播慢就报「这个视频无法播放」（本次修）** | 用户报「偶尔打开会显示这个视频无法播放，等一段时间正常」，并猜是 NAS 硬盘休眠 —— 猜对了。链路：硬盘休眠 → 播放器第一次读撞上 SMB 的 20 秒请求超时 → `TimeoutException` → ijkplayer 报成播放错误 → 界面层**立刻**弹故障页，而十几秒后盘转起来同一集明明能播。修法两件：① 起播先挂「正在加载…」（`SwitchHud.onStarting`），首帧上屏才换成内容名 —— 这段时间原来屏幕上一个字都没有；② 没出过画面的失败不再立刻报故障，先自动重试（纯函数 `StartupGrace`：窗口 40 秒 / 最多 3 次 / 退避 3、8、15 秒），超窗口才把原因摆出来。已在放的内容中途断了不走这条路（用户需要立刻知道原因）。顺手封掉 `onCompletion` 里「时长不可信」那条**只写日志就 return** 的死路（此刻播放器停在文件结尾、屏幕全黑，起播看门狗早撤了）|
 | **上一集播完，下一集直接黑屏（本次修）** | 用户报「铁梨花播放偶尔会出现上一集播完，下一集直接黑屏。原因未知」—— 不是原因未知，是**状态串了**：`liveReconnect` 是换到直播时打开的，而全工程没有一处把它置回 false。于是「先看直播、再回电视剧」以后，点播的一集播完被当成直播断流：`scheduleLiveRetry()` 先 `releaseInternal()`（画面当场变黑），两秒后去取频道地址重连，而 `channels` 在切库时已被清空、provider 返回 null → 黑屏永远停在那儿（无报错、无看门狗，起播看门狗在上一集首帧时就撤了）。修法：① 判据加另一半 `PlaybackMode.onCompletion(kind, liveReconnect)`（纯函数 + 3 项单测，这条规则错了不报错只黑屏）；② 引擎切到点播内容时自己 `stopLiveReconnect()`，并清掉 provider（顺带让已排队的直播重连 Runnable 拿不到地址、不会抢画面）。同类死路 `advanceToNextShow` 未回写 `shows` 字段也一并封掉 |
 | **崩溃闪退** | ijkplayer 的 `onPrepared/onError/onCompletion/onInfo` 回调**不在它自己的线程上**：`IjkMediaPlayer.initPlayer` 是 `Looper.myLooper()` 优先、`getMainLooper()` 兜底（核对了 AAR 字节码），即「谁 new 的播放器就排谁的队列」。之前直接透传给界面层，界面在非 UI 线程碰 View，抛 `CalledFromWrongThreadException` 当场崩；Activity 重建后又立刻报同样的错，于是「闪退之后再也打不开」。现在 `IjkPlaybackEngine` 用 `onMain{}` 统一把回调切回主线程 |
@@ -1443,7 +1453,7 @@ Android 5.1 的 ACodec 完整支持这条路（`ACodec.cpp#1315/#2127`，此时�
 | R8 两个坑 | ①`net.engio.mbassy` 被写成 `net.engio.mbassador`（keep 规则等于没写，debug 包不压缩所以一直没症状）；②`javax.el.**` / `org.ietf.jgss.**` 是 Java SE 专有依赖，必须 `-dontwarn`，否则 R8 直接失败。**开 R8 的价值一半在这里** —— 它把「装上能开、一连 NAS 就崩」这类问题提到了构建期 |
 | 依赖 | **ijkplayer 用自己编的内核**（`app/libs/ijkplayer-full-0.8.8.aar`，含 AC-3/MP2/DTS）；AAR 不入库，重建见 `app/libs/README.md` 与 `scripts/build-ijkplayer.sh` |
 | 模拟器 | AVD `firefly_tv` = `system-images;android-22;android-tv;x86`（Android TV 5.1.1，与目标电视同版本，自带遥控器面板） |
-| 测试 | `.\build.ps1 testDebugUnitTest`（**259 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
+| 测试 | `.\build.ps1 testDebugUnitTest`（**265 项**）/ `.\build.ps1 connectedDebugAndroidTest`（**60 项**，含对真实 NAS、真实直播源与天气接口的联调；未配 `local.properties` 时自动跳过） |
 | 内核重建 | `scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`（需 Linux/WSL，见 `app/libs/README.md`） |
 | 解码器校验 | `scripts/verify-ijkplayer-decoders.sh <so 目录>`：逐 ABI 用 `nm` 读符号表。**别用 `strings`**，那个符号不一定以裸字符串出现，会误报「没有」 |
 | 格式实测 | `connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.firefly.tv.player.FormatMatrixTest`，结果看 `adb logcat -s FireflyFormat` |

@@ -209,6 +209,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     /** NAS 目录结构的落盘缓存；冷启动直接出画面，不用等 SMB 扫完。 */
     private var cache: LibraryCache.Snapshot? = null
 
+    /**
+     * 后台列库的轮次号。
+     *
+     * 起播重试可能连着排好几次扫描；只让最新那一轮落地，
+     * 免得旧结果把界面覆盖回去（和 [librarySeq] 是同一个思路）。
+     */
+    @Volatile
+    private var libraryScanGeneration = 0
+
     /** 按键反馈条。没有它，切库那几秒屏幕上什么都没有，看起来就是卡死。 */
     private val hud = SwitchHud()
 
@@ -379,6 +388,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private var startupRecoverAt = 0L
 
     /**
+     * 「内容已经交给播放器了吗」。
+     *
+     * [startupWatchdog] 只该管「决定要播 → 列库/列剧/列集」那段；一旦某一集/某一路
+     * 真的交给了播放器，起播的责任就转到 [stallWatchdog] 和 [StartupGrace] 上。
+     * 旧实现不知道这个边界，40 秒一到就把整条启动链路**推倒重来** —— 而 NAS 硬盘
+     * 唤醒刚好需要更久，重启反而打断了正在等数据的播放器，用户看到的就是
+     * 「首次打开总也起不来」。现在交给播放器之后就由播放器那条线自己收尾。
+     */
+    private var handedOff = false
+
+    /**
      * 启动兜底：**从"决定要播"到"真的有画面"这条路上，任何一段卡住都能自己好。**
      *
      * 为什么单独要一个：[stallWatchdog] 是 `playEpisodeNow` 里才挂的，只保护"播放器拿到活之后"；
@@ -401,6 +421,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         if (faultScreen.visibility == View.VISIBLE) return@Runnable
         // 配置页占屏时不管：那是用户在配置，不是卡住
         if (configScreen.visibility == View.VISIBLE) return@Runnable
+        // 内容已经交给播放器：起播宽限 / 卡死看门狗正在按「数据有没有在流动」处理。
+        // 这里再推倒重来只会打断它（NAS 唤醒可能就要几十秒）。
+        if (handedOff) {
+            trace("startupWatchdog：内容已经交给播放器，交给起播宽限/卡死看门狗")
+            return@Runnable
+        }
 
         // 次数做"冷却"：一段时间没再出事就把额度还回去，免得偶尔卡一次就永久用光
         val now = System.currentTimeMillis()
@@ -542,6 +568,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      */
     private fun playEpisodeNow(path: String, startMs: Long, s: Spot) {
         spot = s
+        handedOff = true
         val cfg = Config.smb(this)
         prepared = false
         audioStarted = false
@@ -723,6 +750,25 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 startRetryFor = null
                 onContentPicked(currentTitle)
                 armLivenessWatchdog()
+                return
+            }
+            // ⚠️ 播放器还在**打开 NAS 上的文件**：这是同步网络 I/O，硬盘休眠时
+            // 一次打开最长约 40 秒（20 秒超时 + SmbStore 自己重试一次）。
+            // 这段时间里「没出首帧」完全是网络的账，判卡死会让用户在
+            // 「无法播放」和「重试」之间来回跳 —— 正是用户报的首次打开那个毛病。
+            if (engine.isOpeningSource() && waitedPlaying < STALL_OPEN_WAIT_MS) {
+                trace("stallWatchdog：还在打开 NAS 文件（已等 ${waitedPlaying}ms），先不判卡死")
+                main.removeCallbacks(this)
+                main.postDelayed(this, STALL_OPEN_POLL_MS)
+                return
+            }
+            // 硬解已选中、引擎的硬解看门狗正在按「数据有没有继续流入」宽限。
+            // 界面层看不到这些计数器，按固定 25 秒推软解会把 NAS 慢误判成硬解坏
+            // （4K H.265 一退软解就成幻灯片，见 PlaybackEngine 的 DecodeStartup）。
+            if (engine.waitingForHardwareStart()) {
+                trace("stallWatchdog：硬解还在等首帧，交给引擎的硬解看门狗（NAS 可能慢）")
+                main.removeCallbacks(this)
+                main.postDelayed(this, STALL_TIMEOUT_MS)
                 return
             }
             if (engine.canFallbackToSoftware() && engine.retryInSoftware()) {
@@ -983,6 +1029,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private fun startPlayback() {
         main.removeCallbacks(retryTick)
+        // 新的一轮启动：还没把任何内容交给播放器
+        handedOff = false
         val cfg = Config.smb(this)
         if (!cfg.ready) {
             openConfigServer()
@@ -1018,49 +1066,87 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             if (cache == null) cache = readCache()
             val cached = cache?.takeIf { !it.isEmpty }
 
-            if (cached != null) {
+            // ⚠️ 「缓存里有东西」不等于「缓存能起播」：`Snapshot.isEmpty` 只看
+            // 库/剧/集三者是不是**全**空，一次列目录失败的扫描可能留下
+            // 「库列表是空的、但剧集还留着」的缓存。那种缓存上 `restoreSpot` 会直接返回，
+            // 而下面又按"有缓存"跳过重播 —— 屏幕就永远起不来。
+            // 所以只有**库列表非空**才算能靠缓存起播。
+            val cachedLibs = cached?.libraries.orEmpty()
+            val startedFromCache = cachedLibs.isNotEmpty()
+            if (startedFromCache) {
                 main.post {
-                    libraries = cached.libraries
-                    restoreSpot(cached.libraries)
+                    libraries = cachedLibs
+                    restoreSpot(cachedLibs)
                 }
             }
 
-            try {
-                val libs = Scanner.libraries(cfg)
-                val snap = LibraryCache.withLibraries(cache, libs)
-                commitCache(snap)
-                trace("startPlayback 列库完成：${libs.size} 个库（cached=${cached != null}）")
-                main.post {
-                    if (libs.isEmpty()) {
-                        // ⚠️ `retry` 必须为 true。这里看着像"NAS 上确实没东西"，其实
-                        // 更常见的是**开机瞬间**的假空：`Scanner.classify` 会把一次
-                        // 列目录失败也表达成"这个库是空的"，于是整轮扫下来一个库都不剩。
-                        // 老的 `retry = false` 配上"libraries 为空时左右上下键全都不响应"，
-                        // 就是一个只能重开应用的死页面（实机反馈的"卡住"之一）。
-                        showFault("NAS 上还没有可以播放的内容，正在重试", retry = true)
-                    } else {
-                        // 新列表可能比缓存里多/少几个库（用户刚在 NAS 上加了文件夹就是这样），
-                        // 下标会整体错位 —— 必须按**名字**把当前库重新锚一次，见
-                        // [Navigator.libraryIndexAfterRefresh]。不锚的实机表现：
-                        // 「按上键没反应、按右键跳到别的库去了」。
-                        val wasOn = libraries.getOrNull(libIndex)?.name
-                        libraries = libs
-                        libIndex = Navigator.libraryIndexAfterRefresh(libs, wasOn)
-                        // 有缓存时界面已经在放了，不能再切一次 —— 否则画面会被打断重来
-                        if (cached == null) restoreSpot(libs)
-                    }
+            val gen = ++libraryScanGeneration
+            val scan = Runnable {
+                if (gen != libraryScanGeneration) return@Runnable
+                refreshLibraries(cfg, alreadyPlaying = startedFromCache)
+            }
+            // ⚠️ 有缓存时**必须让播放器先拿到 SMB 连接**。
+            //
+            // 全进程只有一条 SMB 连接（SmbStore 串行化），而列库的第一条请求正好是
+            // 「建连接/列根目录」—— NAS 硬盘休眠时它会占住那把锁几十秒。
+            // 如果它和播放器的 `open()` 同时开跑，抢到锁的往往是扫描，播放器只能排队；
+            // 用户看到的就是「打开先等半天、偶尔还说无法播放」。缓存已经能出画面，
+            // 所以这次扫描晚几秒再做，先让播放器把这第一段路走完。
+            if (startedFromCache) {
+                trace("startPlayback：先用缓存起播，NAS 扫描延后 ${BACKGROUND_REFRESH_DELAY_MS}ms")
+                ioHandler.postDelayed(scan, BACKGROUND_REFRESH_DELAY_MS)
+            } else {
+                scan.run()
+            }
+        }
+    }
+
+    /**
+     * 后台刷新媒体库列表（列根目录 + 逐库分类）。
+     *
+     * 拆出来是因为它现在有两条进入时机：没有缓存时立刻做；有缓存时延后做，
+     * 把 SMB 连接先让给播放器打开片源（见 [startPlayback]）。
+     *
+     * @param alreadyPlaying 这一轮界面是不是已经靠缓存起播了（是的话刷新完不能再切一次画面，
+     *   也不能用旧库表去 `restoreSpot` —— 那会把刚起来的画面打断）
+     */
+    private fun refreshLibraries(cfg: Config.Smb, alreadyPlaying: Boolean) {
+        try {
+            val libs = Scanner.libraries(cfg)
+            val snap = LibraryCache.withLibraries(cache, libs)
+            commitCache(snap)
+            trace("startPlayback 列库完成：${libs.size} 个库（已靠缓存起播=$alreadyPlaying）")
+            main.post {
+                if (libs.isEmpty()) {
+                    // ⚠️ `retry` 必须为 true。这里看着像"NAS 上确实没东西"，其实
+                    // 更常见的是**开机瞬间**的假空：`Scanner.classify` 会把一次
+                    // 列目录失败也表达成"这个库是空的"，于是整轮扫下来一个库都不剩。
+                    // 老的 `retry = false` 配上"libraries 为空时左右上下键全都不响应"，
+                    // 就是一个只能重开应用的死页面（实机反馈的"卡住"之一）。
+                    showFault("NAS 上还没有可以播放的内容，正在重试", retry = true)
+                } else {
+                    // 新列表可能比缓存里多/少几个库（用户刚在 NAS 上加了文件夹就是这样），
+                    // 下标会整体错位 —— 必须按**名字**把当前库重新锚一次，见
+                    // [Navigator.libraryIndexAfterRefresh]。不锚的实机表现：
+                    // 「按上键没反应、按右键跳到别的库去了」。
+                    val wasOn = libraries.getOrNull(libIndex)?.name
+                    libraries = libs
+                    libIndex = Navigator.libraryIndexAfterRefresh(libs, wasOn)
+                    // 已经靠缓存起播时不能再切一次 —— 否则画面会被打断重来
+                    if (!alreadyPlaying) restoreSpot(libs)
                 }
-            } catch (t: Throwable) {
-                val msg = SmbClient.describe(t)
-                SmbStore.drop()
-                trace("startPlayback 列库失败：${t.javaClass.simpleName} / $msg")
-                main.post {
-                    // 缓存里有内容就先照常看，NAS 的毛病等它自己好；没有才报故障
-                    if (cache?.isEmpty != false) {
-                        showFault(msg, retry = true)
-                    } else {
-                        Log.w(TAG, "后台刷新失败（先用缓存继续播）：$msg")
-                    }
+            }
+        } catch (t: Throwable) {
+            val msg = SmbClient.describe(t)
+            SmbStore.drop()
+            trace("startPlayback 列库失败：${t.javaClass.simpleName} / $msg")
+            main.post {
+                // 已经在靠缓存放片了就先照常看，NAS 的毛病等它自己好；
+                // 没在放（包括"缓存非空但库列表是空的"那条死路）就把原因报出来
+                if (!alreadyPlaying) {
+                    showFault(msg, retry = true)
+                } else {
+                    Log.w(TAG, "后台刷新失败（先用缓存继续播）：$msg")
                 }
             }
         }
@@ -1336,6 +1422,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 内容身份也跟着作废：这一刻起还没起播任何一集，定时写盘不该再写记录
         // （离开上一个库之前，调用方已经 force 写过一条了）
         spot = null
+        // 新一轮选库从「列目录/列剧集」开始，启动兜底看门狗重新有用
+        handedOff = false
         cachedShow = ""
         cachedShowsLib = ""
 
@@ -1361,7 +1449,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                     // 注意：这里**不能** return —— 还要去后台刷新一次。
                     // 刷新回来发现首轮已经有内容在播，就不会再切一次（见 refreshShows）。
                 }
-                refreshShows(lib, cfg, seq, resumeShow, resumeIndex, resumePos, dir, skipDepth)
+                // 已经在靠缓存起播时让播放器先拿到 SMB 连接（理由见 [BACKGROUND_REFRESH_DELAY_MS]）
+                refreshShows(
+                    lib, cfg, seq, resumeShow, resumeIndex, resumePos, dir, skipDepth,
+                    delayMs = if (cachedShows.isNotEmpty()) BACKGROUND_REFRESH_DELAY_MS else 0L,
+                )
             }
 
             is Library.Live -> loadChannels(lib, Config.channel(this), seq)
@@ -1378,14 +1470,16 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         resumePos: Long,
         dir: Int,
         skipDepth: Int = 0,
+        /** > 0 = 延后这么久再问 NAS（有缓存、正在起播时用，避免和播放器抢 SMB 连接）。 */
+        delayMs: Long = 0L,
     ) {
-        ioHandler.post {
+        val job = Runnable {
             val list = try {
                 Scanner.shows(cfg, lib)
             } catch (t: Throwable) {
                 // 有缓存就没必要打扰用户；没有才报故障
                 if (shows.isEmpty()) postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
-                return@post
+                return@Runnable
             }
             val snap = LibraryCache.withShows(cache ?: LibraryCache.withLibraries(null, libraries), lib.name, list)
             commitCache(snap)
@@ -1406,6 +1500,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                 }
             }
         }
+        if (delayMs > 0L) ioHandler.postDelayed(job, delayMs) else ioHandler.post(job)
     }
 
     /**
@@ -1520,13 +1615,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             }
         }
 
-        ioHandler.post {
+        val job = Runnable {
             val eps = try {
                 Scanner.episodesDetailed(cfg, lib, wanted)
             } catch (t: Throwable) {
                 trace("playShow 《$wanted》列集失败：${t.message}")
                 if (episodes.isEmpty()) postIf(seq) { showFault(SmbClient.describe(t), retry = true) }
-                return@post
+                return@Runnable
             }
             trace("playShow 《$wanted》列到 ${eps.names.size} 集 byContent=${eps.byContent}")
             val snap = LibraryCache.withEpisodes(cache, wanted, eps.names, eps.byContent)
@@ -1557,6 +1652,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                     }
                 }
             }
+        }
+        // 用缓存起播时把这次刷新让到播放器打开片源之后（理由见 [BACKGROUND_REFRESH_DELAY_MS]）；
+        // 没有缓存时这条刷新就是起播本身，必须立刻跑。
+        if (!cached.isNullOrEmpty() && !cacheIsFresh()) {
+            trace("playShow 《$wanted》缓存偏旧，列集刷新延后 ${BACKGROUND_REFRESH_DELAY_MS}ms")
+            ioHandler.postDelayed(job, BACKGROUND_REFRESH_DELAY_MS)
+        } else {
+            ioHandler.post(job)
         }
     }
 
@@ -1773,12 +1876,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             playChannel()
         }
         val cfg = Config.smb(this)
-        ioHandler.post {
+        val job = Runnable {
             val list = try {
                 LiveSource.channels(cfg, lib)
             } catch (t: Throwable) {
                 if (channels.isEmpty()) postIf(seq) { showFault("直播源暂时无法加载", retry = true) }
-                return@post
+                return@Runnable
             }
             commitCache(LibraryCache.withChannels(cache, lib.name, list))
             postIf(seq) {
@@ -1794,6 +1897,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                     }
                 }
             }
+        }
+        // 已经在靠缓存看直播时把刷新让开，别和播放器的 SMB 打开抢连接
+        // （直播本身不走 SMB，但同一条 SMB 连接上可能正开着点播的字节源）。
+        if (!cached.isNullOrEmpty()) {
+            ioHandler.postDelayed(job, BACKGROUND_REFRESH_DELAY_MS)
+        } else {
+            ioHandler.post(job)
         }
     }
 
@@ -1824,6 +1934,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 以前这个函数是私有的内联逻辑，排队那条路根本没有直播入口。
      */
     private fun playChannelNow(name: String, url: String) {
+        handedOff = true
         // 直播不记进度（见 PlaybackMode）：把内容身份清掉，定时写盘就不会碰记录
         spot = null
         currentTitle = name
@@ -2628,6 +2739,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         private const val CACHE_FRESH_MS = 10 * 60 * 1000L
 
         /**
+         * 有缓存、已经在播时，后台 NAS 扫描往后让多久。
+         *
+         * 全进程只有一条 SMB 连接，而扫描的第一条请求会占住那把锁建立连接 ——
+         * 硬盘休眠时最长几十秒。让几秒足够播放器先把片源 `open()` 抢到手；
+         * NAS 上新加的内容晚几秒看到没有影响（见 [startPlayback]/[refreshShows]）。
+         */
+        private const val BACKGROUND_REFRESH_DELAY_MS = 3_000L
+
+        /**
          * 直播重连失败几次以内还说「正在重连」，超过就换成「这个频道暂时看不了」。
          *
          * 3 次 ≈ 头 12 秒（引擎退避是 2s/4s/6s…）。抖动一般几秒就恢复，
@@ -2640,6 +2760,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
         /** 起播后多久没出首帧就判定卡死。4K 大文件要留足时间。 */
         private const val STALL_TIMEOUT_MS = 25_000L
+
+        /**
+         * 「还在打开 NAS 文件」最多宽限多久（见 [stallWatchdog]）。
+         *
+         * 取 60 秒：一次打开最长约 40 秒（20 秒请求超时 + SmbStore 重试一次），
+         * 再留一点给慢盘寻道。超过这个数还没开始准备，就说明不是"慢"了。
+         */
+        private const val STALL_OPEN_WAIT_MS = 60_000L
+
+        /** 宽限「正在打开 NAS 文件」时的问询间隔。 */
+        private const val STALL_OPEN_POLL_MS = 3_000L
 
         /** 播放中存活检查的间隔。 */
         private const val LIVENESS_INTERVAL_MS = 5_000L

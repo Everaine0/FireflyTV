@@ -253,6 +253,24 @@ interface PlaybackEngine {
     fun decodedAnyFrame(): Boolean = false
 
     /**
+     * 播放器是不是正在**打开字节源**（SMB 打开 + 建数据源）。
+     *
+     * 这一段是同步网络 I/O，NAS 硬盘休眠时一次打开最长可等 40 秒
+     * （20 秒请求超时 + `SmbStore` 自动重试一次）。界面层的起播看门狗如果
+     * 把这段时间也算成「播放器卡死」，就会在播放器还没开始干活时退软解/重试，
+     * 正是用户报的「首次打开偶尔说无法播放」的成因之一。
+     */
+    fun isOpeningSource(): Boolean = false
+
+    /**
+     * 硬解已经选中、但还在等首帧 —— 引擎自己的硬解看门狗正在管这件事。
+     *
+     * 界面层的起播看门狗在这段时间里应该让路：它看不到「数据在流入」，
+     * 只会按固定 25 秒推软解，而 NAS 慢的时候 25 秒远不够。
+     */
+    fun waitingForHardwareStart(): Boolean = false
+
+    /**
      * 一份用于判断「播放器还活着吗」的快照。
      *
      * 为什么不是单一指标：在 SMB + `IMediaDataSource` 通路上，
@@ -376,6 +394,7 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     private fun fireFirstFrame() {
         if (firstFrameFired) return
         firstFrameFired = true
+        ioStarved = false
         cancelHardwareWatchdog()
         // ⚠️ 起播瞬间报的那次缓冲要作废：`BUFFERING_END` 实测**不会来**（见 [LiveStall]），
         // 留着它的话，一路正常播放的直播会在开播十几秒后被自己的看门狗判成断流。
@@ -416,7 +435,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
 
     private var lastRequest: LastRequest? = null
 
-    /** 本次起播是否跑在硬解上。 */
+    /** 本次起播是否跑在硬解上（跨线程读写，见 [fallbackToSoftware]）。 */
+    @Volatile
     private var usingHardware = false
 
     /**
@@ -425,6 +445,16 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
      * [DecoderPath]（见 [PlaybackEngine.Diag.codecOffered]）。
      */
     private var hardwareRequested = false
+
+    /**
+     * 「卡住的原因已经查明是读取/NAS，不是解码器」。
+     *
+     * 硬解看门狗发现缓存还没攒够、或数据还在流入时置 true：这段时间**禁止**退软解
+     * （软解救不了读取，只会把 4K 变成幻灯片），交给界面层的起播宽限原样重试。
+     * 新一次起播会把它清掉，重新评估。
+     */
+    @Volatile
+    private var ioStarved = false
 
     /**
      * 本次运行里已经证实「选中了，但实际没接上」的解码器名。
@@ -571,6 +601,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         releaseInternal()
         usingHardware = hardware
         hardwareRequested = hardware
+        // 新一次起播：上一次「判定为读取慢」的结论作废，重新给硬解和读取一次机会
+        ioStarved = false
         // URL 请求要把地址交给 newPlayer：直播的超时选项跟传输协议绑在一起
         //（RTSP 的 `timeout` 是秒、还兼作保活间隔，见 newPlayer 里的说明）。
         val p = newPlayer(hardware, (req as? LastRequest.Url)?.url)
@@ -885,18 +917,70 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         }.getOrDefault(false)
     }
 
-    /** 首帧看门狗宽限了几次（见 [hardwareWatchdog]）。 */
+    /**
+     * 「数据还在不在流动」的采样值。
+     *
+     * 三个计数器一起看：点播/SMB 上 `trafficStatisticByteCount` 有值（实测直播 RTSP 上恒为 0，
+     * 所以不能单靠它）；`videoCachedBytes/Duration` 则是解码器前面那个包队列。
+     * 只要任一个还在涨，就说明瓶颈在 NAS/读取，不是硬解坏了。
+     */
+    private fun decoderProgress(): Long {
+        val p = player ?: return 0L
+        return runCatching {
+            p.videoCachedBytes + p.videoCachedDuration + p.trafficStatisticByteCount
+        }.getOrDefault(0L)
+    }
+
+    /** 首帧看门狗宽限了几次（见 [hardwareWatchdog] / [DecodeStartup]）。 */
+    @Volatile
     private var watchdogGrace = 0
+
+    /** 上一次宽限时的「数据流动」采样值。 */
+    private var watchdogProgress = 0L
+
+    /**
+     * 硬解看门狗是不是挂着。
+     *
+     * 界面层靠它判断「现在该等引擎」还是「引擎已经放弃、该我出手了」。
+     */
+    @Volatile
+    private var hardwareWatchdogArmed = false
 
     private val hardwareWatchdog = Runnable {
         if (firstFrameFired || !usingHardware) return@Runnable
-        // 解码器还没拿到数据就先别怪它：SMB 打开 + 探流（probesize 16MB）本来就要几秒，
-        // 这段时间「没出首帧」是正常的。宽限两次，再没有才判定硬解不行。
-        // 不加这一层的话，一次网络抖动就会把硬解判死（而这台电视上硬解是 4K 唯一的活路）。
-        if (watchdogGrace < WATCHDOG_GRACE && !decoderHasData()) {
+        // 解码器还没拿到数据、或者数据还在继续流入，都先别怪它：
+        // SMB 打开 + 探流（probesize 16MB）+ NAS 硬盘唤醒可能占掉几十秒。
+        // 旧逻辑只要「有数据」就立刻回软解，于是 NAS 慢也被判成硬解坏，
+        // 4K H.265 一退回软解就成幻灯片（用户报的「先异常卡顿」）。
+        val hasData = decoderHasData()
+        val progress = decoderProgress()
+        val progressChanged = progress != watchdogProgress
+        watchdogProgress = progress
+        if (DecodeStartup.waitLonger(watchdogGrace, hasData, progressChanged)) {
             watchdogGrace++
-            Log.i(TAG, "硬解还没拿到数据，首帧超时先宽限一次（第 $watchdogGrace 次）")
-            armHardwareWatchdog()
+            Log.i(
+                TAG,
+                "硬解首帧超时先宽限（第 $watchdogGrace 次）：" +
+                    "有数据=$hasData 数据在涨=$progressChanged（NAS 慢，不是解码器的错）",
+            )
+            scheduleHardwareWatchdog()
+            return@Runnable
+        }
+        val cachedMs = runCatching { player?.videoCachedDuration ?: 0L }.getOrDefault(0L)
+        val cachedBytes = runCatching { player?.videoCachedBytes ?: 0L }.getOrDefault(0L)
+        if (!DecodeStartup.looksLikeDecoderFault(hasData, progressChanged, cachedMs, cachedBytes)) {
+            // ⚠️ 别退软解。现场是「NAS 还没把首帧要的数据供上」：
+            // 软解一样读不动，却会把 4K 变成幻灯片（用户报的「先异常卡顿」）。
+            // 把这一轮交回界面层重试，**保留硬解**；起播宽限会再给它机会。
+            Log.w(
+                TAG,
+                "硬解 ${VideoDecodePolicy.FIRST_FRAME_TIMEOUT_MS / 1000} 秒没出首帧，但更像读取慢：" +
+                    "有数据=$hasData 在涨=$progressChanged 缓存=${cachedMs}ms/${cachedBytes}B —— " +
+                    "不降级软解，交给界面层原样重试",
+            )
+            ioStarved = true
+            cancelHardwareWatchdog()
+            onMain { listener?.onError("NAS 读取偏慢，正在重试", fatal = false) }
             return@Runnable
         }
         fallbackToSoftware("硬解 ${VideoDecodePolicy.FIRST_FRAME_TIMEOUT_MS / 1000} 秒没出首帧")
@@ -965,13 +1049,30 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         if (h?.post(block) != true) Log.w(TAG, "兜底重播没能排上工作线程")
     }
 
+    /**
+     * 重新开始一整轮硬解首帧计时（新起播 / 恢复播放时用）。
+     *
+     * ⚠️ 旧的 `armHardwareWatchdog()` 在**每次宽限后也调用它**，而它会把
+     * `watchdogGrace` 清零 —— 于是「宽限 2 次」变成了无限宽限：只要解码器一直
+     * 拿不到数据，看门狗永远不后退。宽限路径必须走 [scheduleHardwareWatchdog]。
+     */
     private fun armHardwareWatchdog() {
         cancelHardwareWatchdog()
         watchdogGrace = 0
+        watchdogProgress = decoderProgress()
+        hardwareWatchdogArmed = true
+        main.postDelayed(hardwareWatchdog, VideoDecodePolicy.FIRST_FRAME_TIMEOUT_MS)
+    }
+
+    /** 只重新挂计时，不清宽限计数、不重置采样值（宽限路径专用）。 */
+    private fun scheduleHardwareWatchdog() {
+        main.removeCallbacks(hardwareWatchdog)
+        hardwareWatchdogArmed = true
         main.postDelayed(hardwareWatchdog, VideoDecodePolicy.FIRST_FRAME_TIMEOUT_MS)
     }
 
     private fun cancelHardwareWatchdog() {
+        hardwareWatchdogArmed = false
         main.removeCallbacks(hardwareWatchdog)
     }
 
@@ -995,16 +1096,22 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
     private fun fallbackToSoftware(reason: String, hard: Boolean = false): Boolean {
         if (!usingHardware) return false
         usingHardware = false
+        ioStarved = false
         cancelHardwareWatchdog()
         cancelHardwareTruthCheck()
         if (hard) hardFailures++ else softFailures++
-        // 这次没接上的解码器拉黑：下次自动换下一个候选，而不是再撞一次同一面墙
+        // ⚠️ 只有**硬失败**（解码器报错 / 界面层确认卡死）才拉黑解码器。
+        //
+        // 首帧超时是**可能被冤枉的**：NAS 慢、探流/搬 moov 慢都会让首帧晚到，
+        // 解码器本身可能完全正常。旧逻辑连超时也拉黑，于是第一次误判就把硬解
+        // 永久换到次优候选/软解 —— 4K H.265 立刻变成幻灯片。
         val banned = decoderName
-        if (!banned.isNullOrBlank()) bannedCodecs.add(banned)
+        if (hard && !banned.isNullOrBlank()) bannedCodecs.add(banned)
         val remaining = VideoDecodePolicy.MAX_FAILURES - hardFailures
         Log.w(
             TAG,
-            "硬解失败（$reason）：${banned ?: "?"} 已拉黑。" +
+            "硬解失败（$reason）：${banned ?: "?"} " +
+                (if (hard) "已拉黑。" else "不拉黑（超时可能是 NAS 慢，不一定是解码器的错）。") +
                 "硬失败 $hardFailures 次、超时 $softFailures 次，" +
                 if (remaining > 0) "改用软解重播" else "本次运行不再尝试硬解，改用软解重播",
         )
@@ -1015,7 +1122,13 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         return true
     }
 
-    override fun canFallbackToSoftware(): Boolean = usingHardware && lastRequest != null
+    override fun canFallbackToSoftware(): Boolean =
+        usingHardware && lastRequest != null && !ioStarved
+
+    override fun isOpeningSource(): Boolean = starting
+
+    override fun waitingForHardwareStart(): Boolean =
+        usingHardware && !firstFrameFired && hardwareWatchdogArmed
 
     override fun retryInSoftware(): Boolean {
         // 正在打开字节源（NAS 慢时可能几十秒）就先别插队：这时候再起一个播放器，
@@ -1071,10 +1184,20 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
             scheduleLiveRetry()
             return
         }
+        // ⚠️ 网络/读取类错误**不是「这个视频没救了」**。
+        //
+        // 旧实现把 `MEDIA_ERROR_IO` 算进 fatal，界面层拿到 fatal=true 后会在 3 秒后
+        // 直接跳下一集 —— 一次 NAS 抖动就跳过一集，老人家看到的就是「少了一集」。
+        // 而且提示写「这个视频无法播放」，跟用户报的「首次打开偶尔说无法播放、
+        // 等一会又正常」正好对上。现在把 IO / 超时单独区分：给一句「正在重试」，
+        // 并且 fatal=false，交给界面层的起播宽限和 10 秒重试。
+        val io = what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_IO ||
+            extra == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_IO ||
+            extra == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_TIMED_OUT
         val fatal = what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_UNSUPPORTED ||
-            what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_MALFORMED ||
-            extra == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_IO
-        onMain { listener?.onError("这个视频无法播放", fatal) }
+            what == tv.danmaku.ijk.media.player.IMediaPlayer.MEDIA_ERROR_MALFORMED
+        val message = if (io) "NAS 读取中断，正在重试" else "这个视频无法播放"
+        onMain { listener?.onError(message, fatal) }
     }
 
     /** 断流自动重连：2 秒起退避，最多退到 10 秒，永不放弃（DESIGN §8）。 */
@@ -1355,8 +1478,8 @@ class IjkPlaybackEngine(private val context: Context) : PlaybackEngine {
         /** 片源帧率还没解析出来时的重问间隔（见 [cachedMediaInfo]）。 */
         const val MEDIA_INFO_RETRY_MS = 5_000L
 
-        /** 首帧超时最多宽限几次（每次一个完整超时）。见 [hardwareWatchdog]。 */
-        const val WATCHDOG_GRACE = 2
+        // 首帧超时最多宽限几次在 [DecodeStartup.MAX_GRACE] 里（连同「该不该退软解」
+        // 的判据一起，因为这两件事必须一起看）。
 
         // 播放中存活看门狗的**周期与次数**在 [LiveStall] 里（连同门槛一起，
         // 因为「用户等多久」是这三个数共同决定的）。

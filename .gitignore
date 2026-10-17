@@ -42,3 +42,11 @@ firefly-apk/
 # Python 脚本（scripts/*.py）跑起来会留字节码，生成物不入库
 __pycache__/
 *.pyc
+
+# 本机（WSL）构建用的 Linux 工具链：JDK、Gradle 缓存、Linux 版 Android SDK。
+# 机器相关且体积大，不入库。重建：装一个 Linux JDK 17 + Linux 版 build-tools/platform，
+# 用仓库外的 Gradle 8.11.1 发行版跑 `gradle testDebugUnitTest` 即可（README「构建」一节）。
+.toolchain/
+.gradle-linux/
+.android-home/
+.android-sdk/

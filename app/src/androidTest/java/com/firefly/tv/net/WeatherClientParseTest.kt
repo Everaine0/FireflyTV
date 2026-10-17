@@ -134,7 +134,8 @@ class WeatherClientParseTest {
         // 写回应用配置：这样模拟器/电视上的浮层马上就能显示天气
         Config.saveWeather(ctx, cfg)
 
-        // 只打一次接口：免费套餐按次计费（超了回 AP010014），测试也一样要省着用。
+        // 只打一次接口：免费版是固定额度（额度用完回 AP010013、请求太密回 AP010014），
+        // 不是按次扣费；测试也一样要省着用。
         // test() 内部就是 fetch()，所以这里只调它，另外打印一次详情即可。
         val verdict = WeatherClient.test(cfg)
         log("配置页试连：ok=${verdict.ok} ${verdict.message}")
