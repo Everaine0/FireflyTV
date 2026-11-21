@@ -70,12 +70,21 @@ if printf '%s\n' $ABIS | grep -qx x86; then
   bash "$ROOT/scripts/patch-ffmpeg-x86-asm.sh" "$IJP/android/contrib"
 fi
 
+# 关键：do-compile-ffmpeg.sh 看到目录里已有 config.h 就直接复用，不会重新 configure，
+# 新加的 --enable-openssl 就永远不生效（症状：编译秒过、https 依旧 Protocol not found）。
+# 必须先删掉旧配置，逼它重新 configure。
+for abi in $ABIS; do
+  rm -f "$IJP/android/contrib/ffmpeg-$abi/config.h" "$IJP/android/contrib/ffmpeg-$abi/config.mak"
+done
+
 for abi in $ABIS; do
   log "重编 FFmpeg $abi（含 openssl）"
   bash ./compile-ffmpeg.sh "$abi" 2>&1 | tail -20
   echo "-------- 检查 $abi 的https开关 --------"
-  CFG=$(dirname "$(find "build/ffmpeg-$abi" -name config.h -print -quit)")
-  grep -E "CONFIG_OPENSSL 1|CONFIG_HTTPS_PROTOCOL 1" "$CFG/config.h" || echo "⚠️  $abi 没有打开 openssl！"
+  # 注意：不要用 find 找 config.h —— build/ffmpeg-<abi> 下还有 toolchain 的
+  # sysroot/usr/include/linux/config.h，find 会先撞上它，导致误报「没打开」。
+  CFG="$IJP/android/contrib/ffmpeg-$abi/config.h"
+  grep -E "CONFIG_OPENSSL 1|CONFIG_HTTPS_PROTOCOL 1" "$CFG" || echo "⚠️  $abi 没有打开 openssl！"
 done
 
 log "完成。产物："

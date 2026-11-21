@@ -88,16 +88,14 @@ class ConfigScreen(context: Context) : FrameLayout(context) {
     }
 
     /**
-     * 保存成功后、真正出画面之前的过渡态。
+     * 保存成功后隐藏二维码页。
      *
-     * 保存成功到第一帧之间要连 NAS、列目录、起播，实测能有好几秒。
-     * 这段时间如果还停在二维码页，用户会以为保存失败了，然后反复点保存。
+     * 保存成功到第一帧之间由开机页接住（见 BootScreen）：既解释在等什么，
+     * 也不会让用户对着二维码页以为保存失败了。
      */
-    fun showStarting() {
-        qrView.visibility = GONE
-        hintView.visibility = GONE
-        titleView.text = "配置已保存"
-        urlView.text = "电视正在打开，请稍等…"
+    fun recycleAndHide() {
+        recycle()
+        visibility = GONE
     }
 
     private fun text(sizeSp: Float, color: Int) = TextView(context).apply {

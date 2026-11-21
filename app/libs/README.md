@@ -70,7 +70,8 @@ bash scripts/swap-ffmpeg-so.sh armeabi-v7a <...>/ijkplayer-armv7a/src/main/libs/
 
 > 顺带修了上游一个磨人的地方：`do-detect-env.sh` 只在 **macOS** 上给了 `make -j`，
 > Linux 下是空的 —— 三个 ABI 全量重编要一个多小时。
-> `scripts/patch-ffmpeg-parallel-make.sh` 把它改成 `-j$(nproc)`，同样 20 核只要几分钟。
+> `scripts/patch-ffmpeg-parallel-make.sh` 把它改成 `-j$(nproc)`，同样 20 核只要几分钟；
+> `build-ijkplayer.sh` 会自动调用这个补丁。
 
 ### 只改 FFmpeg、不想重编整个内核时
 
@@ -90,10 +91,25 @@ bash scripts/swap-ffmpeg-so.sh x86 \
 否则要么明明能出声却提示「这台电视不支持」，要么反过来。单元测试会遍历所有编码
 把两个方向都钉住。
 
+### AAR 丢了怎么恢复
+
+这份 AAR 是本地二进制、**不入库**，换机器后按下面的顺序找：
+
+1. **从已发布的 APK 里取回**（最快）：Release 的 `app-release.apk`（或本地打好的 debug APK）
+   本身就是 zip，`unzip -o app-release.apk 'lib/*'` 就能得到三个 ABI 的 `libijk*.so`；
+   按 `build-out/ijkplayer-full/<abi>/` 的目录结构放好，再跑
+   `scripts/pack-ijkplayer-aar.sh`。取回后用 `readelf -s`/nm 确认 AC-3 / MP2 符号还在。
+2. **全量重编**：`scripts/build-ijkplayer.sh` → `collect-ijkplayer.sh` → `pack-ijkplayer-aar.sh`，
+   需要 Linux/WSL 与 NDK r10e。GitHub 慢时先准备源码再跑（本次用 codeload tarball
+   浅克隆 FFmpeg 的 tag，步骤记在 `HANDOVER.md`）。
+
+> 不要默认从 AVD 的 userdata 里取：本项目在模拟器上装过的旧包（UI-only 的 1.1.0 debug）
+> 的 `lib/` 是空的。先 `unzip -l base.apk | grep lib/` 确认有 native 库再谈恢复。
+
 ### 补齐官方包（只在需要重新打包时用）
 
 `pack-ijkplayer-aar.sh` 需要从官方 `ijkplayer-java-0.8.8.aar` 里取 Java 类和清单；
-**`app/libs/stock-aar/` 不在仓库里**（AAR 已被 gitignore），第一次用先下到这里：
+`app/libs/stock-aar/` 不在仓库里（AAR 已被 gitignore），第一次用先下到这里：
 
 ```powershell
 $base = 'https://maven.aliyun.com/repository/public/tv/danmaku/ijk/media'
@@ -108,13 +124,21 @@ foreach ($k in $arts.Keys) {
 }
 ```
 
+**和打包脚本的配合**：`pack-ijkplayer-aar.sh` 固定在 `app/libs/` 下找这四个官方 AAR
+（`JAVA_AAR` 与 `STAMP_AARS`），不会去 `stock-aar/` 里找。所以实际流程是：
+
+1. 下载到 `app/libs/stock-aar/` 留档；
+2. 打包前把四个 AAR 复制/移动到 `app/libs/` 根下；
+3. 跑 `bash scripts/pack-ijkplayer-aar.sh`；
+4. 按脚本输出把它们移回 `app/libs/stock-aar/`，避免被 `fileTree("libs")` 扫到重复类。
+
 为什么当初走阿里云镜像：Maven Central 上没有 `com.github.befovy:ijkplayer`（404），
 JitPack 上 `befovy/ijkplayer` 的所有 tag 都是 `Error`，
 GitHub Release `f0.7.16` 的包里**只有 iOS 的 .framework**。
 
 ## 为什么编的时候要打补丁
 
-`scripts/` 下三个补丁脚本，都是「2018 年的代码遇上 2026 年的系统」被迫加的：
+`scripts/` 下的补丁脚本，都是「2018 年的代码遇上 2026 年的系统」被迫加的：
 
 | 补丁 | 挡住的错误 |
 | :--- | :--- |

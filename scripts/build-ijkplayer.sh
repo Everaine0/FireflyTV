@@ -143,6 +143,11 @@ bash "$ROOT/scripts/patch-all-ffmpeg.sh" "$WORK/ijkplayer/android/contrib"
 log "给 x86 打开 FFmpeg 汇编（SSE/AVX）"
 bash "$ROOT/scripts/patch-ffmpeg-x86-asm.sh" "$WORK/ijkplayer/android/contrib"
 
+# 上游只给 macOS 设了 make -j，Linux 上 IJK_MAKE_FLAG 是空的 —— 不补这一下，
+# FFmpeg 会单线程编，20 核机器上要一小时（见补丁脚本的说明）。
+log "让 FFmpeg 的 make 并行"
+bash "$ROOT/scripts/patch-ffmpeg-parallel-make.sh" "$WORK/ijkplayer/android/contrib"
+
 log "编译 FFmpeg（$ABIS）—— 这步最慢，20 核大概几分钟"
 for abi in $ABIS; do
   echo "-------- ffmpeg $abi --------"

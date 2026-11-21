@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.KeyEvent
 import android.view.SurfaceHolder
@@ -55,6 +56,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private lateinit var faultScreen: FaultScreen
     private lateinit var overlay: OverlayScreen
     private lateinit var hudView: HudView
+    private lateinit var switchFlash: SwitchFlash
+    private lateinit var bootScreen: BootScreen
     private lateinit var diagScreen: DiagScreen
 
     private lateinit var engine: PlaybackEngine
@@ -221,6 +224,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     /** 按键反馈条。没有它，切库那几秒屏幕上什么都没有，看起来就是卡死。 */
     private val hud = SwitchHud()
 
+    /** 方向键 400ms 防抖：老人容易连按，而每次换库都可能是一轮 SMB 列目录。 */
+    private val navGuard = KeyGuard()
+
     private var currentTitle: String = ""
 
     /** 这条流的音频这台电视解不了时，给用户的一句话（见 AudioSupport）。 */
@@ -326,6 +332,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         if (!Config.configured(this)) {
             openConfigServer()
         } else {
+            // 每次冷启动都先盖一页「遥控器说明 + 正在唤醒硬盘」。播放照常在背后起，
+            // 页面的退场规则见 BootGate：首帧 + 最短 5 秒，出错立刻让位。
+            enterBoot()
             startPlayback()
             main.postDelayed(positionTick, POSITION_INTERVAL_MS)
             main.postDelayed(hudTick, HUD_TICK_MS)
@@ -344,20 +353,29 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         root.addView(surfaceView, matchParent())
 
         configScreen = ConfigScreen(this)
-        faultScreen = FaultScreen(this)
         overlay = OverlayScreen(this)
         hudView = HudView(this)
+        faultScreen = FaultScreen(this)
+        switchFlash = SwitchFlash(this)
+        bootScreen = BootScreen(this)
         diagScreen = DiagScreen(this)
 
         configScreen.visibility = View.GONE
-        faultScreen.visibility = View.GONE
         overlay.visibility = View.GONE
         hudView.visibility = View.GONE
+        faultScreen.visibility = View.GONE
+        switchFlash.visibility = View.GONE
+        bootScreen.visibility = View.GONE
         diagScreen.visibility = View.GONE
+        // 层叠顺序（从下到上）：视频 < 配置页 < 切换过渡层 < 天气浮层 < 提示条 < 故障页 < 开机页 < 诊断页。
+        // 故障页必须在浮层/提示条之上，否则“连不上 NAS”会被底部文字局部遮住；
+        // 开机页在故障页之上只会短暂挡 350ms（showFault 里 notifyFault 触发淡出），诊断页始终最上。
         root.addView(configScreen, matchParent())
-        root.addView(faultScreen, matchParent())
+        root.addView(switchFlash, matchParent())
         root.addView(overlay, matchParent())
         root.addView(hudView, matchParent())
+        root.addView(faultScreen, matchParent())
+        root.addView(bootScreen, matchParent())
         root.addView(diagScreen, matchParent())
 
         setContentView(root)
@@ -569,6 +587,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun playEpisodeNow(path: String, startMs: Long, s: Spot) {
         spot = s
         handedOff = true
+        // 开机页/换库过渡页还盖着的话，把状态换成更准确的一句：这时真的在读片源了
+        if (bootScreen.isShowing()) bootScreen.setStatus("正在读取片源…")
+        if (switchFlash.isLibraryShowing()) switchFlash.setSubtitle("正在加载…")
         val cfg = Config.smb(this)
         prepared = false
         audioStarted = false
@@ -685,6 +706,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private var prepared = false
 
     /**
+     * 首帧已经上屏，但开机页还要停留（没到 5 秒最短展示），所以先把画面停住。
+     *
+     * 不停的话，用户会先听到电视剧的声音、几秒后才看到画面 —— 对一个「打开就在播」
+     * 的应用来说，这比多等两秒更让人困惑。开机页退场（READY）时恢复。
+     */
+    private var pausedForBoot = false
+
+    /**
      * 音频真的出声了（`AUDIO_RENDERING_START`）。
      *
      * 「有画面没声音」是这台电视上最难查的一类问题，所以单独记一个真值，
@@ -741,15 +770,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             if (engine.decodedAnyFrame()) {
                 gotFirstFrame = true
                 Log.w(TAG, "起播 ${waitedPlaying}ms 没收到渲染事件，但帧率非 0：按已出画面处理")
-                trace("stallWatchdog：无渲染事件但帧率非 0，撤哨")
-                // ⚠️ 这条路上 `VIDEO_RENDERING_START` 不会来（原因见上），所以首帧该做的事
-                // 得在这里补一遍：撤掉「正在加载…」、挂上播放中存活看门狗、
-                // 并把起播宽限排的那次重试作废。少了这一段，画面明明在放，
-                // 左下角却会一直挂着「正在加载…」到 60 秒期限。
-                main.removeCallbacks(startRetry)
-                startRetryFor = null
-                onContentPicked(currentTitle)
-                armLivenessWatchdog()
+                trace("stallWatchdog：无渲染事件但帧率非 0，走统一首帧收尾")
+                // ⚠️ 这条路上 VIDEO_RENDERING_START 不会来，收尾必须和 onFirstFrame 完全一致：
+                // 撤「正在加载…」、通知开机页/换库过渡页、挂存活看门狗、撤起播重试。
+                // 原来只补了其中两件，开机页会一直挂到 90 秒。
+                onFirstFrameRendered()
                 return
             }
             // ⚠️ 播放器还在**打开 NAS 上的文件**：这是同步网络 I/O，硬盘休眠时
@@ -919,7 +944,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         strikes = 0
     }
 
-    // ---- 按键（只有三类 + 一个隐藏的诊断入口） ----
+    // ---- 按键（最少 3 类核心按键：←→ / ↑↓ / OK，外加一个隐藏的诊断入口） ----
 
     /** 上一次按「设置 / 信息」键的时刻，用来识别双击（见 [DIAG_DOUBLE_CLICK_MS]）。 */
     private var lastDiagKeyAt = 0L
@@ -927,12 +952,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         // 诊断页：**双击**遥控器上的「设置 / 信息」键打开，**OK 键关闭**。
         //
-        // 为什么是双击不是单击：用户实测这台电视的「信息」键其实就是**设置键**，
+        // 为什么是双击不是单击：这台电视的「信息」键其实就是**设置键**，
         // 单击就弹一屏字太重（也容易和别的功能撞车）。双击误触概率极低，
         // 而且不用记组合键。
-        //
-        // （清理版说明：这里原来还有「打开面板后单击切实验方案」，
-        //   那是配合远程诊断口的实验台；实验台已移除，见 README「诊断页」一节。）
         when (event.keyCode) {
             KeyEvent.KEYCODE_INFO, KeyEvent.KEYCODE_MENU, KEYCODE_SETTINGS -> {
                 if (event.action == KeyEvent.ACTION_DOWN && event.repeatCount == 0) {
@@ -949,11 +971,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             }
         }
 
-        // OK：诊断页开着就关掉，否则看天气
+        // OK：诊断页开着就关掉；开机页期间吞掉；否则看天气。
+        // 必须先处理 OK 再拦开机页：诊断页可以叠在开机页之上打开，
+        // 若先 return，用户就关不掉诊断页了。
         if (event.keyCode == KeyEvent.KEYCODE_DPAD_CENTER || event.keyCode == KeyEvent.KEYCODE_ENTER) {
             if (event.action == KeyEvent.ACTION_UP) onOkPressed()
             return true
         }
+
+        // 开机页显示期间吃掉方向键：教程页上误按会把背后的库/剧/台切走，
+        // 而用户看不见屏幕变化，只会觉得「按了没用，画面却变了」。
+        // 设置/信息键双击与诊断页的 OK 已经在上面处理。
+        if (bootScreen.isShowing()) return true
 
         // 长按也当一次处理，避免老人按住不放导致疯狂切台
         if (event.repeatCount > 0) return true
@@ -967,23 +996,34 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         }
     }
 
-    /** OK：诊断页开着就关掉，否则看天气。 */
+    /** OK：诊断页开着就关掉；开机页期间吞掉；否则看天气。 */
     private fun onOkPressed() {
         if (diagScreen.visibility == View.VISIBLE) {
             hideDiag()
             return
         }
+        if (bootScreen.isShowing()) return
         toggleOverlay()
     }
 
+    /**
+     * 方向键统一入口：首次按下先过 400ms 防抖。
+     * 长按连发在 dispatchKeyEvent 里已经吞掉，这里只处理 ACTION_DOWN。
+     */
     private inline fun consume(event: KeyEvent, action: () -> Unit): Boolean {
-        if (event.action == KeyEvent.ACTION_DOWN) action()
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            if (!navGuard.allow(SystemClock.elapsedRealtime())) return true
+            action()
+        }
         return true
     }
 
     // ---- 配置 ----
 
     private fun openConfigServer() {
+        // 配置不完整时是配置页的场：开机页/过渡层必须让开，不能把二维码盖在下面
+        if (bootScreen.isShowing()) bootScreen.stop()
+        switchFlash.stop()
         engine.stop()
         engine.detachSurface()
         faultScreen.visibility = View.GONE
@@ -1004,9 +1044,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     private fun onConfigured() {
         // 保存成功到出画面要连 NAS、列目录、起播，可能好几秒。
-        // 这段先显示「正在打开」，别让用户以为没保存上。
-        configScreen.showStarting()
-        main.postDelayed(configStartingTick, CONFIG_STARTING_MS)
+        // 这段交给开机页：既说明「在等 NAS 硬盘」，也顺手把遥控器说明摆一遍，
+        // 第一句写明“配置已保存”，免得用户对着二维码页以为保存失败了。
+        enterBoot(fromConfig = true)
         startPlayback()
         main.removeCallbacks(positionTick)
         main.postDelayed(positionTick, POSITION_INTERVAL_MS)
@@ -1017,11 +1057,43 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         configServer = null
     }
 
-    /** 过渡态最多显示这么久；到点就交回播放（画面出来时也会提前撤掉）。 */
-    private val configStartingTick = Runnable {
-        if (configScreen.visibility == View.VISIBLE) {
-            configScreen.recycle()
-            configScreen.visibility = View.GONE
+    /**
+     * 盖上开机页（见 [BootScreen]/[BootGate]）。
+     *
+     * 只在两种时机调用：冷启动（已配置）和配置保存成功后的首次起播。
+     * 后续的故障重试**不会**再盖一次 —— 那时用户需要看的是原因，不是教程。
+     */
+    private fun enterBoot(fromConfig: Boolean = false) {
+        if (bootScreen.isShowing()) return
+        pausedForBoot = false
+        trace("enterBoot：显示开机页 fromConfig=$fromConfig")
+        bootScreen.show(
+            statusText = if (fromConfig) "配置已保存，正在连接 NAS…" else "正在连接 NAS…",
+            wakeHintAfter = true,
+        ) { reason -> onBootExit(reason) }
+        // 配置页的「正在打开」过渡态由开机页接替
+        configScreen.recycleAndHide()
+    }
+
+    /**
+     * 开机页退场。
+     *
+     * READY：首帧已到、且待够了最短时间。如果为了不让声音先出来暂停过，这里恢复播放。
+     * FAULT/TIMEOUT：让下面的故障页/提示条接管，**不要**恢复播放 —— 故障时播放器
+     * 多半已经被释放，贸然 resume 只会和重试打架。
+     */
+    private fun onBootExit(reason: BootGate.Exit) {
+        trace("开机页退场：$reason pausedForBoot=$pausedForBoot")
+        if (reason == BootGate.Exit.READY) {
+            if (pausedForBoot) {
+                pausedForBoot = false
+                engine.resume()
+            }
+            // 画面从教程页后面露出来的这一刻，再报一次「哪个库、在放什么」：
+            // 首帧时那条提示已经被开机页盖掉了，不补一次用户会不知道现在是哪一集。
+            if (currentTitle.isNotBlank()) announce(currentTitle)
+        } else {
+            pausedForBoot = false
         }
     }
 
@@ -1336,6 +1408,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     /** 一次按键的即时反馈。返回是否还需要继续跑定时器。 */
     private fun renderHud(): Boolean {
+        // 换库过渡页自带中央大字，提示条先收起，避免两套文字抢注意力。
+        // 仍然返回 true，让 200ms 刷新链继续跑；过渡页退场后下一拍就会把内容名露出来。
+        if (switchFlash.isLibraryShowing()) {
+            hudView.visibility = View.GONE
+            return true
+        }
         val state = hud.peek(System.currentTimeMillis()) ?: run {
             hudView.visibility = View.GONE
             return false
@@ -1399,6 +1477,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         dir: Int = 1,
         /** 已经因为「这个库是空的」跳过了几个库 —— 给跳过封顶，见 [refreshShows]。 */
         skipDepth: Int = 0,
+        /** true = 用户按了左右键；false = 冷启动恢复/空库自动跳过（不重新计时、不盖开机页）。 */
+        userInitiated: Boolean = false,
     ) {
         if (libraries.isEmpty()) return
         if (Navigator.skipExhausted(skipDepth, libraries.size)) {
@@ -1436,6 +1516,18 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 立刻告诉用户「键收到了，正在打开哪个库」。切库要等 SMB 列目录，
         // 原来这段时间屏幕上什么都没变，看起来就是卡住（用户实测反馈）。
         announceLibrary(lib.name)
+
+        // 过渡层：只有用户主动换库才盖整屏；冷启动/恢复由开机页负责，不叠两页。
+        // 用户又换了一个目标 → retarget 重置 15 秒；内部跳过空库 → 只改文字、不重置。
+        if (userInitiated && !bootScreen.isShowing()) {
+            if (switchFlash.isLibraryShowing()) {
+                switchFlash.retarget(dir, lib.name)
+            } else {
+                switchFlash.showLibrary(dir, lib.name)
+            }
+        } else if (switchFlash.isLibraryShowing()) {
+            switchFlash.updateText(lib.name)
+        }
 
         when (lib) {
             is Library.Video -> {
@@ -1523,11 +1615,16 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             resumeIndex = rec?.episode ?: 0,
             resumePos = rec?.resumeMs ?: 0L,
             dir = if (delta == 0) 1 else delta,
+            userInitiated = true,
         )
     }
 
-    /** ↑ / ↓：决策交给 [Navigator]（有单元测试钉住），这里只负责执行。 */
-    private fun switchShowOrChannel(delta: Int) {
+    /**
+     * ↑ / ↓：决策交给 [Navigator]（有单元测试钉住），这里只负责执行。
+     *
+     * @param userInitiated true = 用户按键；false = 空剧自动跳过（只更新提示，不播翻页动画）
+     */
+    private fun switchShowOrChannel(delta: Int, userInitiated: Boolean = true) {
         if (libraries.isEmpty()) return
         trace("switchShowOrChannel delta=$delta lib=${libraries.getOrNull(libIndex)?.name} shows=${shows.size} chans=${channels.size}")
         // 先把这个库当前看到哪儿了写下来，再换 —— 否则刚看的这几秒会丢
@@ -1545,7 +1642,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         when (action) {
             is Navigator.Action.PlayShow -> {
                 val lib = libraries.getOrNull(libIndex) as? Library.Video ?: return
-                // 先把剧名打出来：列剧集目录还要等一下，不能让屏幕一动不动
+                // 先翻一页（半透明、不写字），再把剧名打到左下角；自动跳过空剧不播
+                if (userInitiated) switchFlash.showPage(delta)
                 shows.getOrNull(action.showIndex)?.let { announce(it) }
                 playShow(lib, action.showIndex, action.episodeIndex, action.startMs, librarySeq)
             }
@@ -1553,6 +1651,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             is Navigator.Action.TuneChannel -> {
                 channelIndex = action.channelIndex
                 Config.saveChannel(this, channelIndex)
+                if (userInitiated) switchFlash.showPage(delta)
                 playChannel()
             }
 
@@ -1639,7 +1738,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
                             showFault("《${lib.name}》里没有能播放的视频", retry = false)
                         } else {
                             showFault("《$wanted》里没有能播放的视频", retry = false)
-                            main.postDelayed({ switchShowOrChannel(1) }, 3000)
+                            main.postDelayed({ switchShowOrChannel(1, userInitiated = false) }, 3000)
                         }
                     }
                     // 首轮已经在播了就别切，免得画面刚出来又被重启
@@ -1935,6 +2034,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      */
     private fun playChannelNow(name: String, url: String) {
         handedOff = true
+        if (bootScreen.isShowing()) bootScreen.setStatus("正在连接频道…")
+        if (switchFlash.isLibraryShowing()) switchFlash.setSubtitle("正在连接频道…")
         // 直播不记进度（见 PlaybackMode）：把内容身份清掉，定时写盘就不会碰记录
         spot = null
         currentTitle = name
@@ -2376,12 +2477,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             faultScreen.visibility = View.GONE
             return
         }
-        // ⚠️ 报故障时必须把那条「正在打开…」收掉。
-        //
-        // hudView 是在 faultScreen **之后** add 进 root 的（见 buildViews），所以那条
-        // 加载条画在故障页**上面**。而 SwitchHud 的 LOADING 状态又没有出口 —— 于是
-        // 用户看到的永远是「《库名》正在打开…」，底下那句人话（"连不上 NAS"之类）被盖住，
-        // 看起来就是"卡在加载不动"。用户实测报的就是这个现象。
+        // 真有原因要报：开机页/过渡页立刻让位；浮层和提示条显式收起。
+        // 故障页在 buildViews 里排在 overlay/hudView 之上，层叠上不会再被底部文字遮住，
+        // 这里再显式收一次，避免以后调整层叠顺序时又踩回去。
+        if (bootScreen.isShowing()) bootScreen.notifyFault()
+        hideOverlay()
+        switchFlash.notifyFault()
         if (!keepHud) {
             hud.dismiss()
             renderHud()
@@ -2471,6 +2572,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             main.removeCallbacks(retryTick)
             showFault(null)
             showStarting(currentTitle)
+            // 开机页/换库过渡页还盖着的话，把状态换成在重试的事实，别让进度条看起来停住了
+            if (bootScreen.isShowing()) bootScreen.setStatus("NAS 硬盘还在唤醒，正在重试…")
+            if (switchFlash.isLibraryShowing()) switchFlash.setSubtitle("NAS 硬盘还在唤醒，正在重试…")
             scheduleStartRetry()
             return
         }
@@ -2503,6 +2607,31 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     override fun onFirstFrame() {
         gotFirstFrame = true
+        onFirstFrameRendered()
+    }
+
+    /**
+     * 首帧的统一收尾。
+     *
+     * VIDEO_RENDERING_START 与 stallWatchdog 的 decodedAnyFrame() 兜底是两条判据，
+     * 但收尾必须完全一致：漏掉任何一条，开机页/换库过渡页就会一直挂到上限，
+     * 屏幕上的「正在加载…」也撤不掉（模拟器纯软解 + GLES2 上本来就不来这个事件）。
+     */
+    private fun onFirstFrameRendered() {
+        // 开机页还盖着：告诉它首帧到了。若它还要停留（还没到最短 5 秒），
+        // 先把画面停住 —— 否则声音先出来、画面却还在教程页后面。
+        // 退场时由 onBootExit(READY) 恢复播放。
+        if (bootScreen.isShowing()) {
+            val wait = bootScreen.notifyFirstFrame()
+            if (wait && bootScreen.isShowing()) {
+                engine.pause()
+                pausedForBoot = true
+                trace("onFirstFrameRendered：开机页还要停留，先暂停播放")
+            }
+        }
+        // 换库过渡页：满最短展示时间就滑出；没满就由它自己的 tick 到点再走。
+        switchFlash.notifyFirstFrame()
+
         main.removeCallbacks(stallWatchdog)
         // 真的出画面了，启动兜底看门狗可以撤了
         disarmStartupWatchdog()
@@ -2515,9 +2644,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         startRetryFor = null
         // 「正在加载…」换成内容名，1.6 秒后收起 —— 这一刻用户才算确认换台/换剧成功
         onContentPicked(currentTitle)
-        // 画面已经出来了，「正在打开…」的过渡页就没必要再占着屏幕
-        main.removeCallbacks(configStartingTick)
-        configStartingTick.run()
         // 首帧已经上屏，这时候再去读那 1MB 做音频判定，怎么都不会拖慢起播
         pendingAudioCheck?.let {
             pendingAudioCheck = null
@@ -2582,6 +2708,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      */
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        // 开机页还在：这时的「再点一次图标」是正常的（用户刚开机又按了一下），
+        // 不是卡住，别把背后正在起播的链路推倒重来
+        if (bootScreen.isShowing()) {
+            trace("onNewIntent：开机页还在，忽略")
+            return
+        }
         val stuck = Navigator.needsRecovery(
             playing = engine.isPlaying(),
             hasPending = pendingEpisode != null || pendingChannel != null,
@@ -2614,6 +2746,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         ioHandler.removeCallbacksAndMessages(null)
         // 播放器那条线程也要收掉：它上面挂着 ijkplayer 的事件队列
         runCatching { playerHandler.removeCallbacksAndMessages(null) }
+        runCatching { switchFlash.stop() }
+        runCatching { bootScreen.stop() }
         runCatching { hud.dismiss() }
         runCatching { main.removeCallbacks(stallWatchdog) }
         runCatching { disarmLivenessWatchdog() }
@@ -2754,9 +2888,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
          * 超过这个数还连不上，就该让用户知道是源的问题，而不是干等。
          */
         private const val LIVE_QUIET_RETRIES = 3
-
-        /** 「配置已保存，正在打开」最多显示这么久。 */
-        private const val CONFIG_STARTING_MS = 15_000L
 
         /** 起播后多久没出首帧就判定卡死。4K 大文件要留足时间。 */
         private const val STALL_TIMEOUT_MS = 25_000L

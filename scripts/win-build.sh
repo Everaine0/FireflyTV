@@ -103,6 +103,8 @@ fi
 
 cp "$BAT" /tmp/ffbuild.bat
 cd /tmp
+# .bat 最后要把产物 copy 回 WSL 的 build/apk；这个目录不存在时 copy 会静默失败
+mkdir -p "$WSL_ROOT/build/apk"
 # ⚠️ 必须先把 cmd.exe 的退出码留下来再交给管道：`cmd | grep | tail` 的退出码是
 # **tail 的**，永远是 0 —— 构建失败时脚本照样「成功」返回，CI/自动化里
 # 会把一次没编出来的构建当成都通过了。踩过一次，别改回去。
