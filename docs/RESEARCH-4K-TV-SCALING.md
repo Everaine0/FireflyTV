@@ -80,7 +80,7 @@ AOSP 的 Android TV 设备 overlay 里有这样一条资源（AOSP main 至今�
 来源（AOSP main）：
 <https://android.googlesource.com/device/google/atv/+/refs/heads/main/overlay/TvFrameworkOverlay/res/values/config.xml>
 
-**版本时间线（我逐个版本核对过，注意路径变过）**
+**版本时间线（逐版本核对过，注意路径变过）**
 
 | 版本 | `frameworks/base` 的 `config_maxUiWidth` | ATV 设备 overlay 的取值 | 位置 |
 | :--- | :--- | :--- | :--- |
@@ -129,7 +129,7 @@ void updateBaseDisplayMetrics(int baseWidth, int baseHeight, int baseDensity) {
 
 来源：<https://android.googlesource.com/platform/frameworks/base/+/27cec32496090efd153327f4fc5a5cecc6f59d9b%5E%21/>
 
-**⚠️ 一个我亲自比对源码发现的版本差异：Android 12 的钳位漏掉了 density 缩放。**
+**⚠️ 一个逐行比对源码发现的版本差异：Android 12 的钳位漏掉了 density 缩放。**
 
 ```java
 // android12-release（DisplayContent.java，updateBaseDisplayMetrics）
@@ -153,14 +153,14 @@ if (!mIsDensityForced) {
 （正常应是 960×540 dp）。注意方向 —— 同样的 dp 布局塞进一半宽的 dp 画布，元素会**相对变大/溢出**，
 **不是变小**；所以它对应的是"字太大/被裁"而不是本项目的"中间一小块"。
 （本条**未在真实故障报告中被证实**，只证实了源码差异；列出它是为了说明"钳位 ≠ 一定安全"。）
-我推荐的 `uiScale` 公式在这种组合下算出 **0.5**，即把 64sp 降到 32sp → 128px/1920 = 6.67%，
+本项目采用的 `uiScale` 公式在这种组合下算出 **0.5**，即把 64sp 降到 32sp → 128px/1920 = 6.67%，
 **仍然是"相同屏幕占比"，方向正确**。
 
 代入 4K：`3840×2160 @640dpi` → **`1920×1080 @320dpi`**（高和密度同步等比缩小）。
 这正是「UI 用 1080p 合成、再放大到 4K 面板」的机制，也说明 **`widthPixels/densityDpi` 的比值被刻意保持恒定**。
 
 > ⚠️ **对提问前提的更正**：`config_supports4kUi` 这个名字在 AOSP 里**查无此资源**。
-> 我在 `frameworks/base/core/res/res/values/config.xml`（android11/12/13/14-release 与 master）
+> 在 `frameworks/base/core/res/res/values/config.xml`（android11/12/13/14-release 与 master）
 > 和 `device/google/atv` 的 TV overlay 中都没有找到任何 `*4kUi*` / `*supports4k*` 资源；
 > **实际生效的开关是 `config_maxUiWidth`**（=1920 即禁用 4K UI；设为 0 或 ≥3840 即开启 4K UI）。
 > 该结论基于对上述仓库的直接检索；不能排除某些厂商私有 overlay 使用了别的名字。
@@ -200,9 +200,9 @@ if (!mIsDensityForced) {
   来源：<https://cs.android.com/androidx/platform/frameworks/support/+/androidx-main:core/core/src/main/java/androidx/core/view/DisplayCompat.java>
   （同文件亦有 GitHub 镜像：<https://github.com/androidx/androidx/blob/androidx-main/core/core/src/main/java/androidx/core/view/DisplayCompat.java>）
 - **未验证**：长虹 43Q3T / MT5520 在 Android 5.1 上 `widthPixels` 与 `densityDpi` 的**具体取值**。
-  我没有找到任何公开的该机型 dumpsys 记录，也没有真机。**必须在真机上按 §6.4 取样后才能定论**。
+  没有找到任何公开的该机型 dumpsys 记录，也没有真机。**必须在真机上按 §6.4 取样后才能定论**。
   MediaTek/MStar 电视 SoC「UI 平面 1080p + 视频平面 4K，由硬件叠加器合成」是业界普遍架构，
-  但我**没有找到**可引用的官方 MT5520 文档来证明它。
+  但**没有找到**可引用的官方 MT5520 文档来证明它。
 
 ### 1.5 三种可能的状态（决定本 bug 属于哪一种）
 
@@ -254,7 +254,7 @@ if (mService.mHasLeanbackFeature) {
 这条正是"同一台 4K 电视上有的 App 正常、有的 App 变小"的机制性解释。
 ⚠️ 注意它**不适用于 Android 5.1**（该代码在 5.1 上不存在），所以它不是长虹这台机器的直接根因；
 但它是**本项目在任何 Android 12+ 的 4K-UI 电视上都会踩到的坑**，且说明
-"我 targetSdk 34 + 假设 1080p 窗口"这个组合本身就是危险的。
+"targetSdk 34 + 假设 1080p 窗口"这个组合本身就是危险的。
 
 ---
 
@@ -509,7 +509,7 @@ OEM 侧也有对应说明（androidx/media issue #1986：`vendor.display-size` �
 | 10 | [SmartTube issue #5102](https://github.com/yuliskov/SmartTube/issues/5102) | Android TV 13（Waydroid）+ 4K60 | UI 糊、"像被锁在 1080p" | `dumpsys SurfaceFlinger` 证据：`geomBufferSize=[0 0 1920 1080]` + `geomLayerTransform … SCALE 2.0000`，合成帧 `Disp Frame 0 0 3840 2160 | Source Crop 0.0 0.0 1920.0 1080.0`。**App 内无解**，靠平台侧更新修复 |
 | 11 | [SO 32557228](https://stackoverflow.com/questions/32557228/) "Detecting 4K UHD screens on Android" | NVIDIA Shield TV | `display.getSize()` 返回 1920×1080，而 ExoPlayer 实际输出 3840×2160 | 需用 `Display.Mode.getPhysicalWidth/Height`（API≥23）或 `DisplayCompat.getSupportedModes()`；且**UHD 可能只在视频播放期间才启用** |
 | 12 | [SO 50921330](https://stackoverflow.com/questions/50921330/) | Sony KD-49XF9005 | `getSupportedModes()` 只报 1080p 一个模式，`preferredDisplayModeId` 永远选不到 4K | 厂商上报的模式列表不完整（与 `DisplayCompat` 注释所述一致） |
-| 13 | [CSDN：MStar MSD8386 的 4K UI 白名单](https://blog.csdn.net/u011044707/article/details/137139591) | MStar 电视 SoC，2GB DDR | 低端方案按**固件白名单** `system/etc/4k2k_app.xml` 决定哪些 App 拿 `wm size 3840x2160`，其余拿 `1920x1080` | ⚠️ **二手博客证据**：说明"我的 App 拿到 1080p 还是 4K 窗口"可能**由你无法控制的固件 XML 决定**。名字与"4K UI 省 DDR"的动机可信，但**未在 AOSP/厂商官方文档中验证** |
+| 13 | [CSDN：MStar MSD8386 的 4K UI 白名单](https://blog.csdn.net/u011044707/article/details/137139591) | MStar 电视 SoC，2GB DDR | 低端方案按**固件白名单** `system/etc/4k2k_app.xml` 决定哪些 App 拿 `wm size 3840x2160`，其余拿 `1920x1080` | ⚠️ **二手博客证据**：说明应用拿到 1080p 还是 4K 窗口可能**由固件的 `4k2k_app.xml` 白名单决定**。名字与"4K UI 省 DDR"的动机可信，但**未在 AOSP/厂商官方文档中验证** |
 | 14 | [CoreELEC 论坛 "video starts in just 1/4th of the screen"](https://discourse.coreelec.org/t/solved-sometimes-video-starts-in-just-1-4th-of-the-screen/12059) | Amlogic Odroid N2/C4 + Kodi GUI 1080p + 4K TV | 画面只在 1/4 屏 | 与 #9 同源（GUI 分辨率 < 输出分辨率且未放大） |
 | 15 | **[SO 76426418](https://stackoverflow.com/questions/76426418/why-is-android-tv-app-having-a-web-view-with-low-resolution)**（score 8 回答） | **Chromecast with Google TV (4K)**，真机 `adb shell wm density` → **`Physical density: 640`** | WebView 视口只有 960×540 CSS px，看起来"低分辨率" | **这是"真 4K UI / densityDpi 640"在零售硬件上的直接证据**。它同时证明：640dpi 的 4K 设备今天就存在（naive `widthPx/1920` 倍率会在这里翻倍），且 CSS 视口 = **960×540** 正好等于 TV 画布不变量 |
 | 16 | [androidx/media issue #1986](https://github.com/androidx/media/issues/1986) | OEM 盒子，ATV 11 vs ATV 12 | `vendor.display-size` 报 4K，但 `Display.getMode().getPhysicalWidth/Height` 在 ATV 11 上错报 1080p | 厂商答复：`vendor.display-size` 自 ATV 12 起废弃，改用 `Display.Mode`；**ATV 12 上 `Display.Mode` 才报对 4K** |
@@ -669,14 +669,14 @@ Log.i(TAG, "dm=${dm.widthPixels}x${dm.heightPixels} dpi=${dm.densityDpi} density
 ## 7. 未验证 / 存疑清单
 
 1. **长虹 43Q3T / MT5520 在 Android 5.1 上的实际 `widthPixels` / `densityDpi`** —— 无真机、无公开 dumpsys，**必须按 §6.4 取样**。
-2. **"`getRealSize` 报 3840×2160 且 `densityDpi` 停在 320"这个精确组合，我没有找到任何一手报告**
+2. **"`getRealSize` 报 3840×2160 且 `densityDpi` 停在 320"这个精确组合，没有找到任何一手报告**
    （中英文都找过）。它可以从「TV 基线 960×540dp @320dpi」+「厂商把密度写死在固件」推导出来，
    但**属于推断，不是已证实的观测**。→ **更凸显 §6.4 现场取样的必要性**。
    （已证实的相邻观测：Chromecast with Google TV 4K = 4K UI @ **640**dpi；各类盒子 = 160/213dpi。）
-3. **Android 12 钳位漏掉 density 缩放**（§1.2）—— 源码差异我已亲自逐行比对确认，
+3. **Android 12 钳位漏掉 density 缩放**（§1.2）—— 源码差异已逐行比对确认，
    但**没有任何真实故障报告与之对应**，也**没有**在 ATV 12 真机上验证过 `wm size`/`wm density` 的实际输出。
    另注意它的症状方向是"元素变大/溢出"，与本项目的"变小"相反，**不要**拿它当本案根因。
-4. **`config_supports4kUi` 资源不存在**（我已检索 AOSP `frameworks/base` 与 `device/google/atv` 各版本；
+4. **`config_supports4kUi` 资源不存在**（已检索 AOSP `frameworks/base` 与 `device/google/atv` 各版本；
    不排除厂商私有 overlay 用了别的名字）。
 5. **`DisplayCompat.isUhdCapable` / `MODE_1080P` / `MODE_4K` 也不存在** —— 该类只有
    `getMode` / `getSupportedModes` 与 `ModeCompat{getPhysicalWidth,getPhysicalHeight,toMode,isNative}`，
@@ -684,7 +684,7 @@ Log.i(TAG, "dm=${dm.widthPixels}x${dm.heightPixels} dpi=${dm.densityDpi} density
 6. **`config_defaultDensity` / `DisplayMetrics.DEFAULT_DENSITY` 不存在**；
    真实默认值是 `DENSITY_DEFAULT = DENSITY_MEDIUM = 160`，
    经 `getDeviceDensity()` 读 `qemu.sf.lcd_density` → `ro.sf.lcd_density` 覆盖。
-7. **MT5520 的「1080p UI 平面 + 4K 视频平面」具体架构** —— 属于业界通行说法，我未找到可引用的
+7. **MT5520 的「1080p UI 平面 + 4K 视频平面」具体架构** —— 属于业界通行说法，未找到可引用的
    联发科官方文档。**标记为推测**。厂商侧被点名的只有 **MStar MSD8386**（固件白名单 `4k2k_app.xml`）
    与 **Amlogic**（Kodi `free_scale`），**没有任何来源点名 MT55xx**；
    且公开 AOSP 中没有 MTK/MStar 的 device tree 含 `config_maxUiWidth`（"采样未找到"，非"证明不存在"）。
@@ -698,13 +698,13 @@ Log.i(TAG, "dm=${dm.widthPixels}x${dm.heightPixels} dpi=${dm.densityDpi} density
     "App 何时拿到 4K 窗口可能由固件白名单决定"这个**结论方向**可信，但**具体文件名/行为未证实**。
 13. **"开发者选项强制 1080p/4K UI"** —— 未找到任何官方文档，不要采信第三方教程。
 14. **Google 所说 "compatible devices" 的判定标准未定义**；ATV 15 QPR1+ 的 xxxhdpi→3840 默认路径
-    是否有任何**实际出货**的 Amlogic/MTK/MStar 4K 设备启用，我未能证实。
-15. 三个并行调研子代理均已交付（社区案例 `research-androidtv-4k-ui-scaling.md`、
+    是否有任何**实际出货**的 Amlogic/MTK/MStar 4K 设备启用，未能证实。
+15. 三份并行调研材料均已交付（社区案例 `research-androidtv-4k-ui-scaling.md`、
     显示度量 `docs/research/4K-DISPLAY-METRICS-REPORT.md`）；
-    本报告的**关键条目我已逐条回源复核**：`config_maxUiWidth` 各版本路径与取值、
+    本报告的**关键条目已逐条回源复核**：`config_maxUiWidth` 各版本路径与取值、
     Android 12 vs 13 的钳位差异、ATV 11 / ATV 12 模拟器 / ATV 15 QPR1 三个提交、
     `CompatModePackages` 代码、`Display.Mode.getPhysicalWidth()` 注释、Chromecast 640dpi 实测、
-    Kodi commit 元数据。子代理报告中与其结论不符处（例如把 Android 12 的钳位差异描述为"tiny UI"，
+    Kodi commit 元数据。并行调研报告中与本文结论不符处（例如把 Android 12 的钳位差异描述为"tiny UI"，
     实际方向相反）已在 §1.2 与本节 §7.3 更正。
 
 ---
@@ -803,15 +803,10 @@ Log.i(TAG, "dm=${dm.widthPixels}x${dm.heightPixels} dpi=${dm.densityDpi} density
 
 ---
 
-## 附：子代理原始调研材料
+## 附：并行调研原始材料
 
-并行子代理产出的原始材料保留在 `docs/research/4K-DISPLAY-METRICS-REPORT.md`
+并行调研产出的原始材料保留在 `docs/research/4K-DISPLAY-METRICS-REPORT.md`
 （显示度量 / 版本沿革 / SoC 证据）。
 
 它**未经逐条回源核对**（关键条目已复核并写入本报告 §1/§3/§5），
-**引用前请以本报告 §7/§8 为准**；与子代理结论不一致处已在 §1.2、§7.3、§7.15 显式更正。
-
-当时还散落在仓库根目录的三份草稿（`research-androidtv-4k-ui-scaling.md`、
-`android-tv-4k-display-metrics-*.md`、`android-tv-design-guidance-research.md`）已删除：
-它们含有本报告纠正过的错误结论（例如把 `config_maxUiWidth` 写成 `config_supports4kUi`、
-把 android12 分支的密度缺陷方向判断反了），留着只会误导。
+**引用前请以本报告 §7/§8 为准**；与并行调研结论不一致处已在 §1.2、§7.3、§7.15 显式更正。

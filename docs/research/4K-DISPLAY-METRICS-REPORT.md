@@ -1,5 +1,7 @@
 # How Android TV reports display metrics on 4K (3840×2160) panels
 
+> 结论以 [RESEARCH-4K-TV-SCALING.md](../RESEARCH-4K-TV-SCALING.md) 为准；本文件是未经逐条复核的原始材料，保留原始措辞。
+
 **Evidence-based research report.** Every factual claim carries a source link. Claims I could not
 verify are marked **[UNVERIFIED]** and collected in the final section.
 

@@ -187,7 +187,7 @@ frame->format = IJK_AV_PIX_FMT__ANDROID_MEDIACODEC;   // amc_fill_frame
 
 ## 2. Q2 — MediaCodec 路径"选上了却不出画/极慢/静音"的已知失效模式
 
-每条给：症状 → 代码机制 → 规避手段。带 🔒 的是我从源码逐行确认的机制；带 📋 的是社区 issue 里的实测报告。
+每条给：症状 → 代码机制 → 规避手段。带 🔒 的是逐行核对源码确认的机制；带 📋 的是社区 issue 里的实测报告。
 
 ### 2.1 🔒 没有 Surface 就准备 → dummy codec → 黑屏有声
 - 机制：`vdec.c:129-132`（见 §1.6）。假帧会被 `SDL_VoutOverlayAMediaCodec_releaseFrame_l`
@@ -232,9 +232,9 @@ frame->format = IJK_AV_PIX_FMT__ANDROID_MEDIACODEC;   // amc_fill_frame
 ### 2.5 🔒 大于输入缓冲的包会被**截断**，尾部被当成第二个 buffer 入队
 - 机制链：
   `writeInputData` 取 `min(size, GetDirectBufferCapacity)`（`ijksdl_codec_android_mediacodec_java.c:222`）；
-  调用方把返回值当作"已消费字节数"，把剩余部分留到下一轮
+  调用方把返回值当作"已消费字节数"，把剩余部分留到下一次输入缓冲
   （`vdec.c:647` → `vdec.c:681-685`：`pkt_temp.data += copy_size; pkt_temp.size -= copy_size;`），
-  而下一轮会用**同一个 pts** 再 `queueInputBuffer` 一次（`vdec.c:655-664`）。
+  而下一次输入会用**同一个 pts** 再 `queueInputBuffer` 一次（`vdec.c:655-664`）。
 - 后果：一个 4K HEVC 关键帧若超过 codec 输入缓冲，会被拆成两个"访问单元"喂进去 →
   解码器报错/花屏/该 GOP 报废；表现为**每个关键帧处卡一下/花一下**。
 - 火上浇油：ijkplayer 自己把 `max-input-size` 显式写成 **0**
@@ -269,7 +269,7 @@ frame->format = IJK_AV_PIX_FMT__ANDROID_MEDIACODEC;   // amc_fill_frame
   （`ff_ffplay.c:2918-2919`）→ 该流的 `avctx` 被释放、`is->audio_st` 未设置 → **静音但视频继续**，
   且不产生 `onError`。
 - 音频输出设备由 `opensles` 决定：`ffpipeline_android.c:85-89`，`opensles=0` → `AudioTrack` 路径。
-- **MTK/Android 5.x 专属的静音 bug【未证实】**：我没有找到可引用的 MTK 静音实测报告。
+- **MTK/Android 5.x 专属的静音 bug【未证实】**：没有找到可引用的 MTK 静音实测报告。
 
 ### 2.9 🔒 `framedrop` 的语义陷阱（想"丢帧救帧率"时必须知道）
 ```c
@@ -441,12 +441,12 @@ return bestCodec.mCodecInfo.getName();
   （`grep -rn "isSizeSupported\|VideoCapabilities" --include=*.java .` 无结果）。
 - `COLOR_FormatSurface`：**全仓库 0 处引用**。它只作为常量出现在"color-format 名字打印表"里：
   `ijksdl_codec_android_mediadef.h:185`（`AMEDIACODEC__OMX_COLOR_FormatSurface = 0x7f000789`）与
-  `ijksdl_codec_android_mediadef.c:122`。你日志里"某 codec 是否支持 COLOR_FormatSurface"是**应用自己查的**，
+  `ijksdl_codec_android_mediadef.c:122`。日志里"某 codec 是否支持 COLOR_FormatSurface"是**应用自己查的**，
   ijkplayer 内部不用它做任何决定。
 
 ---
 
-## 4. Q4 — ijkplayer 会不会问 MediaCodec "你支持 Main10 / 这个尺寸吗"？
+## 4. Q4 — ijkplayer 会不会查询 MediaCodec 对 Main10 / 尺寸的支持？
 
 **不会。** 三层都不问：
 
@@ -576,7 +576,7 @@ val ok4k = vc?.isSizeSupported(3840, 2160) == true
 
 ### 5.2 **不存在的选项**（问了但 k0.8.8 没有）
 
-| 你以为有的 | 实际情况 |
+| 看起来有的 | 实际情况 |
 |---|---|
 | `framedrop_delay` | **不存在**。全仓库无此字符串。 |
 | `video-packet-buffer` | **不存在**。对应能力 = `max-buffer-size` + `video-pictq-size` + `min-frames` + 三个 `*-high-water-mark-ms`。 |
@@ -590,7 +590,7 @@ val ok4k = vc?.isSizeSupported(3840, 2160) == true
 
 | 类别 | 存放 | 被读取的位置 | prepare 后还能改吗 |
 |---|---|---|---|
-| `OPT_CATEGORY_PLAYER` | `ffp->player_opts` 字典 | **`av_opt_set_dict(ffp, &ffp->player_opts)`，只在 `ffp_prepare_async_l` 里执行一次**（`ff_ffplay.c:4287`） | **不能**。`ffp_set_option` 只是 `av_dict_set`（`ff_ffplay.c:4157-4164`），写进一个已经被消费掉的字典；而 `av_opt_set_dict` 会把**已识别的键从字典里删掉**（`libavutil/opt.c:1575-1588`），**所以之后设的值永远不会被搬进 `FFPlayer` 字段**。注意区分两件事：(1) 同一次 prepare 之后字段值仍在（值存在 struct 里，不是每次从字典取），所以"第二次 prepareAsync"仍然是有效配置；(2) 但你在第二次 prepare 之前**新设/改动**的值不会生效。清空字段的唯一途径是 `reset()`——它会**销毁整个 native player**（见 5.4）。 |
+| `OPT_CATEGORY_PLAYER` | `ffp->player_opts` 字典 | **`av_opt_set_dict(ffp, &ffp->player_opts)`，只在 `ffp_prepare_async_l` 里执行一次**（`ff_ffplay.c:4287`） | **不能**。`ffp_set_option` 只是 `av_dict_set`（`ff_ffplay.c:4157-4164`），写进一个已经被消费掉的字典；而 `av_opt_set_dict` 会把**已识别的键从字典里删掉**（`libavutil/opt.c:1575-1588`），**所以之后设的值永远不会被搬进 `FFPlayer` 字段**。注意区分两件事：(1) 同一次 prepare 之后字段值仍在（值存在 struct 里，不是每次从字典取），所以"第二次 prepareAsync"仍然是有效配置；(2) 但在第二次 prepare 之前**新设/改动**的值不会生效。清空字段的唯一途径是 `reset()`——它会**销毁整个 native player**（见 5.4）。 |
 | `OPT_CATEGORY_FORMAT` | `ffp->format_opts` | `avformat_open_input`（`ff_ffplay.c:3119`）、`find_stream_info`（`:3151`） | 不能（只在 prepare 打开输入时用一次）。字典**不会被消费删除**，但输入已经打开。 |
 | `OPT_CATEGORY_CODEC` | `ffp->codec_opts` | `filter_codec_opts` → `avcodec_open2`，在 `stream_component_open` 内（`ff_ffplay.c:2869-2876`） | **部分可以**：字典不会被删，每次 `stream_component_open`（例如切流 `ff_ffplay.c:4860`、重新 prepare）都会重新取用；但**对当前已打开的解码器无效**。 |
 | `OPT_CATEGORY_SWS` | `ffp->sws_dict` | 仅 `configure_video_filters`（`ff_ffplay.c:1786`） | 无 `vf0` 时永远无效。 |
@@ -612,7 +612,7 @@ val ok4k = vc?.isSizeSupported(3840, 2160) == true
 即 **销毁并重建 native player**；`ffp_destroy` → `ffp_reset_internal`（`ff_ffplay_def.h:728-739`）
 会 `av_opt_free(ffp)` 并 `av_dict_free` **所有五个选项字典**。
 → **`reset()` 之后所有 `setOption` 的结果全部丢失，必须重设。**
-（本项目每次播放 `IjkMediaPlayer()` 新建、结束 `release()`，见 `PlaybackEngine.kt:408, 776`，不受影响。）
+（本项目每次播放 `IjkMediaPlayer()` 新建、结束 `release()`，见 `PlaybackEngine.kt:408, 776`，没有复用同一个实例。）
 
 ### 5.5 推荐值
 
@@ -688,7 +688,7 @@ if (is->is_video_high_fps) {
 2. ijkplayer 的 `is_video_high_fps` 启发式对 4K HEVC **是空操作**，`max-fps` 设多少对 HEVC 都无所谓。
 3. **这些字段在 MediaCodec 模式下也完全无效**：AMC 管线不调用 `avcodec_decode_video2`
    （唯一例外是 H.264 换分辨率时的探测解码，`vdec.c:512-560`，且那里强制 `threads=1`）。
-4. **"能提速多少"的量化数据：ijkplayer 文档/代码里没有，我也没有找到可引用的 ARM 实测数字 → 【未证实】。**
+4. **"能提速多少"的量化数据：ijkplayer 文档/代码里没有，也没有找到可引用的 ARM 实测数字 → 【未证实】。**
    本报告只给出"有效/无效"的确定结论，不给百分比。
 
 ### 6.3 `threads`：默认是 `auto`，而在 4 核 A53 上 `auto` = **5 个帧级线程**，且**同时关掉 WPP**
@@ -779,31 +779,23 @@ p.setOption(IjkMediaPlayer.OPT_CATEGORY_CODEC, "thread_type", "slice")  // 要 W
    - `AMediaFormat: ... , 0x0`（`vdec.c:178` 的 `AMediaFormat: %s, %dx%d`，宽高为 0 说明探测失败）
 5. 需要更细时可重编带 `FFP_SHOW_AMC_VDPS` 的 so（见上）。
 
-### 7.3 一个**未能证实**的观察（来自本项目实测，留给后续）
+### 7.3 一个**未能证实**的观察（来自本项目实测）
 
 本项目 `MainActivity` 记录了：`outputFps()`（10002）在 **SMB + `IMediaDataSource`** 通路上
 **恒为 0**，而本地文件能读到 14.8fps（commit `bdfe20f`）。
-我按源码逐行追过：`stat.vfps` 的赋值在 `video_image_display2` 的 `if (vp->bmp)` 块内
+按源码逐行追过：`stat.vfps` 的赋值在 `video_image_display2` 的 `if (vp->bmp)` 块内
 （`ff_ffplay.c:872-916`），而 AMC overlay 的创建（`SDL_VoutAMediaCodec_CreateOverlay`，
 `ijksdl_vout_overlay_android_mediacodec.c:137-177`）**除 OOM 外不会失败**，也不依赖 codec 是否已设置。
 → **仅凭代码无法解释该现象**。可能的解释（均未验证）：(a) 查询的是被 `reset()` 重建后的另一个
 player 实例（`reset()` 会销毁 native player，§5.4）；(b) 该通路上 `video_image_display2` 未被走到。
-建议先按 7.2 的 logcat 判据确认，再回头查 10002。
+要确认时按 7.2 的 logcat 判据查，再回头核对 10002。
 
 ---
 
-## 8. 针对本项目的"下一步可执行清单"（按收益排序）
+## 8. 结论与适用边界
 
-1. **先确认到底走的是硬解还是软解**：`getVideoDecoder()`（2/1）+ logcat 的
-   `AMEDIACODEC__INFO_OUTPUT_FORMAT_CHANGED`。如果是 1 → 全部问题都是"软解 4K HEVC"，按 §1
-   逐道闸看哪一步 fail 了（日志关键词已在 7.2 列出）。
-2. **确认片源是不是 10-bit（Main10）**：`ffprobe -show_streams` 看 `profile=Main 10` /
-   `pix_fmt=yuv420p10le`；同时用 §4.3 的代码读本机 `profileLevels` 是否含 `HEVCProfileMain10`。
-   若"片源 10bit + 机器无 Main10" → 换 8bit 片源是唯一解。
-3. 打印完整的 `onMediaCodecSelect` 候选列表（已有）+ 排名与最终选择，
-   确认选到的是 `OMX.MTK.VIDEO.DECODER.HEVC` 而不是 `.secure` 变体或 `OMX.google.*`（§3）。
-4. 显式设 `OPT_CATEGORY_CODEC "threads"=3` + `"thread_type"="slice"`，为软解回落兜底（§6.3）。
-5. `max-fps` 按"4K HEVC 用 61/-1、1080p50 H.264 用 31"分流（§5.5）——现在用一个 61 打天下，
-   等于把 H.264 那条唯一有效的跳帧路径关掉了。
-6. 若出现 SurfaceView 黑屏有声 → 试 `TextureView`（issue #3181，同为长虹 Android 5.1）。
-7. 若出现卡死/不出帧 → A/B 试 `mediacodec-sync=1`（§2.7）。
+- 硬解/软解必须用 `getVideoDecoder()`（2/1）确认：`OMX.google.*` 软解实现会被 ijkplayer 的排名拒掉，选码回调被调用不等于硬解真的建成。
+- 4K HEVC 的瓶颈在解码块本身的像素率，MediaCodec 选码成功不等于能满帧；Main10 是否支持要读 `profileLevels`，片源 10bit 而机器无 Main10 时只能换片源。
+- `max-fps` 的跳帧启发式对 HEVC 是空操作，对 H.264 才有意义；`threads` / `thread_type` 只影响软解回落（§6.3）。
+- SurfaceView 黑屏有声时 TextureView 是备选（issue #3181，同款长虹 Android 5.1）；`mediacodec-sync` 只在卡死/不出帧时 A/B 验证（§2.7）。
+- 本报告的结论基于 k0.8.8 源码与本项目实测；未验证项见 §7，引用前以 §7 为准。
