@@ -1,13 +1,13 @@
 # HANDOVER：构建、发布与维护记录
 
-最后更新：2026-11-21 ｜ 当前版本 1.1.0（versionCode 4）｜ code commit `d6165f0` ｜ tag `v1.1.0`
+最后更新：2026-11-21 ｜ 当前版本 1.1.1（versionCode 5）｜ code commit `6464389` ｜ tag `v1.1.1`
 
 ## 仓库与发布
 
 - Gitea：`http://8.146.238.150:10200/everaine/firefly-tv`，分支 `main`。
-- Release：`v1.1.0`，资产 `app-release.apk`（24,757,677 B，
-  SHA-256 `e926d60e442400ed502cd6bc2447ad0fb0b483f91227573413931ec5ee95e3cf`）；
-  本地留档 `firefly-apk/firefly-tv-1.1.0.apk`（`firefly-apk/` 不入库）。
+- Release：`v1.1.1`，资产 `app-release.apk`（24,756,684 B，
+  SHA-256 `6d19ce0424fc508aba930f28043791c2ccd49489a0149c833550ddf15a558e25`）；
+  本地留档 `firefly-apk/firefly-tv-1.1.1.apk`（`firefly-apk/` 不入库）。
 - 包名 `com.firefly.tv`；签名复用 Windows debug keystore
   （证书 SHA-256 `da14fe1d035dff9284bbbbbd91715d98c88aa10064b63fa36245bf67b4186272`）。
   同签名覆盖安装保留配置和观看记录。
@@ -31,7 +31,7 @@ ANDROID_HOME='D:\AndroidSDK' WIN_ROOT='E:\firefly-build' \
 - JDK：`C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot`
 - SDK：`D:\AndroidSDK`（build-tools 36.1.0 / platforms 34）
 - Gradle：`%USERPROFILE%\.gradle\wrapper\dists\gradle-8.11.1-bin\...`
-- 验证结果：285 项单测 0 失败；release 构建 2 分 07 秒（缓存热、R8 正常）。
+- 验证结果：285 项单测 0 失败；release 构建正常（缓存热、R8 正常）。
 - `scripts/win-build.sh` 在 WSL 侧先建 `build/apk`，否则 `.bat` 的产物回拷会静默失败；
   该脚本有可执行位（755），其余脚本按 README 用 `bash scripts/xxx.sh` 调用。
 
@@ -76,15 +76,15 @@ GitHub 全量 clone `Bilibili/FFmpeg` 太慢（十几分钟还没完），改用
 1. **从 Release APK 取**（最快）：`unzip -o app-release.apk 'lib/*'`，得到三个 ABI 的
    `libijk*.so`，按 `build-out/ijkplayer-full/<abi>/` 放好，再跑 `pack-ijkplayer-aar.sh`。
 2. **全量重编**：上面的四步。
-3. 不要从 AVD 的 userdata 里取：之前那个 UI-only 的 1.1.0 包 `lib/` 是空的，
+3. 不要从 AVD 的 userdata 里取：之前那个 UI-only 包 `lib/` 是空的，
    先 `unzip -l base.apk | grep lib/` 确认再谈恢复。
 
 ## 测试与验证
 
 - 单测：`testDebugUnitTest` 285 项，0 失败（2026-11-21）。
-- Release APK：`versionCode 4 / versionName 1.1.0`，minSdk 21 / targetSdk 34，
+- Release APK：`versionCode 5 / versionName 1.1.1`，minSdk 21 / targetSdk 34，
   native-code 三个 ABI，debug 签名；安装到 AVD API 22/x86，开机页 smoke test 正常。
-- 截图：`docs/images/boot.png`（新开机页）、`docs/images/switch.png`（换库过渡页）。
+- 截图：`docs/images/boot.png`（1.1.1 新开机页）、`docs/images/switch.png`（换库过渡页）。
   AVD 1920×1080/density 320；配置用 `scripts/push-prefs.sh` + `build/tmp/fake-prefs.xml`
   （gitignored）。过渡页截图是在 debug 预览里隐藏 SurfaceView 后拍的：模拟器软件渲染下
   独立 surface 会盖住普通 View；**release 包没有预览代码**，真实电视上视频层和过渡层正常叠加。
@@ -105,22 +105,23 @@ AVD：`firefly_tv`（API 22 / x86 / 1920×1080 / density 320）。安装：
 
 ## 发布流程
 
-1. `git push origin main`；`git tag -a v1.1.0 -m ... && git push origin v1.1.0`。
+1. `git push origin main`；`git tag -a v1.1.1 -m ... && git push origin v1.1.1`。
 2. Gitea API：`POST /api/v1/repos/everaine/firefly-tv/releases`（token 只从
    `~/.git-credentials` 读，不写进仓库/不打印），body 含安装、覆盖、回滚、未验证项。
 3. 上传资产 `app-release.apk`，记录 SHA-256。
-4. Release 页面：`http://8.146.238.150:10200/everaine/firefly-tv/releases/tag/v1.1.0`。
+4. Release 页面：`http://8.146.238.150:10200/everaine/firefly-tv/releases/tag/v1.1.1`。
 
 ## 回滚
 
-- 从 tag `v1.0.2` 重建：同一份 AAR、同一把 debug keystore，`versionCode 3`。
-- 1.1.0 覆盖安装 1.0.2 会 `INSTALL_FAILED_VERSION_DOWNGRADE`；电视 U 盘安装需要先卸载
-  （会清配置和观看记录），或用 adb `install -d`。所以回滚前先保留 1.0.2 的 APK，再决定。
+- 回滚资产：`firefly-apk/firefly-tv-1.1.0.apk`（1.1.0 / versionCode 4）；Release 侧同版本资产可从 `v1.1.0` 标签重新取。
+- 从 tag `v1.1.0` 重建：同一份 AAR、同一把 debug keystore，`versionCode 4`。
+- 1.1.1 覆盖 1.1.0 是升级；回滚到 1.1.0 是降级，电视 U 盘安装需要先卸载
+  （会清配置和观看记录），或用 adb `install -d`。所以回滚前先保留 1.1.0 的 APK，再决定。
 - 不要换签名：换签名会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，卸载会丢配置和记录。
 
 ## 已知坑（按重要性）
 
-- AVD 里的旧 1.1.0 UI-only 包没有 native 库，不能当内核来源。
+- 旧 UI-only 包没有 native 库，不能当内核来源。
 - `win-build.sh` 只同步 `app/src`、`app/build.gradle.kts`、`proguard-rules.pro`、AAR；
   改 settings/root gradle 时要手动同步过去。
 - FFmpeg 全量 clone 慢，见「源码下载慢」。
@@ -132,4 +133,4 @@ AVD：`firefly_tv`（API 22 / x86 / 1920×1080 / density 320）。安装：
 
 - 真机 4K 帧率、中文 TTS、设置键 keyCode、长虹主屏抢占。
 - https 直播源在真实网络下的起播。
-- 老人实际观感：开机页 5 秒、过渡页 0.4 秒、400ms 防抖是否需要调参。
+- 老人实际观感：开机页 1.1.1 三张键帽卡、开机页 5 秒、过渡页 0.4 秒、400ms 防抖是否需要调参。
