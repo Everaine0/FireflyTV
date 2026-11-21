@@ -56,8 +56,8 @@ android {
         // 都判断不了 —— 而这台电视上没有 adb，问不到别的。
         //
         // 版本号在电视上**看得见**：诊断页标题、配置页底部（见 DiagScreen / ConfigServer）。
-        versionCode = 4
-        versionName = "1.1.0"
+        versionCode = 5
+        versionName = "1.1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

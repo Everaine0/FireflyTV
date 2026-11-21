@@ -1,21 +1,15 @@
 package com.firefly.tv.ui
 
 import android.content.Context
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.Path
-import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
-import kotlin.math.sin
 
 /**
  * 开机页：遥控器说明 + 等待 NAS 硬盘唤醒。
@@ -25,48 +19,34 @@ import kotlin.math.sin
  * 面对黑屏只会以为电视坏了。这一页把等待解释清楚，同时把「日常只用三组键」
  * 的操作说明在每次开机时重复一遍 —— 视频在背后照常起播，不额外拖慢。
  *
- * 版式（16:9 电视）：
- *
- * ```
- *             萤火照夜
- *       遥控器上日常只用三组键
- *
- *    ┌──────┐   ┌─────────────────────┐
- *    │ 遥控 │   │ ← →   换媒体库       │  ← 三行说明轮流高亮，
- *    │  器  │   │ ↑ ↓   换剧 / 换频道  │     每行 1.6 秒
- *    │      │   │ OK    天气和时间      │
- *    └──────┘   └─────────────────────┘
- *
- *        正在连接 NAS…
- *        ▓▓▓▓▓░░░░░░░░░░░░
- *   第一次打开，NAS 硬盘要转一会儿，属正常现象
- * ```
+ * 版式：没有品牌标题，也没有遥控器插画。三张横向引导卡占住视觉中心，
+ * 键帽本身就是「按哪个键」的说明；底部单独一行等待状态。
  *
  * 退场规则在 [BootGate]（纯函数 + 单测）：首帧出来且待够 5 秒就淡出；
  * 故障页要说话时立刻让位；最多待到 90 秒。
  *
- * 动画开销刻意压得很低：整页只有遥控器那一小块和进度条在重绘（约 20Hz），
- * 文字与背景都是静态的。老电视的 CPU 本来就紧，开机时更不该抢它的时间。
+ * 动画开销刻意压得很低：只有三张卡的选中态和进度条在变，约 20Hz。
  */
 class BootScreen(context: Context) : FrameLayout(context) {
 
     private val ui = Ui(context)
 
     private val content = LinearLayout(context)
-    private val title = text(40f, Color.WHITE).apply {
-        text = "萤火照夜"
-        setTypeface(Typeface.DEFAULT_BOLD)
+    private val heading = text(30f, SECONDARY).apply {
+        text = "遥控器上日常只用三组键"
+        gravity = Gravity.CENTER
+        letterSpacing = 0.02f
     }
-    private val subtitle = text(22f, SECONDARY).apply { text = "遥控器上日常只用三组键" }
-    private val remote = RemoteView(context)
-    private val hintList = LinearLayout(context)
-    private val hints = ArrayList<Hint>(3)
-    private val status = text(26f, Color.WHITE).apply { gravity = Gravity.CENTER }
+    private val guide = LinearLayout(context)
+    private val rows = ArrayList<GuideRow>(3)
+
+    private val status = text(30f, Color.WHITE).apply { gravity = Gravity.CENTER }
     private val bar = PulseBar(context)
-    private val note = text(20f, SECONDARY).apply {
+    private val note = text(22f, SECONDARY).apply {
         text = "第一次打开，NAS 的硬盘可能要转一会儿，属正常现象"
         gravity = Gravity.CENTER
     }
+    private val bottom = LinearLayout(context)
 
     private var scene = -1
     private var shownAt = 0L
@@ -195,10 +175,9 @@ class BootScreen(context: Context) : FrameLayout(context) {
             val now = System.currentTimeMillis()
             val elapsed = BootGate.elapsedMs(now, shownAt)
 
-            val next = ((elapsed / SCENE_MS) % hints.size).toInt()
+            val next = ((elapsed / SCENE_MS) % rows.size).toInt()
             if (next != scene) applyScene(next)
 
-            remote.pulse = ((sin(elapsed / 230.0) + 1.0) / 2.0).toFloat()
             bar.phase = (elapsed % PULSE_MS).toFloat() / PULSE_MS
 
             if (autoWakeHint && now - statusAt >= WAKE_HINT_AFTER_MS) {
@@ -215,120 +194,150 @@ class BootScreen(context: Context) : FrameLayout(context) {
         }
     }
 
+    /** 一行高亮：选中行的卡片描边、左侧金条和键帽一起点亮。 */
     private fun applyScene(index: Int) {
         scene = index
-        remote.active = index
-        hints.forEachIndexed { i, h ->
+        rows.forEachIndexed { i, row ->
             val on = i == index
-            h.row.background = rounded(HINT_RADIUS, if (on) ACTIVE_BG else INACTIVE_BG)
-            h.accent.setBackgroundColor(if (on) ACCENT else Color.TRANSPARENT)
-            h.keys.setTextColor(if (on) ACCENT else SECONDARY)
-            h.action.setTextColor(if (on) Color.WHITE else SECONDARY)
+            row.card.background = cardBackground(on)
+            row.accent.background = if (on) rounded(3f, ACCENT) else null
+            row.label.setTextColor(if (on) Color.WHITE else LABEL_OFF)
+            row.keys.forEach { cap ->
+                cap.background = keyBackground(on)
+                cap.setTextColor(if (on) ACCENT else KEY_TEXT_OFF)
+            }
         }
     }
 
     private fun build() {
         removeAllViews()
         content.removeAllViews()
-        hintList.removeAllViews()
-        hints.clear()
+        guide.removeAllViews()
+        rows.clear()
 
         background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
             intArrayOf(BG_TOP, BG_BOTTOM),
         )
 
+        // 上中下三段：标题与三张卡在上半屏，弹性的空白托住底部等待状态；
+        // 这样在 1080p/4K/720p 都不会出现底部状态压住最后一行卡片。
         content.orientation = LinearLayout.VERTICAL
         content.gravity = Gravity.CENTER_HORIZONTAL
+        content.setPadding(ui.px(54), ui.px(44), ui.px(54), ui.px(40))
+        content.addView(heading)
 
-        // 标题旁边一颗暖色小点：和播放页/浮层用的是同一个强调色，不额外引入品牌色
-        val dot = View(context).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(ACCENT)
-            }
-        }
-        val titleRow = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            addView(dot, LinearLayout.LayoutParams(ui.px(10), ui.px(10)))
-            addView(title, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { leftMargin = ui.px(14) })
-        }
-        content.addView(titleRow)
-        content.addView(subtitle, wrap(top = 10))
+        guide.orientation = LinearLayout.VERTICAL
+        guide.gravity = Gravity.CENTER_HORIZONTAL
+        guide.addView(row("换媒体库", "←", "→"), rowParams(0))
+        guide.addView(row("换剧 / 换频道", "↑", "↓"), rowParams(1))
+        guide.addView(row("天气和时间", "OK"), rowParams(2))
+        content.addView(
+            guide,
+            LinearLayout.LayoutParams(ui.widthFraction(0.64f), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = ui.px(28)
+            },
+        )
 
-        remote.start(ui.px(136), ui.px(260))
-        hintList.orientation = LinearLayout.VERTICAL
-        hintList.addView(hint("←  →", "换媒体库").row, hintParams(0))
-        hintList.addView(hint("↑  ↓", "换剧 / 换频道").row, hintParams(1))
-        hintList.addView(hint("OK", "天气和时间").row, hintParams(2))
+        content.addView(
+            View(context),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f),
+        )
 
-        val middle = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(remote, LinearLayout.LayoutParams(ui.px(136), ui.px(260)))
-            addView(hintList, LinearLayout.LayoutParams(
-                ui.widthFraction(0.46f),
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { leftMargin = ui.px(40) })
-        }
-        content.addView(middle, wrap(top = 22))
+        bottom.orientation = LinearLayout.VERTICAL
+        bottom.gravity = Gravity.CENTER_HORIZONTAL
+        bottom.addView(status)
+        bottom.addView(
+            bar,
+            LinearLayout.LayoutParams(ui.widthFraction(0.52f), ui.px(8)).apply { topMargin = ui.px(14) },
+        )
+        bottom.addView(
+            note,
+            LinearLayout.LayoutParams(ui.widthFraction(0.72f), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = ui.px(10)
+            },
+        )
+        content.addView(
+            bottom,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+        )
 
-        content.addView(status, wrap(top = 22))
-        content.addView(bar, LinearLayout.LayoutParams(
-            ui.widthFraction(0.52f), ui.px(8),
-        ).apply { topMargin = ui.px(14) })
-        content.addView(note, LinearLayout.LayoutParams(
-            ui.widthFraction(0.62f),
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-        ).apply { topMargin = ui.px(10) })
-
-        addView(content, LayoutParams(
-            LayoutParams.WRAP_CONTENT,
-            LayoutParams.WRAP_CONTENT,
-            Gravity.CENTER,
-        ))
-
-        // 5% 安全边距：电视 overscan 会裁掉贴边内容（DESIGN §7）
-        setPadding(ui.px(54), ui.px(30), ui.px(54), ui.px(30))
+        addView(content, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
     }
 
-    private fun hint(keysText: String, actionText: String): Hint {
-        val row = LinearLayout(context).apply {
+    private fun row(labelText: String, vararg keyTexts: String): LinearLayout {
+        val card = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            background = rounded(HINT_RADIUS, INACTIVE_BG)
-            setPadding(ui.px(20), ui.px(12), ui.px(24), ui.px(12))
+            background = cardBackground(false)
+            setPadding(ui.px(24), ui.px(10), ui.px(28), ui.px(10))
         }
+
         val accent = View(context)
-        row.addView(accent, LinearLayout.LayoutParams(ui.px(5), ViewGroup.LayoutParams.MATCH_PARENT))
+        card.addView(accent, LinearLayout.LayoutParams(ui.px(4), ui.px(44)))
 
-        val keys = text(30f, SECONDARY).apply {
-            text = keysText
-            setTypeface(Typeface.DEFAULT_BOLD)
-            minWidth = ui.px(100)
+        val keys = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL or Gravity.CENTER_HORIZONTAL
         }
-        row.addView(keys, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = ui.px(18) })
+        card.addView(keys, LinearLayout.LayoutParams(ui.px(150), ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = ui.px(22)
+        })
 
-        val action = text(30f, SECONDARY).apply { text = actionText }
-        row.addView(action, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT,
-        ).apply { leftMargin = ui.px(16) })
+        val caps = ArrayList<TextView>(keyTexts.size)
+        keyTexts.forEachIndexed { i, key ->
+            val cap = text(if (key == "OK") 22f else 32f, KEY_TEXT_OFF).apply {
+                text = key
+                gravity = Gravity.CENTER
+                setTypeface(Typeface.DEFAULT_BOLD)
+                background = keyBackground(false)
+            }
+            keys.addView(cap, LinearLayout.LayoutParams(ui.px(60), ui.px(60)).apply {
+                if (i > 0) leftMargin = ui.px(12)
+            })
+            caps.add(cap)
+        }
 
-        return Hint(row, keys, action, accent).also { hints += it }
+        val label = text(36f, Color.WHITE).apply {
+            text = labelText
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        card.addView(label, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { leftMargin = ui.px(24) })
+
+        rows.add(GuideRow(card, accent, caps, label))
+        return card
     }
 
-    private fun hintParams(index: Int) = LinearLayout.LayoutParams(
+    private fun rowParams(index: Int) = LinearLayout.LayoutParams(
         ViewGroup.LayoutParams.MATCH_PARENT,
         ViewGroup.LayoutParams.WRAP_CONTENT,
     ).apply { if (index > 0) topMargin = ui.px(14) }
+
+    private fun cardBackground(active: Boolean) = GradientDrawable().apply {
+        cornerRadius = ui.px(18f)
+        setColor(if (active) CARD_ON else CARD_OFF)
+        setStroke(
+            if (active) ui.px(2) else ui.px(1),
+            if (active) CARD_STROKE_ON else CARD_STROKE_OFF,
+        )
+    }
+
+    private fun keyBackground(active: Boolean) = GradientDrawable().apply {
+        cornerRadius = ui.px(14f)
+        setColor(if (active) KEY_ON else KEY_OFF)
+        setStroke(
+            if (active) ui.px(2) else ui.px(1),
+            if (active) ACCENT else KEY_STROKE_OFF,
+        )
+    }
+
+    private fun rounded(radiusDp: Float, color: Int) = GradientDrawable().apply {
+        cornerRadius = ui.px(radiusDp)
+        setColor(color)
+    }
 
     private fun text(sp: Float, color: Int) = TextView(context).apply {
         ui.text(this, sp)
@@ -336,172 +345,33 @@ class BootScreen(context: Context) : FrameLayout(context) {
         includeFontPadding = false
     }
 
-    private fun wrap(top: Int = 0) = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT,
-    ).apply { topMargin = ui.px(top) }
-
-    private fun rounded(radius: Int, color: Int) = GradientDrawable().apply {
-        cornerRadius = ui.px(radius.toFloat())
-        setColor(color)
-    }
-
-    private class Hint(
-        val row: LinearLayout,
-        val keys: TextView,
-        val action: TextView,
+    private class GuideRow(
+        val card: LinearLayout,
         val accent: View,
+        val keys: List<TextView>,
+        val label: TextView,
     )
-
-    /**
-     * 一只极简遥控器：方向键 + OK。只画真正用得到的键，
-     * 画上「音量」「返回」只会让老人多问一句「这个按了怎么没用」。
-     */
-    private class RemoteView(context: Context) : View(context) {
-
-        var active = 0
-            set(value) {
-                field = value
-                invalidate()
-            }
-
-        var pulse = 0.5f
-            set(value) {
-                field = value
-                invalidate()
-            }
-
-        private var ui: Ui? = null
-
-        private val body = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = BODY }
-        private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-            color = STROKE_COLOR
-        }
-        private val disc = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = DISC }
-        private val keyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = KEY_OFF }
-        private val glow = Paint(Paint.ANTI_ALIAS_FLAG)
-        private val okText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            textAlign = Paint.Align.CENTER
-            typeface = Typeface.DEFAULT_BOLD
-        }
-
-        /** 把 [Ui] 记录进来用于字号；尺寸由调用方通过 LayoutParams 定死。 */
-        fun start(width: Int, height: Int) {
-            minimumWidth = width
-            minimumHeight = height
-            ui = Ui(context)
-            okText.textSize = TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_SP,
-                17f * ui!!.scale,
-                resources.displayMetrics,
-            )
-        }
-
-        override fun onDraw(canvas: Canvas) {
-            val w = width.toFloat()
-            val h = height.toFloat()
-            if (w <= 0f || h <= 0f) return
-
-            // 机身
-            body.color = BODY
-            canvas.drawRoundRect(RectF(w * 0.08f, 0f, w * 0.92f, h), w * 0.11f, w * 0.11f, body)
-            stroke.strokeWidth = w * 0.012f
-            stroke.color = STROKE_COLOR
-            canvas.drawRoundRect(RectF(w * 0.08f, 0f, w * 0.92f, h), w * 0.11f, w * 0.11f, stroke)
-
-            // 顶部红外窗 + 底部喇叭缝：只为了让它是「一只遥控器」，不承载信息
-            body.color = TOP_DECOR
-            canvas.drawRoundRect(RectF(w * 0.34f, h * 0.035f, w * 0.66f, h * 0.055f), w * 0.02f, w * 0.02f, body)
-            canvas.drawRoundRect(RectF(w * 0.38f, h * 0.94f, w * 0.62f, h * 0.955f), w * 0.01f, w * 0.01f, body)
-
-            val cx = w * 0.5f
-            val cy = h * 0.44f
-            val ring = w * 0.30f
-
-            disc.color = DISC
-            canvas.drawCircle(cx, cy, ring, disc)
-            stroke.strokeWidth = w * 0.035f
-            stroke.color = STROKE_COLOR
-            canvas.drawCircle(cx, cy, ring, stroke)
-
-            // 高亮光晕画在按键下面
-            glow.color = Color.argb(
-                (36 + 46 * pulse.coerceIn(0f, 1f)).toInt(),
-                0xFF, 0xD5, 0x4F,
-            )
-            val glowR = ring * 0.44f
-            if (active == 0) {
-                canvas.drawCircle(cx - ring * 0.70f, cy, glowR, glow)
-                canvas.drawCircle(cx + ring * 0.70f, cy, glowR, glow)
-            }
-            if (active == 1) {
-                canvas.drawCircle(cx, cy - ring * 0.70f, glowR, glow)
-                canvas.drawCircle(cx, cy + ring * 0.70f, glowR, glow)
-            }
-            if (active == 2) canvas.drawCircle(cx, cy, ring * 0.48f, glow)
-
-            // 四个方向键
-            val on = ACCENT
-            val activeH = active == 0
-            val activeV = active == 1
-            keyPaint.color = if (activeH) on else KEY_OFF
-            drawArrow(canvas, cx - ring * 0.70f, cy, -1f, 0f, w * 0.075f, keyPaint)
-            drawArrow(canvas, cx + ring * 0.70f, cy, 1f, 0f, w * 0.075f, keyPaint)
-            keyPaint.color = if (activeV) on else KEY_OFF
-            drawArrow(canvas, cx, cy - ring * 0.70f, 0f, -1f, w * 0.075f, keyPaint)
-            drawArrow(canvas, cx, cy + ring * 0.70f, 0f, 1f, w * 0.075f, keyPaint)
-
-            // OK 键
-            disc.color = if (active == 2) OK_ON else OK_OFF
-            canvas.drawCircle(cx, cy, ring * 0.42f, disc)
-            stroke.strokeWidth = w * 0.02f
-            stroke.color = if (active == 2) ACCENT else STROKE_COLOR
-            canvas.drawCircle(cx, cy, ring * 0.42f, stroke)
-            canvas.drawText("OK", cx, cy + okText.textSize * 0.36f, okText)
-        }
-
-        private fun drawArrow(c: Canvas, cx: Float, cy: Float, dx: Float, dy: Float, size: Float, p: Paint) {
-            val path = Path()
-            if (dx != 0f) {
-                path.moveTo(cx + dx * size, cy)
-                path.lineTo(cx - dx * size * 0.55f, cy - size)
-                path.lineTo(cx - dx * size * 0.55f, cy + size)
-            } else {
-                path.moveTo(cx, cy + dy * size)
-                path.lineTo(cx - size, cy - dy * size * 0.55f)
-                path.lineTo(cx + size, cy - dy * size * 0.55f)
-            }
-            path.close()
-            c.drawPath(path, p)
-        }
-
-        private companion object {
-            const val BODY = 0xFF1A2233.toInt()
-            const val DISC = 0xFF232C3D.toInt()
-            const val STROKE_COLOR = 0x2EFFFFFF
-            const val TOP_DECOR = 0x33FFFFFF
-            const val KEY_OFF = 0xFFD9FFFFFF.toInt()
-            const val OK_OFF = 0xFF111827.toInt()
-            const val OK_ON = 0xFF3A3010.toInt()
-            const val ACCENT = 0xFFFFD54F.toInt()
-        }
-    }
 
     private companion object {
         const val SECONDARY = 0xB3FFFFFF.toInt()
+        const val LABEL_OFF = 0xFFD6DEEA.toInt()
+        const val KEY_TEXT_OFF = 0xFFE2E8F2.toInt()
         const val ACCENT = 0xFFFFD54F.toInt()
         const val BG_TOP = 0xFF101827.toInt()
         const val BG_BOTTOM = 0xFF05070C.toInt()
-        const val INACTIVE_BG = 0x14FFFFFF
-        const val ACTIVE_BG = 0x2EFFD54F
-        const val HINT_RADIUS = 14
+        const val CARD_ON = 0x2EFFD54F
+        const val CARD_OFF = 0x14FFFFFF
+        const val CARD_STROKE_ON = 0x66FFD54F
+        const val CARD_STROKE_OFF = 0x1FFFFFFF
+        const val KEY_ON = 0x33FFD54F
+        const val KEY_OFF = 0x14FFFFFF
+        const val KEY_STROKE_OFF = 0x24FFFFFF
 
         const val FADE_IN_MS = 220L
         const val TICK_MS = 50L
         const val SCENE_MS = 1_600L
         const val PULSE_MS = 1_800L
+
         /** 比最短展示 5 秒长：快 NAS 上不会闪一句「硬盘正在唤醒」，真的等久了才出现。 */
         const val WAKE_HINT_AFTER_MS = 6_000L
 

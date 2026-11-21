@@ -42,11 +42,10 @@ import java.util.TimeZone
 /**
  * 唯一的 Activity。
  *
- * 按键只有三类（DESIGN §3）：← → 换库、↑ ↓ 换剧/换频道、OK 看天气。
+ * 日常按键只有三类（DESIGN §3）：← → 换库、↑ ↓ 换剧/换频道、OK 看天气。
  * 其余键（返回、菜单）不响应任何应用逻辑；音量键不拦截，交给系统。
  *
- * 重入配置页（已与用户确认）：设置键 + OK，或 返回键 + OK —— 单键不会误触，
- * 组合键在电视遥控器上又很容易按出来。
+ * 设置 / 信息键双击是隐藏的播放诊断入口（不是重入配置页）；诊断页打开后 OK 先关它。
  */
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine.Listener {
 
