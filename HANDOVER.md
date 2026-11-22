@@ -1,13 +1,15 @@
 # HANDOVER：构建、发布与维护记录
 
-最后更新：2026-11-21 ｜ 当前版本 1.1.2（versionCode 6）｜ code commit `3ca771a` ｜ tag `v1.1.2`
+最后更新：2026-11-22 ｜ 当前版本 1.1.3（versionCode 7）｜ code commit `f3a6288` ｜ tag `v1.1.3`
 
 ## 仓库与发布
 
 - Gitea：`http://8.146.238.150:10200/everaine/firefly-tv`，分支 `main`。
-- Release：`v1.1.2`，资产 `app-release.apk`（24,757,641 B，
-  SHA-256 `4dbe6d1ee39229ce2e95e15be19450e5ff758f0e724796b025cf0940efdbd7a9`）；
-  本地留档 `firefly-apk/firefly-tv-1.1.2.apk`（`firefly-apk/` 不入库）。
+- Release：`v1.1.3`，资产 `app-release.apk`（24,758,131 B，
+  SHA-256 `81217249916e92f335072cc039eb17d29d70aa4972d11a1a6a81453402c54668`）；
+  本地留档 `firefly-apk/firefly-tv-1.1.3.apk`（`firefly-apk/` 不入库）。
+- 回滚资产：`firefly-tv-1.1.2.apk`（24,757,641 B，
+  SHA-256 `4dbe6d1ee39229ce2e95e15be19450e5ff758f0e724796b025cf0940efdbd7a9`）。
 - 包名 `com.firefly.tv`；签名复用 Windows debug keystore
   （证书 SHA-256 `da14fe1d035dff9284bbbbbd91715d98c88aa10064b63fa36245bf67b4186272`）。
   同签名覆盖安装保留配置和观看记录。
@@ -31,7 +33,7 @@ ANDROID_HOME='D:\AndroidSDK' WIN_ROOT='E:\firefly-build' \
 - JDK：`C:\Program Files\Microsoft\jdk-17.0.18.8-hotspot`
 - SDK：`D:\AndroidSDK`（build-tools 36.1.0 / platforms 34）
 - Gradle：`%USERPROFILE%\.gradle\wrapper\dists\gradle-8.11.1-bin\...`
-- 验证结果：285 项单测 0 失败；release 构建正常（缓存热、R8 正常）。
+- 验证结果：290 项单测 0 失败；release 构建正常（缓存热、R8 正常）。
 - `scripts/win-build.sh` 在 WSL 侧先建 `build/apk`，否则 `.bat` 的产物回拷会静默失败；
   该脚本有可执行位（755），其余脚本按 README 用 `bash scripts/xxx.sh` 调用。
 
@@ -81,10 +83,17 @@ GitHub 全量 clone `Bilibili/FFmpeg` 太慢（十几分钟还没完），改用
 
 ## 测试与验证
 
-- 单测：`testDebugUnitTest` 285 项，0 失败（2026-11-21）。
-- Release APK：`versionCode 6 / versionName 1.1.2`，minSdk 21 / targetSdk 34，
-  native-code 三个 ABI，debug 签名；安装到 AVD API 22/x86，开机页 smoke test 正常。
-- 截图：`docs/images/boot.png`（1.1.2 新开机页）、`docs/images/switch.png`（换库过渡页）。
+- 单测：`testDebugUnitTest` 290 项，0 失败（2026-11-22）。
+- Release APK：`versionCode 7 / versionName 1.1.3`，minSdk 21 / targetSdk 34，
+  native-code 三个 ABI，debug 签名；安装到 AVD API 22/x86 验证过开机页行为。
+- 模拟器实测（AVD，NAS 指向不可达地址）：
+  - 1.1.2（基线）：开机页约 8 秒后被故障页顶掉，随后「故障页 → 纯黑 10 秒 → 故障页」循环；
+  - 1.1.3：开机页一直留着，状态行写「连接超时，检查地址和网络」，连续 3 次重试失败
+    （约 50 秒）后才交给故障页；故障页在后续重试期间**保持可见**，不再黑屏；
+  - 断网（`ifconfig eth0 down`，等 ConnectivityService 掉网）后重启：开机页显示
+    「正在等待网络连接…」，不产生「连接超时」假故障；`ifconfig eth0 up` 后约 2 秒
+    自动变成「网络已连接，正在打开 NAS…」并继续起播。
+- 截图：`docs/images/boot.png`（1.1.2 版式，1.1.3 视觉未变）、`docs/images/switch.png`（换库过渡页）。
   AVD 1920×1080/density 320；配置用 `scripts/push-prefs.sh` + `build/tmp/fake-prefs.xml`
   （gitignored）。过渡页截图是在 debug 预览里隐藏 SurfaceView 后拍的：模拟器软件渲染下
   独立 surface 会盖住普通 View；**release 包没有预览代码**，真实电视上视频层和过渡层正常叠加。
@@ -109,14 +118,14 @@ AVD：`firefly_tv`（API 22 / x86 / 1920×1080 / density 320）。安装：
 2. Gitea API：`POST /api/v1/repos/everaine/firefly-tv/releases`（token 只从
    `~/.git-credentials` 读，不写进仓库/不打印），body 含安装、覆盖、回滚、未验证项。
 3. 上传资产 `app-release.apk`，记录 SHA-256。
-4. Release 页面：`http://8.146.238.150:10200/everaine/firefly-tv/releases/tag/v1.1.2`。
+4. Release 页面：`http://8.146.238.150:10200/everaine/firefly-tv/releases/tag/v1.1.3`。
 
 ## 回滚
 
-- 回滚资产：`firefly-apk/firefly-tv-1.1.1.apk`（1.1.1 / versionCode 5，SHA-256 `6d19ce0424fc508aba930f28043791c2ccd49489a0149c833550ddf15a558e25`）；Release 侧同版本资产可从 `v1.1.1` 标签重新取。
-- 从 tag `v1.1.1` 重建：同一份 AAR、同一把 debug keystore，`versionCode 5`。
-- 1.1.2 覆盖 1.1.1 是升级；回滚到 1.1.1 是降级，电视 U 盘安装需要先卸载
-  （会清配置和观看记录），或用 adb `install -d`。所以回滚前先保留 1.1.1 的 APK，再决定。
+- 回滚资产：`firefly-apk/firefly-tv-1.1.2.apk`（1.1.2 / versionCode 6，SHA-256 `4dbe6d1ee39229ce2e95e15be19450e5ff758f0e724796b025cf0940efdbd7a9`）；Release 侧同版本资产可从 `v1.1.2` 标签重新取。
+- 从 tag `v1.1.2` 重建：同一份 AAR、同一把 debug keystore，`versionCode 6`。
+- 1.1.3 覆盖 1.1.2 是升级；回滚到 1.1.2 是降级，电视 U 盘安装需要先卸载
+  （会清配置和观看记录），或用 adb `install -d`。所以回滚前先保留 1.1.2 的 APK，再决定。
 - 不要换签名：换签名会 `INSTALL_FAILED_UPDATE_INCOMPATIBLE`，卸载会丢配置和记录。
 
 ## 已知坑（按重要性）
@@ -128,9 +137,21 @@ AVD：`firefly_tv`（API 22 / x86 / 1920×1080 / density 320）。安装：
 - `pack-ijkplayer-aar.sh` 固定从 `app/libs/` 根找官方 AAR；打完后移回 `stock-aar/`。
 - R8 会报 `MediaCodecChoice.kt` 的 unused param warning，无影响。
 - 过渡页在模拟器截图时会被 SurfaceView 盖住；只是预览环境问题，真实电视上视频层与过渡层正常叠加。
+- **开机页最短 5 秒必须从首次 `dispatchDraw` 算**，不能从 `show()` 算：onCreate 到窗口出画
+  可能差几秒，按调用时刻计会让用户看到的动画短一截（1.1.2 及以前的实测反馈「2 秒就没了」）。
+- **开机自启时网络往往比应用晚就绪**：`startPlayback` 先查 `activeNetworkInfo`，没网就
+  500ms 轮询等待、不去连 NAS；否则第一次连接必然失败，会被当成故障。
+- **开机页显示期间，会自动重试的故障不要 `notifyFault()`**：先写状态行、最多挡 3 次；
+  否则用户看到「动画闪一下 → 旧版那句打不开」。不可重试的故障仍然立刻让位。
+- **重试期间不要用 `showFault(null)` 清屏**：它会把原因和提示条一起收掉，重试的十几秒
+  屏幕纯黑（模拟器实测过）。让原因留在屏幕上，成功时 `onPrepared`/`onFirstFrame` 自己收。
+- 模拟器模拟断网：`adb shell "ifconfig eth0 down"` 后要等约 4 秒 ConnectivityService 才认为
+  没有默认网络；直接看 `dumpsys connectivity` 的 `Active default network`。
 
 ## 待确认
 
 - 真机 4K 帧率、中文 TTS、设置键 keyCode、长虹主屏抢占。
 - https 直播源在真实网络下的起播。
 - 老人实际观感：开机页 1.1.2 左侧遥控器 + 右侧三行提示、开机页 5 秒、过渡页 0.4 秒、400ms 防抖是否需要调参。
+- 真机开机自启时网络就绪要多久、开机页实际露脸时长（1.1.3 起诊断页有一行
+  「开机页 X 秒后为什么退场」，用户复现时直接读这一行）。
