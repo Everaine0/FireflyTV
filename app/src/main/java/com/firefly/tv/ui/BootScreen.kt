@@ -24,8 +24,8 @@ import kotlin.math.sin
  * 目标用户是老人：遥控器画出按键位置，右侧同步高亮「现在讲哪一组」，
  * 比纯文字更容易对上号。没有品牌标题，也没有多余的插画。
  *
- * 退场规则在 [BootGate]（纯函数 + 单测）：首帧出来且待够 5 秒就淡出；
- * 故障页要说话时立刻让位；最多待到 90 秒。
+ * 退场规则在 [BootGate]（纯函数 + 单测）：首帧出来且**从真正画到屏幕上算起**待够 5 秒
+ * 就淡出；故障页要说话时让位（会自动重试的失败先在这里写原因、挡两次）；最多待到 90 秒。
  *
  * 动画开销刻意压得很低：遥控器按键光晕 + 进度条约 20Hz，右侧只有选中态在变。
  */
@@ -47,7 +47,19 @@ class BootScreen(context: Context) : FrameLayout(context) {
     private val bottom = LinearLayout(context)
 
     private var scene = -1
-    private var shownAt = 0L
+
+    /**
+     * 首次真正绘制到屏幕上的时刻（[dispatchDraw] 第一次跑）。
+     *
+     * 最短 5 秒必须从这一刻算：`show()` 是在 onCreate 里调用的，而电视冷启动时
+     * 窗口出画可能晚好几秒 —— 从 show() 计时会让用户看到的动画明显短于 5 秒
+     * （实测反馈「大概 2 秒就没了」）。
+     */
+    private var drawnAt = 0L
+
+    /** 上一次退场的原因与开机页真正露脸了多久（诊断页复盘用）。 */
+    private var exitReason: BootGate.Exit? = null
+    private var visibleMs = 0L
     private var statusAt = 0L
     private var firstFrame = false
     private var faultVisible = false
@@ -74,8 +86,10 @@ class BootScreen(context: Context) : FrameLayout(context) {
         onDismiss: (BootGate.Exit) -> Unit,
     ) {
         this.onDismiss = onDismiss
-        shownAt = System.currentTimeMillis()
-        statusAt = shownAt
+        statusAt = System.currentTimeMillis()
+        drawnAt = 0L
+        exitReason = null
+        visibleMs = 0L
         firstFrame = false
         faultVisible = false
         autoWakeHint = wakeHintAfter
@@ -116,8 +130,9 @@ class BootScreen(context: Context) : FrameLayout(context) {
      */
     fun notifyFirstFrame(): Boolean {
         firstFrame = true
+        val now = System.currentTimeMillis()
         val reason = BootGate.exitReason(
-            System.currentTimeMillis(), shownAt, firstFrame = true, faultVisible = faultVisible,
+            now, BootGate.visibleAt(drawnAt, now), firstFrame = true, faultVisible = faultVisible,
         )
         if (reason != null) {
             dismiss(reason)
@@ -136,6 +151,12 @@ class BootScreen(context: Context) : FrameLayout(context) {
     }
 
     fun isShowing(): Boolean = visibility == View.VISIBLE && !dismissed
+
+    /** 上一次退场原因；还没退过场是 null。给诊断页复盘「开机页为什么走得早」用。 */
+    fun lastExit(): BootGate.Exit? = exitReason
+
+    /** 上一次开机页真正露脸了多少毫秒（没画过就是 0）。 */
+    fun lastVisibleMs(): Long = visibleMs
 
     /** 页面离开屏幕（销毁）时调用：停掉定时器、丢弃回调，不触发 [onDismiss]。 */
     fun stop() {
@@ -162,16 +183,34 @@ class BootScreen(context: Context) : FrameLayout(context) {
     }
 
     private fun finish(reason: BootGate.Exit) {
+        exitReason = reason
+        visibleMs = if (drawnAt > 0L) (System.currentTimeMillis() - drawnAt).coerceAtLeast(0L) else 0L
         val cb = onDismiss
         onDismiss = null
         cb?.invoke(reason)
+    }
+
+    /**
+     * 第一次真正绘制时才开始计时。
+     *
+     * 用 dispatchDraw 而不是 onDraw：本页的背景和内容都在子 View 里，dispatchDraw
+     * 才是「这一页确实要上屏了」的那一刻；它同时发生在窗口可见的同一帧。
+     */
+    override fun dispatchDraw(canvas: Canvas) {
+        if (drawnAt == 0L) {
+            drawnAt = System.currentTimeMillis()
+            // 「硬盘正在唤醒」那句也从这个时刻重新计，避免页面还没露面就到了
+            statusAt = drawnAt
+        }
+        super.dispatchDraw(canvas)
     }
 
     private val tick = object : Runnable {
         override fun run() {
             if (visibility != View.VISIBLE || dismissed) return
             val now = System.currentTimeMillis()
-            val elapsed = BootGate.elapsedMs(now, shownAt)
+            // 没真正画过就不算等待；画过之后从露脸那一刻算
+            val elapsed = BootGate.elapsedMs(now, BootGate.visibleAt(drawnAt, now))
 
             val next = ((elapsed / SCENE_MS) % rows.size).toInt()
             if (next != scene) applyScene(next)
@@ -184,7 +223,9 @@ class BootScreen(context: Context) : FrameLayout(context) {
                 autoWakeHint = false
             }
 
-            val reason = BootGate.exitReason(now, shownAt, firstFrame, faultVisible)
+            val reason = BootGate.exitReason(
+                now, BootGate.visibleAt(drawnAt, now), firstFrame, faultVisible,
+            )
             if (reason != null) {
                 dismiss(reason)
                 return

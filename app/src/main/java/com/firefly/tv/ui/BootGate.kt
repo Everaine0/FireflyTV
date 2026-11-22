@@ -51,6 +51,36 @@ object BootGate {
     fun elapsedMs(now: Long, shownAt: Long): Long = (now - shownAt).coerceAtLeast(0L)
 
     /**
+     * 计时的起点：**页面真正画到屏幕上那一刻**。
+     *
+     * 为什么不能在 `show()` 里就开始计时：冷启动（尤其是开机自启）时，
+     * Activity 的 onCreate 比窗口真正出画早得多 —— 电视越慢差得越多。
+     * 实测反馈「开机动画大概 2 秒就没了」，就是最短 5 秒里有一截耗在了
+     * 页面还没露面的时候。以首帧绘制（[drawnAt]）为起点，用户看到的才是完整的 5 秒。
+     *
+     * @param drawnAt 首次绘制时刻；0 = 还没画过（此时把起点推到 now，等于刚开始计时）
+     */
+    fun visibleAt(drawnAt: Long, now: Long): Long = if (drawnAt > 0L) drawnAt else now
+
+    /**
+     * 开机页最多替故障页挡几次「会自动重试的失败」。
+     *
+     * 开机那十几秒里 NAS 没连上、列目录超时这类失败**本来就会自动重试**，
+     * 以前它们一出现就把开机页顶掉，用户看到的就是「动画闪一下，接着还是旧版那句打不开」。
+     * 现在先在开机页的状态行里把原因写出来；连续 [MAX_TRANSIENT_FAULTS] 次仍不行才让位。
+     */
+    const val MAX_TRANSIENT_FAULTS = 2
+
+    /**
+     * 故障页要说话时，开机页现在该不该让位。
+     *
+     * @param retryable 这个故障会不会自动重试（见 MainActivity.showFault 的 retry 参数）
+     * @param transientFaults 开机页显示期间已经挡下的可重试故障次数（含这一次）
+     */
+    fun yieldsToFault(retryable: Boolean, transientFaults: Int): Boolean =
+        !retryable || transientFaults > MAX_TRANSIENT_FAULTS
+
+    /**
      * 现在该不该退场；不该就返回 null。
      *
      * 故障优先于「最短停留」：错误必须立刻可见。这也是唯一会打破强制展示的情况。

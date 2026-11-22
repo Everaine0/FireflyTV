@@ -1065,6 +1065,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
     private fun enterBoot(fromConfig: Boolean = false) {
         if (bootScreen.isShowing()) return
         pausedForBoot = false
+        bootTransientFaults = 0
         trace("enterBoot：显示开机页 fromConfig=$fromConfig")
         bootScreen.show(
             statusText = if (fromConfig) "配置已保存，正在连接 NAS…" else "正在连接 NAS…",
@@ -1082,7 +1083,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
      * 多半已经被释放，贸然 resume 只会和重试打架。
      */
     private fun onBootExit(reason: BootGate.Exit) {
-        trace("开机页退场：$reason pausedForBoot=$pausedForBoot")
+        trace("开机页退场：$reason pausedForBoot=$pausedForBoot visible=${bootScreen.lastVisibleMs()}ms")
+        bootTransientFaults = 0
+        if (reason == BootGate.Exit.TIMEOUT) {
+            // 到 90 秒还没有画面：把还在等的原因交给故障页，别留下一片黑。
+            // （FAULT 这条路故障页自己已经在显示了，READY 则是画面已经好了。）
+            val why = when {
+                waitingForNetwork -> "网络还没连上，正在等待"
+                lastFault != null -> lastFault
+                else -> "这台电视还没打开片源，正在重试"
+            }
+            showFault(why, retry = true)
+            pausedForBoot = false
+            return
+        }
         if (reason == BootGate.Exit.READY) {
             if (pausedForBoot) {
                 pausedForBoot = false
@@ -1098,6 +1112,57 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
 
     // ---- 播放 ----
 
+    /**
+     * 开机时网络可能比应用晚就绪（尤其是电视刚上电、开机自启的那一次）。
+     *
+     * 以前这里不管网络状态直接去连 NAS：连接失败 → 报故障 → 开机页立刻让位，
+     * 用户看到的就是「动画闪一下，接着还是旧版那句打不开」，然后每 10 秒重试一次。
+     * 现在先等网络，网络一好立刻起播。
+     */
+    private var waitingForNetwork = false
+
+    /** 开机页显示期间替故障页挡下的「会自动重试的失败」次数（见 [BootGate.yieldsToFault]）。 */
+    private var bootTransientFaults = 0
+
+    /** 等网络时的轮询：CONNECTIVITY 广播在个别电视固件上不可靠，直接问状态最稳。 */
+    private val networkWaitTick = object : Runnable {
+        override fun run() {
+            if (!waitingForNetwork) return
+            if (!networkOnline()) {
+                main.postDelayed(this, NETWORK_POLL_MS)
+                return
+            }
+            waitingForNetwork = false
+            main.removeCallbacks(this)
+            trace("网络已就绪，继续起播")
+            if (bootScreen.isShowing()) bootScreen.setStatus("网络已连接，正在打开 NAS…")
+            startPlayback()
+        }
+    }
+
+    /** 电视现在有没有可用的网络（SMB 走局域网，不要求外网可达）。 */
+    @Suppress("DEPRECATION")
+    private fun networkOnline(): Boolean = runCatching {
+        val info = (getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager)?.activeNetworkInfo
+        info?.isConnected == true
+    }.getOrDefault(true)
+
+    /** 网络还没好：留在开机页上说明在等什么，并每 500ms 问一次。 */
+    private fun awaitNetwork() {
+        if (!waitingForNetwork) {
+            waitingForNetwork = true
+            trace("startPlayback：网络还没就绪，等网络")
+        }
+        if (bootScreen.isShowing()) {
+            bootScreen.setStatus("正在等待网络连接…")
+        } else {
+            showFault("网络还没连上，正在等待", retry = true)
+        }
+        main.removeCallbacks(networkWaitTick)
+        main.postDelayed(networkWaitTick, NETWORK_POLL_MS)
+    }
+
     private fun startPlayback() {
         main.removeCallbacks(retryTick)
         // 新的一轮启动：还没把任何内容交给播放器
@@ -1107,6 +1172,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             openConfigServer()
             return
         }
+        if (!networkOnline()) {
+            awaitNetwork()
+            return
+        }
+        waitingForNetwork = false
 
         // ⚠️ 重试不能把"为什么没播成"从屏幕上拿掉。
         //
@@ -1119,10 +1189,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 现在：刚失败不久就把原因继续挂在屏幕上，只有真的隔了很久（用户重新进来的那种）
         // 才有必要说"正在连接 NAS"。阈值取 60 秒而不是一个重试周期（10 秒）：
         // 取 10 秒时实测正好卡在边界上（上一轮 10 秒整点触发），结果又退回"正在连接"。
+        //
+        // ⚠️ 这里**不能**用 showFault(null) 把故障页藏起来：它同时会把提示条也收掉，
+        // 于是重试的那十几秒里屏幕上什么都没有（模拟器实测：故障页 → 纯黑 10 秒 → 故障页）。
+        // 正确做法是让原因一直留在屏幕上，重试在背后进行；成功时 onPrepared/onFirstFrame
+        // 会自己 showFault(null) 收掉。
         val showingReason = lastFault != null &&
             System.currentTimeMillis() - lastFaultAt < REASON_KEEP_MS
-        showFault(null, keepHud = showingReason)
-        trace("startPlayback 开始：挂启动兜底看门狗（显示原因=$showingReason）")
+        if (!showingReason) {
+            showFault(null)
+            hud.onRestoring(System.currentTimeMillis())
+            postHudTick()
+        }
+        trace("startPlayback 开始：挂启动兜底看门狗（保留原因=$showingReason）")
         // ⚠️ 从这里到 [playEpisodeNow] 之间（列库 → 列剧 → 列集）原本**没有任何看门狗**：
         // 起播看门狗是在 playEpisodeNow 里才挂的，而这段时间屏幕上只有 SwitchHud 那条
         // 「正在打开…」。SMB 卡在这几段任何一处，就永远停在那句话上，只能重进应用。
@@ -2243,6 +2322,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // 9) 正在播什么（用户报问题时对着这一行说就够了）
         lines += DiagScreen.Line("内容", currentTitle.ifBlank { "—" })
 
+        // 10) 开机页复盘：用户说「动画两秒就没了」时，只有这一行能说明到底露脸多久、为什么走
+        bootScreen.lastExit()?.let { exit ->
+            val why = when (exit) {
+                BootGate.Exit.READY -> "画面已就绪"
+                BootGate.Exit.FAULT -> "让给故障页"
+                BootGate.Exit.TIMEOUT -> "等待超时"
+            }
+            lines += DiagScreen.Line(
+                "开机页",
+                "${PlaybackVerdict.one(bootScreen.lastVisibleMs() / 1000f)} 秒后$why",
+            )
+        }
+
         return lines
     }
 
@@ -2476,10 +2568,29 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
             faultScreen.visibility = View.GONE
             return
         }
-        // 真有原因要报：开机页/过渡页立刻让位；浮层和提示条显式收起。
+        // 真有原因要报：浮层和提示条显式收起。
         // 故障页在 buildViews 里排在 overlay/hudView 之上，层叠上不会再被底部文字遮住，
         // 这里再显式收一次，避免以后调整层叠顺序时又踩回去。
-        if (bootScreen.isShowing()) bootScreen.notifyFault()
+        if (bootScreen.isShowing()) {
+            // 开机页还盖着：**会自动重试的失败先别顶掉它**。
+            // 开机那十几秒里 NAS 没连上、列目录超时都会自动重试，以前它们一出现就把
+            // 开机页换成故障页 —— 用户看到的正是「动画 2 秒就没了，接着还是旧版那句打不开」。
+            // 现在原因写进开机页的状态行，连续挡 [BootGate.MAX_TRANSIENT_FAULTS] 次仍失败才让位。
+            if (retry) bootTransientFaults++
+            if (!BootGate.yieldsToFault(retry, bootTransientFaults)) {
+                faultScreen.visibility = View.GONE
+                bootScreen.setStatus(message)
+                hideOverlay()
+                if (!keepHud) {
+                    hud.dismiss()
+                    renderHud()
+                }
+                hideDiag()
+                main.postDelayed(retryTick, RETRY_MS)
+                return
+            }
+            bootScreen.notifyFault()
+        }
         hideOverlay()
         switchFlash.notifyFault()
         if (!keepHud) {
@@ -2796,6 +2907,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, PlaybackEngine
         // （纯函数，有单测）；这里不再留一份同名常量，免得两处各改一半。
 
         private const val HUD_TICK_MS = 200L
+
+        /** 等网络时的问询间隔：开机时 Wi-Fi 通常几秒就好，500ms 内接上就能立刻起播。 */
+        private const val NETWORK_POLL_MS = 500L
 
         /** 诊断页刷新间隔（1 Hz）：再快没意义，还费 CPU。 */
         private const val DIAG_INTERVAL_MS = 1_000L
