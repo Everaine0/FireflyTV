@@ -148,6 +148,22 @@ AVD：`firefly_tv`（API 22 / x86 / 1920×1080 / density 320）。安装：
 - 模拟器模拟断网：`adb shell "ifconfig eth0 down"` 后要等约 4 秒 ConnectivityService 才认为
   没有默认网络；直接看 `dumpsys connectivity` 的 `Active default network`。
 
+## 构建缓存清理（2026-11-24）
+
+- 删除：WSL `build/apk`、`build/tmp`；`build/ijkbuild/.../contrib/{build,ffmpeg-*,openssl-*}` 的
+  中间产物；Windows `E:\firefly-build\app\build` 与 `E:\firefly-build\.gradle`；
+  `%USERPROFILE%\.gradle\caches\8.11.1`、`caches\build-cache-1`、`daemon`、`kotlin-profile`；
+  AVD `firefly_tv.avd\snapshots`；Windows `%TEMP%` 中 3 天前的文件。
+- 保留：`app/libs/ijkplayer-full-0.8.8.aar`、`app/libs/stock-aar/`、`build-out/`、
+  `firefly-apk/`、Gradle wrapper（不能重下）、`modules-2` 依赖缓存、NDK r10e、
+  `build/ijkbuild/.../extra` 内核源码、AVD 用户数据。
+- 共释放约 10 GB：WSL 3.9 GB、Windows 构建树 0.3 GB、Gradle 缓存 0.8 GB、
+  Windows 临时目录 3.0 GB、AVD 快照 2.1 GB。
+- 下次重编内核：`bash scripts/build-ijkplayer.sh` 会从 `extra/` 重铺源码并重编；
+  AAR 仍在，普通 `win-build.sh` 不受影响，只是第一次构建要重新生成 Gradle 缓存，会慢一些。
+- 仍占空间、但**不是缓存**（删前要确认）：`build/ijkbuild/android-ndk-r10e` 3.4 GB、
+  AVD `firefly_tv` 用户数据约 14 GB、`genie_test` AVD 6.9 GB、Gradle 8.11.1 发行版 0.9 GB。
+
 ## 待确认
 
 - 真机 4K 帧率、中文 TTS、设置键 keyCode、长虹主屏抢占。
